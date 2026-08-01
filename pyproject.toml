@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s32edbg"
+version = "0.1.0"
+description = "CoreSight/JTAG command-line tool for NXP S32E27x via SEGGER J-Link"
+requires-python = ">=3.11"
+dependencies = ["click>=8.1", "rich>=13.0"]
+
+[project.scripts]
+s32edbg = "s32edbg.cli:entry"
+
+[tool.setuptools.packages.find]
+include = ["s32edbg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["hardware: requires a J-Link probe attached to a powered S32E target"]
+addopts = "-m 'not hardware'"
