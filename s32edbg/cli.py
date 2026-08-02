@@ -243,12 +243,24 @@ def _prepare_dap(
 @click.option("--device", default="CORTEX-R52", show_default=True, help="Device name for J-Link's connect sequence. J-Link needs one to scan the chain and init the DAP even for DAP-only work.")
 @click.pass_context
 def main(ctx: click.Context, transport_kind: str, serial: str | None, speed_khz: int, jlink_dir: str | None, log: str | None, json_out: str | None, echo: bool, irlen: int | None, device: str | None) -> None:
-    """CoreSight/JTAG tool for NXP S32E27x over a SEGGER J-Link.
+    """CoreSight/JTAG debugger for NXP S32E27x over a SEGGER J-Link.
 
-    Safety policy baked in: boundary scan is SAMPLE/PRELOAD only, the SDA-AP is
-    never written, AXI-AP traffic is refused while functional reset is asserted,
-    and switching to SWD needs an explicit opt-in because returning to JTAG
-    requires a power-on reset.
+    Three layers of capability: bring-up and survey (doctor, gates, apmap,
+    romdump, mem, report), run control for the Cortex-R52 and Cortex-M33
+    cores (core, m33, bp, wp -- halt, step, resume, breakpoints, watchpoints,
+    reset-and-halt), and `debug`, a persistent session that holds one probe
+    connection for a whole halt/step/resume workflow and restores the target
+    when it closes.
+
+    First command on a freshly power-cycled board: `gates apply` -- the debug
+    clocks are off by default (RM 135.11) and the enables are lost on power
+    loss. Everything else fails politely until it has run.
+
+    Safety policy baked in: boundary scan is SAMPLE/PRELOAD only, the SDA-AP
+    authentication path is never written (the reset-control registers are the
+    sole, allowlisted exception), AXI-AP traffic is refused while functional
+    reset is asserted, and switching to SWD needs an explicit opt-in because
+    returning to JTAG requires a power-on reset.
     """
     ctx.obj = Ctx(transport_kind, serial, speed_khz, jlink_dir, log, json_out, echo, irlen, device)
 
@@ -1367,10 +1379,16 @@ def core_step(ctx: Ctx, core_spec: str | None, over: bool, count: int,
 def core_reset_halt(ctx: Ctx, core_spec: str | None) -> None:
     """Functional-reset the system and halt a core at its first instruction.
 
-    The guide's §5.10.3 flow: SDARSTMASK preserves the R52 debug state across
-    the reset, EDECR.RCE arms the Reset Catch (plus OSUCE for boot software's
-    OS-restore), and SDASYSRSTC asserts and releases the functional reset. The
-    core halts with DLR at the reset vector, having fetched nothing.
+    The guide's §5.10.2 hold flow, the one that works on this silicon: the
+    core's SDARSTCTRL release bit is cleared so it stays in reset while the
+    system functional-resets and boots normally, EDECR.RCE is armed on the
+    held core, and releasing it fires the Reset Catch before the first
+    instruction -- DLR sits at the reset vector, nothing has been fetched.
+
+    THE RESET IS SYSTEM-WIDE: every core reboots; only the chosen one is
+    caught, and comparators on the other cores are wiped by the reset. (The
+    guide's §5.10.3 SDARSTMASK protection measurably does not work on this
+    part -- see the test plan's finding 1.)
     """
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
@@ -1837,6 +1855,12 @@ def m33_reset_halt(ctx: Ctx, core_spec: str | None) -> None:
     The architected flow (guide §6.8): C_DEBUGEN + DEMCR.VC_CORERESET survive
     the warm reset, AIRCR.SYSRESETREQ requests it, and the core halts before
     the first handler instruction with DFSR.VCATCH set.
+
+    KNOWN BLOCKED ON THIS SILICON (measured 2026-08-02): the AIRCR write is
+    accepted but SYSRESETREQ takes no effect -- nothing resets and the core
+    keeps running. The command fails cleanly and disarms the vector catch.
+    The SoC gates M33 SYSRESETREQ outside the guide's sources; the SDA-AP
+    RSTWAIT* CPUWAIT hold is the documented candidate for a future flow.
     """
     with _one_m33(ctx, core_spec) as (dap, c):
         console.print(
@@ -1961,7 +1985,14 @@ def bp_clear(ctx: Ctx, index: int | None, core_spec: str | None, all_slots: bool
 
 @main.group()
 def wp() -> None:
-    """Hardware data watchpoints. Separate comparators from breakpoints."""
+    """Hardware data watchpoints -- halt when an address is loaded or stored.
+
+    Separate comparators from breakpoints: eight per R52 core, watching data
+    accesses rather than instruction fetches. A hit halts on the exact access
+    (R52 watchpoints are synchronous) and `core status` reports the faulting
+    data address from EDWAR -- the answer to "who is writing this variable".
+    The watch covers 1, 2, 4 or 8 bytes inside one aligned 8-byte window.
+    """
 
 
 @wp.command("list")
@@ -2213,6 +2244,10 @@ def debug_cmd(
     On close (quit, end of input, or Ctrl-C at the prompt) the session
     restores the target: the breakpoints and watchpoints it set are cleared
     and the cores it halted are resumed, unless --keep-on-exit.
+
+    On a freshly power-cycled board the session opens with no cores
+    discovered -- run `gates apply` inside it, then `use <core>`, and carry
+    on; discovery reruns by itself.
 
     Non-interactive use: pipe lines into stdin, or give -c commands:
 
