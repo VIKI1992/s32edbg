@@ -28,6 +28,8 @@ from ..data import coresight as cs
 from ..data import r52debug as r52
 from ..data.expected_apmap import AP_APB, AP_AXI
 from ..errors import DapError, UnsafeOperation
+from . import gates
+from . import memaccess
 from . import romtable
 from .adiv6 import STICKYERR, Dap
 
@@ -137,6 +139,10 @@ class CoreState:
     #: Set by resume() when the core ran and immediately re-entered Debug state
     #: for a *different* reason -- almost always a breakpoint on a hot address.
     rehalted: bool = False
+    #: Whether EDPRSR.SDR confirmed the restart. The guide §5.5 is explicit:
+    #: "Confirm restart with EDPRSR.SDR (clear-on-read), *not* EDSCR.STATUS".
+    #: None means no restart was attempted (or SDR was never sampled).
+    restart_confirmed: bool | None = None
 
     @property
     def halted(self) -> bool | None:
@@ -172,6 +178,8 @@ class CoreState:
             out["edprsr"] = r52.decode_edprsr(self.edprsr)
         out["halted"] = self.halted
         out["unreachable_reason"] = self.unreachable_reason
+        if self.restart_confirmed is not None:
+            out["restart_confirmed"] = self.restart_confirmed
         if self.status_registers_disagree:
             out["warning"] = (
                 "EDSCR.STATUS and EDPRSR.HALTED disagree about whether this core is "
@@ -715,11 +723,24 @@ def _prepare_cti(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> None:
         _write_checked(dap, ap_base, cti, cs.LAR, cs.LAR_KEY)
 
     _write_checked(dap, ap_base, cti, r52.CTICONTROL, r52.CTICONTROL_GLBEN)
+    # Read-modify-write the trigger routing. An absolute write here silently
+    # removed the cross-halt channel that `core xtrigger on` had routed onto
+    # trigger output 0, so a later single-core halt disarmed the group.
+    outen0 = _read_checked(dap, ap_base, cti, r52.ctiouten(r52.TRIGOUT_DEBUG_REQUEST)) or 0
     _write_checked(
-        dap, ap_base, cti, r52.ctiouten(r52.TRIGOUT_DEBUG_REQUEST), 1 << r52.CHANNEL_HALT
+        dap,
+        ap_base,
+        cti,
+        r52.ctiouten(r52.TRIGOUT_DEBUG_REQUEST),
+        outen0 | (1 << r52.CHANNEL_HALT),
     )
+    outen1 = _read_checked(dap, ap_base, cti, r52.ctiouten(r52.TRIGOUT_RESTART)) or 0
     _write_checked(
-        dap, ap_base, cti, r52.ctiouten(r52.TRIGOUT_RESTART), 1 << r52.CHANNEL_RESTART
+        dap,
+        ap_base,
+        cti,
+        r52.ctiouten(r52.TRIGOUT_RESTART),
+        outen1 | (1 << r52.CHANNEL_RESTART),
     )
     gate = _read_checked(dap, ap_base, cti, r52.CTIGATE)
     if gate is not None:
@@ -753,6 +774,42 @@ def _wait_for(
         time.sleep(0.01)
 
 
+def _acknowledge_halt(
+    dap: Dap, core: Core, *, ap_base: int, timeout_s: float = 0.5
+) -> None:
+    """Drop the debug request and confirm the trigger actually deasserted.
+
+    Guide §5.5, step 1: ``CTIINTACK``, then **poll ``CTITRIGOUTSTATUS`` until
+    the debug-request trigger reads deasserted** -- "you must first clear any
+    still-asserted Debug request, or the core swallows the restart".
+    ``CTIAPPCLEAR`` additionally drops any latched application-set state on the
+    halt channel.
+
+    Skipping the acknowledge was a measured bug: the request stayed asserted at
+    the trigger matrix, the core was released and re-halted repeatedly, the PC
+    moved between CLI commands, and the register-transfer path failed until the
+    request was dropped.
+    """
+    _write_checked(
+        dap, ap_base, core.cti_base, r52.CTIINTACK, 1 << r52.TRIGOUT_DEBUG_REQUEST
+    )
+    _write_checked(dap, ap_base, core.cti_base, r52.CTIAPPCLEAR, 1 << r52.CHANNEL_HALT)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        status = _read_checked(dap, ap_base, core.cti_base, r52.CTITRIGOUTSTATUS)
+        if status is None or not status & (1 << r52.TRIGOUT_DEBUG_REQUEST):
+            # Unreadable is treated as unconfirmed rather than fatal: the
+            # acknowledge writes have been issued either way.
+            return
+        if time.monotonic() > deadline:
+            raise RunControlError(
+                f"{core.name}: the debug-request trigger did not deassert after "
+                f"CTIINTACK (CTITRIGOUTSTATUS 0x{status:08X}). A restart now would "
+                "be swallowed (guide §5.5)."
+            )
+        time.sleep(0.005)
+
+
 def halt(
     dap: Dap, core: Core, *, ap_base: int = AP_APB, timeout_s: float = 2.0
 ) -> CoreState:
@@ -772,27 +829,6 @@ def halt(
         raise RunControlError(f"{core.name}: the CTIAPPPULSE write faulted.")
 
     state = _wait_for(dap, core, True, ap_base=ap_base, timeout_s=timeout_s)
-    if state.halted is True:
-        # **Acknowledge the request, or the halt is not stable.**
-        #
-        # CTIAPPPULSE raises the debug request but nothing lowers it. Left
-        # asserted, the core is released and re-halted repeatedly: measured, the
-        # PC moved between one CLI command and the next, so a step appeared to
-        # do nothing and a `bp clear` appeared to resume execution. The lingering
-        # request also broke the register-transfer path -- reading the PC
-        # straight after a halt failed, and worked immediately after this
-        # acknowledgement.
-        #
-        # With this, a halt survives across sessions: halt in one invocation,
-        # reopen in the next, and the PC is where it was left.
-        _write_checked(
-            dap, ap_base, core.cti_base, r52.CTIINTACK, 1 << r52.TRIGOUT_DEBUG_REQUEST
-        )
-        _write_checked(
-            dap, ap_base, core.cti_base, r52.CTIAPPCLEAR, 1 << r52.CHANNEL_HALT
-        )
-        return read_state(dap, core.debug_base, ap_base=ap_base)
-
     if state.halted is not True:
         raise RunControlError(
             f"{core.name} did not halt within {timeout_s:.1f}s "
@@ -804,7 +840,77 @@ def halt(
                 else ""
             )
         )
-    return state
+
+    # **Acknowledge the request, or the halt is not stable.**
+    #
+    # CTIAPPPULSE raises the debug request but nothing lowers it. Left
+    # asserted, the core is released and re-halted repeatedly: measured, the
+    # PC moved between one CLI command and the next, so a step appeared to
+    # do nothing and a `bp clear` appeared to resume execution. The lingering
+    # request also broke the register-transfer path -- reading the PC
+    # straight after a halt failed, and worked immediately after this
+    # acknowledgement.
+    #
+    # With this, a halt survives across sessions: halt in one invocation,
+    # reopen in the next, and the PC is where it was left.
+    _acknowledge_halt(dap, core, ap_base=ap_base)
+    return read_state(dap, core.debug_base, ap_base=ap_base)
+
+
+def _confirm_restart(
+    dap: Dap,
+    core: Core,
+    *,
+    ap_base: int,
+    timeout_s: float,
+    before_status: int | None,
+) -> CoreState:
+    """Confirm a requested restart actually happened.
+
+    The architected confirmation is **EDPRSR.SDR** -- Sticky Debug Restart, set
+    when the PE restarts and clear-on-read. Guide §5.5: "Confirm restart with
+    EDPRSR.SDR (clear-on-read), *not* EDSCR.STATUS -- the architecture is
+    explicit about this." (SDR is UNKNOWN across a warm reset, which is why
+    EDPRSR.SR is decoded alongside it elsewhere.)
+
+    EDPRSR is read exactly once per iteration, directly -- a ``read_state()``
+    call in the same loop would also read EDPRSR and silently consume the
+    clear-on-read SDR bit before this loop could see it.
+
+    Success is "the core executed", not "the core is still running". A
+    breakpoint on a hot address re-halts before this poll can even see it
+    running -- measured: resuming onto a breakpoint in an idle loop came back
+    halted with EDSCR.STATUS changed from external-debug-request to breakpoint.
+    Treating that as a failed resume reported a working breakpoint as a broken
+    resume, which is the guide's §7.5 case. SDR settles it either way: set
+    means the core left Debug state, whatever state it is in now.
+    """
+    sdr_seen = False
+    deadline = time.monotonic() + timeout_s
+    while True:
+        edprsr = _read_checked(dap, ap_base, core.debug_base, r52.EDPRSR)
+        if edprsr is not None and edprsr & r52.EDPRSR_SDR:
+            sdr_seen = True
+        edscr = _read_checked(dap, ap_base, core.debug_base, r52.EDSCR)
+        state = CoreState(edscr=edscr, edprsr=edprsr)
+
+        if state.halted is False:
+            state.restart_confirmed = sdr_seen
+            return state
+        status = r52.edscr_status(edscr) if edscr is not None else None
+        if state.halted is True and (
+            sdr_seen or (before_status is not None and status != before_status)
+        ):
+            state.rehalted = True
+            state.restart_confirmed = sdr_seen
+            return state
+        if time.monotonic() > deadline:
+            raise RunControlError(
+                f"{core.name} did not restart within {timeout_s:.1f}s "
+                f"(EDSCR 0x{edscr or 0:08X}, EDPRSR 0x{edprsr or 0:08X}). EDPRSR.SDR "
+                "never set, so the core never left Debug state (guide §5.5)."
+            )
+        time.sleep(0.01)
 
 
 def resume(
@@ -812,49 +918,197 @@ def resume(
 ) -> CoreState:
     """Let a halted core run again.
 
-    The debug request is acknowledged first. Without that the request is still
-    asserted at the trigger matrix, so the core would re-enter Debug state the
-    moment it left it -- which looks exactly like a resume that did nothing.
+    The debug request is acknowledged first -- and its deassertion confirmed
+    through CTITRIGOUTSTATUS -- before the restart channel is pulsed. Without
+    that the request is still asserted at the trigger matrix and the core
+    swallows the restart (guide §5.5). The restart itself is then confirmed
+    through EDPRSR.SDR.
     """
     before = read_state(dap, core.debug_base, ap_base=ap_base)
     before_status = r52.edscr_status(before.edscr) if before.edscr is not None else None
 
     _prepare_cti(dap, core, ap_base=ap_base)
-    _write_checked(
-        dap, ap_base, core.cti_base, r52.CTIINTACK, 1 << r52.TRIGOUT_DEBUG_REQUEST
+    _restart(dap, core, ap_base=ap_base)
+    return _confirm_restart(
+        dap, core, ap_base=ap_base, timeout_s=timeout_s, before_status=before_status
     )
-    _write_checked(
-        dap, ap_base, core.cti_base, r52.CTIAPPCLEAR, 1 << r52.CHANNEL_HALT
-    )
-    if not _write_checked(
-        dap, ap_base, core.cti_base, r52.CTIAPPPULSE, 1 << r52.CHANNEL_RESTART
-    ):
-        raise RunControlError(f"{core.name}: the CTIAPPPULSE write faulted.")
 
-    # Success is "the core executed", not "the core is still running". A
-    # breakpoint on a hot address re-halts before this poll can even see it
-    # running -- measured: resuming onto a breakpoint in an idle loop came back
-    # halted with EDSCR.STATUS changed from external-debug-request (0b010011) to
-    # breakpoint (0b000111). Treating that as a failed resume reported a working
-    # breakpoint as a broken resume, which is the guide's §7.5 case.
-    deadline = time.monotonic() + timeout_s
-    while True:
-        state = read_state(dap, core.debug_base, ap_base=ap_base)
-        if state.halted is False:
-            return state
-        status = r52.edscr_status(state.edscr) if state.edscr is not None else None
-        if status is not None and status != before_status:
-            state.rehalted = True
-            return state
-        if time.monotonic() > deadline:
-            break
-        time.sleep(0.01)
 
-    raise RunControlError(
-        f"{core.name} did not resume within {timeout_s:.1f}s "
-        f"(EDSCR 0x{state.edscr or 0:08X}, EDPRSR 0x{state.edprsr or 0:08X}). The halt "
-        "reason did not change either, so the core never left Debug state."
-    )
+def resume_group(
+    dap: Dap, cores: list[Core], *, ap_base: int = AP_APB, timeout_s: float = 2.0
+) -> dict[str, CoreState]:
+    """Restart every halted core in ``cores`` on a single pulse (guide §5.9).
+
+    Per core: acknowledge its debug request (and confirm the trigger
+    deasserted), route the restart channel, and open that channel's CTIGATE bit
+    so it reaches the cross-trigger matrix. One CTIAPPPULSE on any member then
+    restarts the whole group. The gate bits are closed again afterwards --
+    whatever happens -- so a later single-core resume stays local, which is the
+    tool's default posture.
+    """
+    halted = [
+        c
+        for c in cores
+        if read_state(dap, c.debug_base, ap_base=ap_base).halted is True
+    ]
+    if not halted:
+        raise RunControlError("no halted core to restart as a group.")
+
+    before: dict[int, int | None] = {}
+    mask = 1 << r52.CHANNEL_RESTART
+    results: dict[str, CoreState] = {}
+    try:
+        for c in halted:
+            state = read_state(dap, c.debug_base, ap_base=ap_base)
+            before[c.debug_base] = (
+                r52.edscr_status(state.edscr) if state.edscr is not None else None
+            )
+            _prepare_cti(dap, c, ap_base=ap_base)
+            _acknowledge_halt(dap, c, ap_base=ap_base)
+            gate = _read_checked(dap, ap_base, c.cti_base, r52.CTIGATE) or 0
+            _write_checked(dap, ap_base, c.cti_base, r52.CTIGATE, gate | mask)
+
+        # One pulse on any member; the open gates broadcast it over the CTM.
+        if not _write_checked(
+            dap, ap_base, halted[0].cti_base, r52.CTIAPPPULSE, mask
+        ):
+            raise RunControlError(
+                f"{halted[0].name}: the group CTIAPPPULSE write faulted."
+            )
+
+        for c in halted:
+            results[c.name] = _confirm_restart(
+                dap,
+                c,
+                ap_base=ap_base,
+                timeout_s=timeout_s,
+                before_status=before[c.debug_base],
+            )
+    finally:
+        for c in halted:
+            gate = _read_checked(dap, ap_base, c.cti_base, r52.CTIGATE) or 0
+            _write_checked(dap, ap_base, c.cti_base, r52.CTIGATE, gate & ~mask)
+    return results
+
+
+def reset_halt(
+    dap: Dap, core: Core, *, ap_base: int = AP_APB, timeout_s: float = 5.0
+) -> CoreState:
+    """Functional-reset the system and catch ``core`` before its first instruction.
+
+    The guide's §5.10.2 **hold flow**, chosen over the §5.10.3 SDARSTMASK
+    variant because the bench settled it: the mask write lands but the RTU
+    debug state is wiped anyway, and a functional reset taken with the mask set
+    wedged the boot (measured 2026-08-02; see gates.py). This flow needs no
+    mask:
+
+    1. Clear the core's ``SDARSTCTRL.RSTREL`` bit -- hold it in reset.
+    2. Assert and release functional reset through ``SDASYSRSTC``. The system
+       boots normally; the held core stays in reset.
+    3. Arm ``EDECR.RCE`` on the held core. EDECR is exempt from the OS lock and
+       readable/writable in this state (guide §5.2 exempt list).
+    4. Set ``RSTREL`` back: the core leaves reset, pends the Reset Catch, and
+       halts before fetching an instruction. The cold reset re-set its OS lock,
+       so the halt is detected through ``EDPRSR`` (exempt) and the lock is
+       cleared before EDSCR is read for the catch status.
+
+    **The functional reset is system-wide**: every core reboots, and only the
+    chosen core is caught. Comparators on the *other* cores do not survive it
+    (§3.6 -- and the masked variant that was meant to preserve them does not
+    work here). The catch bit is cleared and the RSTREL bit restored whatever
+    happens.
+    """
+    aff = core.identity.affinity
+    if aff is None:
+        raise RunControlError(
+            f"{core.name}: DEVAFF0 did not read, so the SDARSTCTRL release bit "
+            "cannot be identified."
+        )
+    hold_bit = 1 << gates.rstrel_bit(aff[1], aff[2])
+
+    rstctrl = gates.read_reset_control(dap)
+    gates.write_reset_control(dap, rstctrl & ~hold_bit)
+    back = gates.read_reset_control(dap)
+    if back & hold_bit:
+        raise RunControlError(
+            f"{core.name}: the SDARSTCTRL hold bit did not land "
+            f"(wrote 0x{rstctrl & ~hold_bit:08X}, read back 0x{back:08X})."
+        )
+
+    released = False
+    try:
+        gates.hold_in_functional_reset(dap)
+        time.sleep(0.05)
+        gates.release_functional_reset(dap)
+
+        # The system is rebooting; wait until the held core's frame answers
+        # and reports it in reset.
+        deadline = time.monotonic() + 2.0
+        while True:
+            edprsr = _read_checked(dap, ap_base, core.debug_base, r52.EDPRSR)
+            if edprsr is not None and edprsr & r52.EDPRSR_R:
+                break
+            if time.monotonic() > deadline:
+                raise RunControlError(
+                    f"{core.name}: not held in reset after the functional reset "
+                    f"(EDPRSR 0x{edprsr or 0:08X}) -- the RSTREL hold did not stick."
+                )
+            time.sleep(0.02)
+
+        # Arm the catch while held. EDECR is in the §5.2 OS-lock-exempt list.
+        edecr = _read_checked(dap, ap_base, core.debug_base, r52.EDECR)
+        if edecr is None or not _write_checked(
+            dap, ap_base, core.debug_base, r52.EDECR, (edecr or 0) | r52.EDECR_RCE
+        ):
+            raise RunControlError(
+                f"{core.name}: the EDECR.RCE write faulted while the core was held "
+                "in reset."
+            )
+        check = _read_checked(dap, ap_base, core.debug_base, r52.EDECR)
+        if check is None or not check & r52.EDECR_RCE:
+            raise RunControlError(
+                f"{core.name}: EDECR.RCE did not stick while held in reset "
+                f"(read back 0x{check or 0:08X})."
+            )
+
+        # Release the core; the catch fires before its first instruction.
+        gates.write_reset_control(dap, gates.read_reset_control(dap) | hold_bit)
+        released = True
+
+        # The cold reset re-set the OS lock, so EDSCR is unreadable until it is
+        # cleared -- detect the halt through EDPRSR (exempt), then unlock.
+        deadline = time.monotonic() + timeout_s
+        while True:
+            edprsr = _read_checked(dap, ap_base, core.debug_base, r52.EDPRSR)
+            if (
+                edprsr is not None
+                and not edprsr & r52.EDPRSR_R
+                and edprsr & r52.EDPRSR_HALTED
+            ):
+                break
+            if time.monotonic() > deadline:
+                raise RunControlError(
+                    f"{core.name}: no reset catch within {timeout_s:.1f}s of "
+                    f"releasing the core (EDPRSR 0x{edprsr or 0:08X})."
+                )
+            time.sleep(0.01)
+
+        unlock(dap, core, ap_base=ap_base)
+        return read_state(dap, core.debug_base, ap_base=ap_base)
+    finally:
+        now = _read_checked(dap, ap_base, core.debug_base, r52.EDECR)
+        if now is not None:
+            _write_checked(
+                dap,
+                ap_base,
+                core.debug_base,
+                r52.EDECR,
+                now & ~(r52.EDECR_RCE | r52.EDECR_OSUCE),
+            )
+        if not released:
+            # Never leave the core held: restore the release bit even when the
+            # flow failed partway.
+            gates.write_reset_control(dap, gates.read_reset_control(dap) | hold_bit)
 
 
 # ---------------------------------------------------------------------------
@@ -1248,12 +1502,43 @@ def clear_watchpoint(dap: Dap, core: Core, index: int, *, ap_base: int = AP_APB)
     _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(index), 0)
 
 
+def sanitize_comparators(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
+    """Blank every breakpoint and watchpoint comparator on this core.
+
+    Guide §5.7: "Every DBGBVR/DBGBCR/DBGWVR/DBGWCR field is UNKNOWN after cold
+    reset -- including E! Initialize all comparators you use *and explicitly
+    write E = 0 on every unused one*." A garbage comparator that happens to
+    read as enabled can fire at an arbitrary address; nothing else ever clears
+    it, because the free-slot search skips anything that reads as armed.
+
+    Returns how many slots read as armed before sanitising, so the caller can
+    say what was discarded rather than doing it silently.
+    """
+    bp_total, wp_total = comparator_counts(core)
+    armed = 0
+    for n in range(bp_total):
+        control = _read_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n))
+        if control is not None and control & r52.DBGBCR_E:
+            armed += 1
+        _write_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n), 0)
+        _write_checked(dap, ap_base, core.debug_base, r52.dbgbvr(n), 0)
+    for n in range(wp_total):
+        control = _read_checked(dap, ap_base, core.debug_base, r52.dbgwcr(n))
+        if control is not None and control & r52.DBGWCR_E:
+            armed += 1
+        _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(n), 0)
+        _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(n), 0)
+    return armed
+
+
 def _restart(dap: Dap, core: Core, *, ap_base: int) -> None:
-    """Pulse the CTI restart channel. Shared by resume() and step()."""
-    _write_checked(
-        dap, ap_base, core.cti_base, r52.CTIINTACK, 1 << r52.TRIGOUT_DEBUG_REQUEST
-    )
-    _write_checked(dap, ap_base, core.cti_base, r52.CTIAPPCLEAR, 1 << r52.CHANNEL_HALT)
+    """Acknowledge the halt request, then pulse the CTI restart channel.
+
+    Shared by resume() and step(). The acknowledge polls CTITRIGOUTSTATUS until
+    the debug-request trigger deasserts -- guide §5.5, "or the core swallows
+    the restart".
+    """
+    _acknowledge_halt(dap, core, ap_base=ap_base)
     if not _write_checked(
         dap, ap_base, core.cti_base, r52.CTIAPPPULSE, 1 << r52.CHANNEL_RESTART
     ):
@@ -1269,6 +1554,47 @@ def read_pc(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
         return read_reg(dap, core, r52.SCRATCH_REG, ap_base=ap_base)
     finally:
         write_reg(dap, core, r52.SCRATCH_REG, saved, ap_base=ap_base)
+
+
+def read_dspsr(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
+    """The saved PSR of a halted core, from DSPSR."""
+    t32 = _INSTRUCTION_SET.get(core.debug_base, True)
+    saved = read_reg(dap, core, r52.SCRATCH_REG, ap_base=ap_base)
+    try:
+        execute(
+            dap, core, r52.instr_dspsr_to_reg(r52.SCRATCH_REG, t32=t32), ap_base=ap_base
+        )
+        return read_reg(dap, core, r52.SCRATCH_REG, ap_base=ap_base)
+    finally:
+        write_reg(dap, core, r52.SCRATCH_REG, saved, ap_base=ap_base)
+
+
+def _write_debug_sysreg(
+    dap: Dap, core: Core, builder, value: int, *, ap_base: int
+) -> None:
+    """Move ``value`` into a p15 debug register through the scratch register."""
+    t32 = _INSTRUCTION_SET.get(core.debug_base, True)
+    saved = read_reg(dap, core, r52.SCRATCH_REG, ap_base=ap_base)
+    try:
+        write_reg(dap, core, r52.SCRATCH_REG, value, ap_base=ap_base)
+        execute(dap, core, builder(r52.SCRATCH_REG, t32=t32), ap_base=ap_base)
+    finally:
+        write_reg(dap, core, r52.SCRATCH_REG, saved, ap_base=ap_base)
+
+
+def write_pc(dap: Dap, core: Core, value: int, *, ap_base: int = AP_APB) -> None:
+    """Set the address the core will restart from, by writing DLR.
+
+    Guide §5.5: "On exit the core restarts from DLR; if you changed the PC,
+    write DLR first." The Thumb state bit is not part of the address -- which
+    instruction set the core resumes in comes from DSPSR.T, not from DLR[0].
+    """
+    _write_debug_sysreg(dap, core, r52.instr_reg_to_dlr, value & ~1, ap_base=ap_base)
+
+
+def write_dspsr(dap: Dap, core: Core, value: int, *, ap_base: int = AP_APB) -> None:
+    """Set the PSR the core will restore on restart, by writing DSPSR."""
+    _write_debug_sysreg(dap, core, r52.instr_reg_to_dspsr, value, ap_base=ap_base)
 
 
 def step(
@@ -1351,14 +1677,18 @@ def step(
             status = r52.edscr_status(state.edscr) if state.edscr is not None else None
             if state.halted and status in r52.STEP_COMPLETE_STATUSES:
                 return state
-            if state.halted and status == 0b000111:
+            if state.halted and status == r52.EDSCR_STATUS_BREAKPOINT:
                 # A breakpoint on the instruction the step landed *on*. The step
                 # happened; this is a legitimate stop. Distinguishable from the
                 # re-trigger case above only because armed comparators are
                 # suspended for the duration -- without that suspension this
                 # branch accepted "nothing moved" as a successful step.
                 return state
-            if state.halted and status is not None and status != 0b010011:
+            if (
+                state.halted
+                and status is not None
+                and status != r52.EDSCR_STATUS_EXTERNAL_DEBUG_REQUEST
+            ):
                 return state
             if time.monotonic() > deadline:
                 raise RunControlError(
@@ -1397,6 +1727,13 @@ def read_instruction(
     """
     address &= ~1  # the Thumb state bit is not part of the address
     aligned = address & ~3
+
+    # The tool's own bus policy applies on this path too. RM Table 957 forbids
+    # AXI-AP traffic while functional reset is asserted (the guide's pitfall
+    # #3: recoverable only by a destructive reset), and `mem --ap axi` refuses
+    # in that state -- so the step-over instruction fetch must refuse the same
+    # way rather than bypass the guard.
+    memaccess.preflight(dap, ap_base, write=False)
 
     word = dap.mem_read_checked(ap_base, aligned, size=32)
     if word is None:
@@ -1484,7 +1821,10 @@ def step_over(
         deadline = time.monotonic() + timeout_s
         while True:
             state = read_state(dap, core.debug_base, ap_base=ap_base)
-            if state.halted and r52.edscr_status(state.edscr or 0) == 0b000111:
+            if (
+                state.halted
+                and r52.edscr_status(state.edscr or 0) == r52.EDSCR_STATUS_BREAKPOINT
+            ):
                 return state, info
             if time.monotonic() > deadline:
                 raise RunControlError(
@@ -1623,7 +1963,7 @@ def halt_location(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> dict[str, o
         "halt_reason": r52.edscr_status_name(state.edscr),
     }
 
-    if status == 0b000111:  # halted: breakpoint
+    if status == r52.EDSCR_STATUS_BREAKPOINT:
         armed = [
             entry
             for entry in list_breakpoints(dap, core, ap_base=ap_base)
@@ -1645,11 +1985,28 @@ def halt_location(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> dict[str, o
                 "EDSCR says breakpoint but no comparator is armed -- the breakpoint "
                 "may have been cleared since, or this was a software breakpoint."
             )
-    elif status == 0b101011:  # halted: watchpoint
+    elif status == r52.EDSCR_STATUS_WATCHPOINT:
         out["armed_watchpoints"] = [
             e for e in list_watchpoints(dap, core, ap_base=ap_base) if e.get("enabled")
         ]
-        out["source"] = "stopped on a data watchpoint; the address above is the data, not the PC"
+        # Guide §5.3: "On a watchpoint halt, the data address is in EDWAR" --
+        # the high word is UNKNOWN and ignored. §5.8 adds that the reported
+        # address may be rounded within a naturally-aligned block (on the R52,
+        # no lower than the watched address rounded down to 16 bytes).
+        edwar = _read_checked(dap, ap_base, core.debug_base, r52.EDWAR_LO)
+        if edwar is not None:
+            out["known"] = True
+            out["address"] = f"0x{edwar:08X}"
+            out["data_address"] = f"0x{edwar:08X}"
+            out["source"] = (
+                "EDWAR: the data address that triggered the watchpoint (not the PC; "
+                "may be rounded down within 16 bytes)"
+            )
+        else:
+            out["source"] = (
+                "stopped on a data watchpoint; EDWAR did not read, so the armed "
+                "comparators above are the only address evidence"
+            )
 
     return out
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from .errors import PowerUpError, S32EError, TransportError, UnsafeOperation
 from .jtag import bscan as bscan_mod
 from .jtag import tap as tap_mod
 from .report import emit
+from .session import DebugSession
 from .transport import Tif, discover, list_installs, make_transport
 
 console = Console()
@@ -56,6 +58,11 @@ class Ctx:
     echo: bool
     irlen: int | None
     device: str | None
+    #: The active debug session, when running inside the `debug` REPL. While
+    #: set, `open_transport` yields the held connection instead of opening a
+    #: fresh one -- which is the whole point of a session on a board where
+    #: every connect pulses reset into the SBC/PMIC (test-plan defect D-2).
+    session: DebugSession | None = None
 
 
 def _emit_json(target: str | None, payload: object) -> None:
@@ -75,6 +82,19 @@ def open_transport(
     connect_dap: bool = True,
     needs_raw_jtag: bool = False,
 ) -> Iterator[tuple[object, Dap | None]]:
+    # Inside a debug session the connection already exists and is shared:
+    # yield it and do not close it. Commands that genuinely cannot share (raw
+    # JTAG needs the commander backend) are refused rather than silently
+    # opening a second connection under the held one.
+    if ctx.session is not None:
+        if needs_raw_jtag:
+            raise UnsafeOperation(
+                "raw JTAG needs the commander backend, and the debug session holds "
+                "the probe through the dll backend. Quit the session first."
+            )
+        yield ctx.session.transport, (ctx.session.dap if connect_dap else None)
+        return
+
     install = discover(ctx.jlink_dir)
     kind = ctx.transport_kind
 
@@ -160,7 +180,9 @@ def _bring_up_link(t: object, ctx: Ctx, tif: Tif) -> None:
             pass
 
 
-def _prepare_dap(dap: Dap, *, system_power: bool = False, attempts: int = 4) -> list[str]:
+def _prepare_dap(
+    dap: Dap, *, ctx: Ctx | None = None, system_power: bool = False, attempts: int = 4
+) -> list[str]:
     """Power up the debug domain and calibrate the AP-read model.
 
     The power-up is retried, because on this target it succeeds only in windows:
@@ -168,7 +190,14 @@ def _prepare_dap(dap: Dap, *, system_power: bool = False, attempts: int = 4) -> 
     made every DAP command look permanently broken during a period when it was
     merely busy. This does not rescue a genuinely dead TAP -- if the JTAGC is
     held in reset the retries all fail and the error says so.
+
+    Inside a debug session this runs once: the power-up bits and the pipeline
+    calibration hold for the life of the connection, so repeating them per
+    command would only add traffic and repeat the notes.
     """
+    session = ctx.session if ctx is not None else None
+    if session is not None and session.prepared:
+        return []
     notes: list[str] = []
     for attempt in range(1, attempts + 1):
         try:
@@ -191,6 +220,8 @@ def _prepare_dap(dap: Dap, *, system_power: bool = False, attempts: int = 4) -> 
             f"AP reads are {'pipelined' if dap.ap_read_pipelined else 'direct'} "
             "on this transport (determined by reading a known IDR both ways)."
         )
+    if session is not None:
+        session.prepared = True
     return notes
 
 
@@ -402,7 +433,7 @@ def connect(ctx: Ctx, system_power: bool) -> None:
                                           for k, v in ident.items()})
             return
 
-        notes = _prepare_dap(dap, system_power=system_power)
+        notes = _prepare_dap(dap, ctx=ctx, system_power=system_power)
         info = dap.info()
 
         if info.dpidr is None:
@@ -605,7 +636,7 @@ def gates_status(ctx: Ctx) -> None:
     """Read the MDM-AP gate and the SDA-AP (HSE) gate. Read-only."""
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        _prepare_dap(dap)
+        _prepare_dap(dap, ctx=ctx)
         report = gates_mod.status(dap)
         emit.print_gates(report, console)
         if ctx.json_out:
@@ -622,7 +653,7 @@ def gates_apply(ctx: Ctx) -> None:
     """
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        _prepare_dap(dap)
+        _prepare_dap(dap, ctx=ctx)
         report = gates_mod.apply_ladder1(dap)
         emit.print_gates(report, console)
         if report.mdm.enables_set:
@@ -736,7 +767,7 @@ def attach(ctx: Ctx, attempts: int, hold: bool, gate: bool) -> None:
     if gate:
         with open_transport(ctx) as (_t2, dap):
             assert dap is not None
-            _prepare_dap(dap)
+            _prepare_dap(dap, ctx=ctx)
             report = gates_mod.apply_ladder1(dap)
             state = "open" if report.mdm.enables_set else "still gated"
             console.print(f"debug-enable gate: {state}")
@@ -821,7 +852,7 @@ def mem_info(ctx: Ctx, ap_spec: str) -> None:
     ap_base = _resolve_ap_or_fail(ap_spec)
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap):
+        for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
         idr = dap.ap_read(ap_base, adiv6.AP_IDR)
         cfg = dap.read_ap_cfg(ap_base)
@@ -859,7 +890,7 @@ def mem_read(ctx: Ctx, addr: str, ap_spec: str, size: str, count: int) -> None:
     width = int(size)
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap):
+        for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
         _report, notes = memaccess.preflight(dap, ap_base, write=False)
         range_note = memaccess.apb_range_note(ap_base, start)
@@ -894,7 +925,7 @@ def mem_dump(ctx: Ctx, addr: str, nbytes: int, ap_spec: str) -> None:
         raise click.ClickException("dump address and length must both be 4-byte aligned")
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap):
+        for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
         _report, notes = memaccess.preflight(dap, ap_base, write=False)
         for note in notes:
@@ -930,7 +961,7 @@ def mem_write(ctx: Ctx, addr: str, value: str, ap_spec: str, size: str, yes: boo
         )
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap):
+        for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
         _report, notes = memaccess.preflight(dap, ap_base, write=True)
         for note in notes:
@@ -974,7 +1005,16 @@ def core() -> None:
 
 
 def _discover_cores(ctx: Ctx, dap: Dap) -> list[runcontrol.Core]:
-    for note in _prepare_dap(dap):
+    session = ctx.session
+    if session is not None and session.cores is not None:
+        # Identity is stable for the life of the connection; run state is not.
+        # Serving the cache with stale state made `status` report a core as
+        # running that the previous session command had halted.
+        for c in session.cores:
+            c.state = runcontrol.read_state(dap, c.debug_base)
+        return session.cores
+
+    for note in _prepare_dap(dap, ctx=ctx):
         console.print(f"[dim]note:[/dim] {note}")
     cores = runcontrol.discover(dap)
     if not cores:
@@ -984,7 +1024,58 @@ def _discover_cores(ctx: Ctx, dap: Dap) -> list[runcontrol.Core]:
             "open, `s32edbg romdump --source apb` will show whether the APBIC2 tree "
             "enumerates at all."
         )
+    if session is not None:
+        session.cores = cores
     return cores
+
+
+def _focus(ctx: Ctx) -> str | None:
+    """The session's default core, when a command names none."""
+    return ctx.session.focus if ctx.session is not None else None
+
+
+def _session_touch(ctx: Ctx, dap: Dap, c: runcontrol.Core) -> None:
+    """First write-operation touch of an R52 core inside a session.
+
+    Sanitises the comparators once per core per session -- guide §5.7: every
+    DBGB/DBGW register field is UNKNOWN after cold reset, *including the enable
+    bit*, so the session starts each core it drives from a known state.
+    `--keep-breakpoints` skips this for workflows that deliberately carry
+    comparators from one session to the next.
+    """
+    session = ctx.session
+    if session is None or session.keep_breakpoints or c.name in session.sanitized:
+        return
+    try:
+        armed = runcontrol.sanitize_comparators(dap, c)
+    except S32EError as exc:
+        console.print(f"[yellow]![/yellow] {c.name}: comparator sanitation failed: {exc}")
+        return
+    session.sanitized.add(c.name)
+    if armed:
+        console.print(
+            f"[dim]{c.name}:[/dim] disabled {armed} pre-existing comparator(s) at "
+            "session start (guide §5.7; `debug --keep-breakpoints` keeps them)"
+        )
+
+
+def _m33_session_touch(ctx: Ctx, dap: Dap, c) -> None:
+    """M33 counterpart of `_session_touch` -- FPB and DWT slots."""
+    session = ctx.session
+    key = f"m33:{c.name}"
+    if session is None or session.keep_breakpoints or key in session.sanitized:
+        return
+    try:
+        armed = m33_mod.sanitize_comparators(dap, c)
+    except S32EError as exc:
+        console.print(f"[yellow]![/yellow] {c.name}: comparator sanitation failed: {exc}")
+        return
+    session.sanitized.add(key)
+    if armed:
+        console.print(
+            f"[dim]{c.name}:[/dim] disabled {armed} pre-existing comparator(s) at "
+            "session start (`debug --keep-breakpoints` keeps them)"
+        )
 
 
 @core.command("list")
@@ -1014,6 +1105,8 @@ def core_status(ctx: Ctx, core_spec: str | None) -> None:
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
+        if core_spec is None:
+            core_spec = _focus(ctx)  # inside a session, `status` means the focused core
         if core_spec is not None:
             try:
                 cores = [runcontrol.resolve(core_spec, cores)]
@@ -1064,10 +1157,16 @@ def core_status(ctx: Ctx, core_spec: str | None) -> None:
 
 
 def _select_cores(
-    core_spec: str | None, all_cores: bool, cores: list[runcontrol.Core]
+    core_spec: str | None,
+    all_cores: bool,
+    cores: list[runcontrol.Core],
+    *,
+    default: str | None = None,
 ) -> list[runcontrol.Core]:
     if all_cores:
         return cores
+    if core_spec is None:
+        core_spec = default  # the session's focused core, when one is set
     if core_spec is None:
         raise click.ClickException(
             "say which core: --core <index|name|address>, or --all. Names on this "
@@ -1103,7 +1202,7 @@ def core_unlock(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
         assert dap is not None
         cores = _discover_cores(ctx, dap)
         payload: list[dict[str, object]] = []
-        for c in _select_cores(core_spec, all_cores, cores):
+        for c in _select_cores(core_spec, all_cores, cores, default=_focus(ctx)):
             runcontrol.preflight(c, write=True)
             notes = runcontrol.unlock(dap, c)
             for note in notes:
@@ -1131,7 +1230,7 @@ def core_halt(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
-        chosen = _select_cores(core_spec, all_cores, cores)
+        chosen = _select_cores(core_spec, all_cores, cores, default=_focus(ctx))
         console.print(f"[yellow]![/yellow] {HALT_WARNING}")
 
         payload: list[dict[str, object]] = []
@@ -1140,8 +1239,11 @@ def core_halt(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
                 console.print(f"[yellow]![/yellow] {c.name}: {note}")
             for note in runcontrol.unlock(dap, c):
                 console.print(f"[dim]{c.name}:[/dim] {note}")
+            _session_touch(ctx, dap, c)
 
             state = runcontrol.halt(dap, c)
+            if ctx.session is not None:
+                ctx.session.note_halted(c.name)
             console.print(
                 f"[green]{c.name} halted[/green] -- "
                 f"{r52debug.edscr_status_name(state.edscr or 0)} "
@@ -1155,25 +1257,37 @@ def core_halt(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
 @core.command("resume")
 @_core_option
 @click.option("--all", "all_cores", is_flag=True, help="Resume every core.")
+@click.option("--sync", is_flag=True,
+              help="Restart every selected halted core on a single CTM pulse "
+                   "(guide §5.9), instead of one at a time.")
 @click.pass_obj
-def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
+def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool, sync: bool) -> None:
     """Let a halted core run again.
 
-    Acknowledges the debug request before restarting. Skipping that leaves the
-    request asserted at the trigger matrix, so the core re-enters Debug state
-    immediately and the resume looks like it did nothing.
+    Acknowledges the debug request -- and confirms the trigger deasserted --
+    before restarting, then confirms the restart through EDPRSR.SDR. Skipping
+    the acknowledge leaves the request asserted at the trigger matrix, so the
+    core re-enters Debug state immediately and the resume looks like it did
+    nothing.
+
+    `--sync` is the guide's §5.9 synchronized restart: each participating
+    core's restart channel is gated onto the cross-trigger matrix and one pulse
+    restarts them all together, then the gates are closed again.
     """
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
+        chosen = _select_cores(core_spec, all_cores, cores, default=_focus(ctx))
         payload: list[dict[str, object]] = []
-        for c in _select_cores(core_spec, all_cores, cores):
-            runcontrol.preflight(c, write=True)
-            state = runcontrol.resume(dap, c)
+
+        def report(name: str, state: runcontrol.CoreState) -> None:
+            if ctx.session is not None and not state.rehalted:
+                ctx.session.note_resumed(name)
             if state.rehalted:
+                c = runcontrol.resolve(name, cores)
                 where = runcontrol.halt_location(dap, c)
                 console.print(
-                    f"[yellow]{c.name} ran and immediately re-halted[/yellow] -- "
+                    f"[yellow]{name} ran and immediately re-halted[/yellow] -- "
                     f"{r52debug.edscr_status_name(state.edscr or 0)}"
                     + (f" at {where['address']}" if where.get("address") else "")
                 )
@@ -1183,10 +1297,25 @@ def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
                 )
             else:
                 console.print(
-                    f"[green]{c.name} running[/green] -- "
+                    f"[green]{name} running[/green] -- "
                     f"{r52debug.edscr_status_name(state.edscr or 0)}"
                 )
-            payload.append({"core": c.name, **state.as_dict()})
+            payload.append({"core": name, **state.as_dict()})
+
+        if sync:
+            for c in chosen:
+                runcontrol.preflight(c, write=True)
+            results = runcontrol.resume_group(dap, chosen)
+            console.print(
+                f"[dim]synchronized restart: one pulse released "
+                f"{len(results)} core(s)[/dim]"
+            )
+            for name, state in results.items():
+                report(name, state)
+        else:
+            for c in chosen:
+                runcontrol.preflight(c, write=True)
+                report(c.name, runcontrol.resume(dap, c))
         if ctx.json_out:
             _emit_json(ctx.json_out, {"resume": payload})
 
@@ -1195,7 +1324,7 @@ def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
 @_core_option
 @click.option("--over/--into", default=False, show_default="--into",
               help="--over runs a call to completion; --into steps one instruction.")
-@click.option("--count", type=int, default=1, show_default=True)
+@click.option("--count", type=click.IntRange(min=1), default=1, show_default=True)
 @click.option("--mask-interrupts/--allow-interrupts", default=True, show_default=True,
               help="Masking stops a step landing in an interrupt handler instead of "
                    "the next instruction.")
@@ -1210,6 +1339,10 @@ def core_step(ctx: Ctx, core_spec: str | None, over: bool, count: int,
     lets the call run, so you do not step through the whole callee.
     """
     with _one_core(ctx, core_spec) as (dap, c):
+        if ctx.session is not None:
+            # The session now owns this core's run state: it is halted at the
+            # end of every step, and restore-on-close should resume it.
+            ctx.session.note_halted(c.name)
         for n in range(count):
             before = runcontrol.read_pc(dap, c)
             if over:
@@ -1226,6 +1359,52 @@ def core_step(ctx: Ctx, core_spec: str | None, over: bool, count: int,
             )
         if ctx.json_out:
             _emit_json(ctx.json_out, {"core": c.name, "pc": f"0x{after:08X}"})
+
+
+@core.command("reset-halt")
+@_core_option
+@click.pass_obj
+def core_reset_halt(ctx: Ctx, core_spec: str | None) -> None:
+    """Functional-reset the system and halt a core at its first instruction.
+
+    The guide's §5.10.3 flow: SDARSTMASK preserves the R52 debug state across
+    the reset, EDECR.RCE arms the Reset Catch (plus OSUCE for boot software's
+    OS-restore), and SDASYSRSTC asserts and releases the functional reset. The
+    core halts with DLR at the reset vector, having fetched nothing.
+    """
+    with open_transport(ctx) as (_t, dap):
+        assert dap is not None
+        cores = _discover_cores(ctx, dap)
+        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
+        runcontrol.preflight(c, write=True)
+        console.print(
+            "[yellow]![/yellow] this asserts a SYSTEM-WIDE functional reset: every "
+            f"core reboots, and only {c.name} is caught at its reset vector. The "
+            "debug connection survives (RM Table 301)."
+        )
+        state = runcontrol.reset_halt(dap, c)
+        if ctx.session is not None:
+            ctx.session.note_halted(c.name)
+        _session_touch(ctx, dap, c)
+        try:
+            pc = runcontrol.read_pc(dap, c)
+            where = f"  PC 0x{pc:08X}"
+        except S32EError as exc:
+            pc = None
+            where = f"  (PC unreadable: {exc})"
+        console.print(
+            f"[green]{c.name} caught[/green] -- "
+            f"{r52debug.edscr_status_name(state.edscr or 0)}{where}"
+        )
+        if ctx.json_out:
+            _emit_json(
+                ctx.json_out,
+                {
+                    "core": c.name,
+                    "pc": f"0x{pc:08X}" if pc is not None else None,
+                    **state.as_dict(),
+                },
+            )
 
 
 @core.command("xtrigger")
@@ -1275,7 +1454,7 @@ def core_sample(ctx: Ctx, core_spec: str | None, count: int) -> None:
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
-        c = _select_cores(core_spec, False, cores)[0]
+        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
         result = runcontrol.sample_pc(dap, c, count)
 
         console.print(
@@ -1307,7 +1486,7 @@ def core_regs(ctx: Ctx, core_spec: str | None) -> None:
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
-        c = _select_cores(core_spec, False, cores)[0]
+        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
         runcontrol.preflight(c, write=True)
 
         regs = runcontrol.read_registers(dap, c)
@@ -1331,19 +1510,29 @@ def core_regs(ctx: Ctx, core_spec: str | None) -> None:
 @_core_option
 @click.pass_obj
 def core_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> None:
-    """Read or write one register of a halted core: `core reg r3`, `core reg r3 0x1234`."""
+    """Read or write one register of a halted core: `core reg r3`, `core reg pc 0x321D2EE6`.
+
+    `pc` (an alias of `dlr`) and `dspsr` are the Debug-state PC and saved PSR,
+    reached through MRC/MCR p15 (Cortex-R52 TRM §4.2.31). Guide §5.5: the core
+    restarts from DLR, so writing `pc` is how execution is redirected before a
+    resume; which instruction set it resumes in comes from DSPSR.T.
+    """
     key = name.strip().lower()
-    if not (key.startswith("r") and key[1:].isdigit() and 0 <= int(key[1:]) <= 14):
+    special = {
+        "pc": (runcontrol.read_pc, runcontrol.write_pc, "pc (DLR)"),
+        "dlr": (runcontrol.read_pc, runcontrol.write_pc, "pc (DLR)"),
+        "dspsr": (runcontrol.read_dspsr, runcontrol.write_dspsr, "dspsr"),
+    }
+    is_gp = key.startswith("r") and key[1:].isdigit() and 0 <= int(key[1:] or "99") <= 14
+    if not is_gp and key not in special:
         raise click.ClickException(
-            f"{name!r} is not a readable core register. Use r0-r14; PC is reported "
-            "separately by `core regs` because it does not come from the register file."
+            f"{name!r} is not a supported register. Use r0-r14, pc (= dlr), or dspsr."
         )
-    n = int(key[1:])
 
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
-        c = _select_cores(core_spec, False, cores)[0]
+        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
         runcontrol.preflight(c, write=True)
 
         if not runcontrol.verify_register_path(dap, c):
@@ -1351,12 +1540,20 @@ def core_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> N
                 "the register-transfer round trip failed; refusing to report or write "
                 "a register value."
             )
-        if value is not None:
-            runcontrol.write_reg(dap, c, n, int(value, 0))
-        got = runcontrol.read_reg(dap, c, n)
-        console.print(f"{c.name}  r{n} = 0x{got:08X}")
+        if is_gp:
+            n = int(key[1:])
+            if value is not None:
+                runcontrol.write_reg(dap, c, n, int(value, 0))
+            got = runcontrol.read_reg(dap, c, n)
+            label = f"r{n}"
+        else:
+            reader, writer, label = special[key]
+            if value is not None:
+                writer(dap, c, int(value, 0))
+            got = reader(dap, c)
+        console.print(f"{c.name}  {label} = 0x{got:08X}")
         if ctx.json_out:
-            _emit_json(ctx.json_out, {"core": c.name, "register": f"r{n}", "value": f"0x{got:08X}"})
+            _emit_json(ctx.json_out, {"core": c.name, "register": label, "value": f"0x{got:08X}"})
 
 
 # ---------------------------------------------------------------------------
@@ -1392,9 +1589,14 @@ def m33() -> None:
 def _one_m33(ctx: Ctx, core_spec: str | None, *, write: bool = True):
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap):
+        for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
         cores = m33_mod.discover(dap)
+        if ctx.session is not None:
+            # The session's restore-on-close needs live core objects.
+            ctx.session.m33_cores = cores
+            if core_spec is None:
+                core_spec = ctx.session.m33_focus
         if core_spec is None:
             raise click.ClickException(
                 "say which core: --core " + "|".join(m33_mod.M33_APS)
@@ -1405,6 +1607,8 @@ def _one_m33(ctx: Ctx, core_spec: str | None, *, write: bool = True):
             raise click.ClickException(str(exc)) from exc
         for note in m33_mod.preflight(c, write=write):
             console.print(f"[yellow]![/yellow] {c.name}: {note}")
+        if write:
+            _m33_session_touch(ctx, dap, c)
         yield dap, c
 
 
@@ -1414,9 +1618,11 @@ def m33_list(ctx: Ctx) -> None:
     """Identify all three M33 subsystems. Read-only."""
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap):
+        for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
         cores = m33_mod.discover(dap)
+        if ctx.session is not None:
+            ctx.session.m33_cores = cores
         emit.print_m33_cores(cores, console)
         if ctx.json_out:
             _emit_json(ctx.json_out, {"m33": [c.as_dict() for c in cores]})
@@ -1430,12 +1636,20 @@ def m33_halt(ctx: Ctx, core_spec: str | None) -> None:
     with _one_m33(ctx, core_spec) as (dap, c):
         console.print(f"[yellow]![/yellow] {HALT_WARNING}")
         dhcsr = m33_mod.halt(dap, c)
+        if ctx.session is not None:
+            ctx.session.note_m33_halted(c.name)
+        cause = m33_mod.halt_cause(dap, c)
         pc = m33_mod.read_register(dap, c, "pc")
         console.print(
             f"[green]{c.name} halted[/green]  PC 0x{pc:08X}  DHCSR 0x{dhcsr:08X}"
         )
+        causes = cause.get("causes")
+        if causes:
+            console.print(f"[dim]cause: {', '.join(causes)} (DFSR {cause['raw']})[/dim]")
         if ctx.json_out:
-            _emit_json(ctx.json_out, {"core": c.name, "pc": f"0x{pc:08X}"})
+            _emit_json(
+                ctx.json_out, {"core": c.name, "pc": f"0x{pc:08X}", "cause": cause}
+            )
 
 
 @m33.command("resume")
@@ -1445,6 +1659,8 @@ def m33_resume(ctx: Ctx, core_spec: str | None) -> None:
     """Let a halted M33 core run again."""
     with _one_m33(ctx, core_spec) as (dap, c):
         dhcsr, rehalted = m33_mod.resume(dap, c)
+        if ctx.session is not None and not rehalted:
+            ctx.session.note_m33_resumed(c.name)
         if rehalted:
             pc = m33_mod.read_register(dap, c, "pc")
             console.print(
@@ -1468,6 +1684,8 @@ def m33_resume(ctx: Ctx, core_spec: str | None) -> None:
 def m33_step(ctx: Ctx, core_spec: str | None, count: int, mask_interrupts: bool) -> None:
     """Step a halted M33 core one instruction at a time."""
     with _one_m33(ctx, core_spec) as (dap, c):
+        if ctx.session is not None:
+            ctx.session.note_m33_halted(c.name)
         for n in range(count):
             before = m33_mod.read_register(dap, c, "pc")
             m33_mod.step(dap, c, mask_interrupts=mask_interrupts)
@@ -1537,6 +1755,8 @@ def m33_bp(ctx: Ctx, action: str, address: str | None, core_spec: str | None) ->
             if address is None:
                 raise click.ClickException("`bp set` needs an address")
             entry = m33_mod.set_breakpoint(dap, c, int(address, 0))
+            if ctx.session is not None:
+                ctx.session.note_m33_bp(c.name, int(entry["index"]))
             console.print(
                 f"[green]breakpoint {entry['index']}[/green] at {entry['address']} on {c.name}"
             )
@@ -1544,7 +1764,100 @@ def m33_bp(ctx: Ctx, action: str, address: str | None, core_spec: str | None) ->
             if address is None:
                 raise click.ClickException("`bp clear` needs a comparator index")
             m33_mod.clear_breakpoint(dap, c, int(address, 0))
+            if ctx.session is not None:
+                ctx.session.note_m33_bp_cleared(c.name, int(address, 0))
             console.print(f"cleared breakpoint {address} on {c.name}")
+
+
+@m33.command("wp")
+@click.argument("action", type=click.Choice(["list", "set", "clear"]))
+@click.argument("address", required=False)
+@click.option("--size", type=click.Choice(["1", "2", "4"]), default="4", show_default=True,
+              help="Watched object size; the address must be aligned to it.")
+@click.option("--on", "access", type=click.Choice(["load", "store", "both"]),
+              default="both", show_default=True)
+@click.option("--index", type=int, default=None,
+              help="Use this DWT comparator; default is the first free one.")
+@_m33_option
+@click.pass_obj
+def m33_wp(
+    ctx: Ctx,
+    action: str,
+    address: str | None,
+    size: str,
+    access: str,
+    index: int | None,
+    core_spec: str | None,
+) -> None:
+    """Manage M33 data watchpoints: `m33 wp list`, `wp set <addr>`, `wp clear <n>`.
+
+    These come from the DWT comparators (four on these cores, read from
+    DWT_CTRL rather than assumed), armed as halting debug events per the guide
+    §6.7. DWT watchpoints are asynchronous: the core halts *near* the access,
+    not at it, and DFSR reports DWTTRAP.
+    """
+    with _one_m33(ctx, core_spec, write=action != "list") as (dap, c):
+        if action == "list":
+            entries = m33_mod.list_watchpoints(dap, c)
+            emit.print_comparators(f"{c.name} watchpoints", entries, console)
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {"core": c.name, "watchpoints": entries})
+        elif action == "set":
+            if address is None:
+                raise click.ClickException("`wp set` needs an address")
+            try:
+                entry = m33_mod.set_watchpoint(
+                    dap, c, int(address, 0), size=int(size), on=access, index=index
+                )
+            except ValueError as exc:
+                raise click.ClickException(str(exc)) from exc
+            if ctx.session is not None:
+                ctx.session.note_m33_wp(c.name, int(entry["index"]))
+            console.print(
+                f"[green]watchpoint {entry['index']}[/green] at {entry['address']} on "
+                f"{c.name}, {entry['bytes']} byte(s), on {entry['on']}"
+            )
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {"core": c.name, "watchpoint": entry})
+        else:
+            if address is None:
+                raise click.ClickException("`wp clear` needs a comparator index")
+            m33_mod.clear_watchpoint(dap, c, int(address, 0))
+            if ctx.session is not None:
+                ctx.session.note_m33_wp_cleared(c.name, int(address, 0))
+            console.print(f"cleared watchpoint {address} on {c.name}")
+
+
+@m33.command("reset-halt")
+@_m33_option
+@click.pass_obj
+def m33_reset_halt(ctx: Ctx, core_spec: str | None) -> None:
+    """Warm-reset an M33 and halt it at its reset handler's first instruction.
+
+    The architected flow (guide §6.8): C_DEBUGEN + DEMCR.VC_CORERESET survive
+    the warm reset, AIRCR.SYSRESETREQ requests it, and the core halts before
+    the first handler instruction with DFSR.VCATCH set.
+    """
+    with _one_m33(ctx, core_spec) as (dap, c):
+        console.print(
+            "[yellow]![/yellow] SYSRESETREQ is a warm reset request; how far it "
+            "reaches on this SoC (this core or wider) is not settled -- treat the "
+            "system as rebooted."
+        )
+        dhcsr, pc = m33_mod.reset_halt(dap, c)
+        if ctx.session is not None:
+            ctx.session.note_m33_halted(c.name)
+        cause = m33_mod.halt_cause(dap, c)
+        console.print(
+            f"[green]{c.name} caught[/green] at reset  PC 0x{pc:08X}  DHCSR 0x{dhcsr:08X}"
+        )
+        causes = cause.get("causes")
+        if causes:
+            console.print(f"[dim]cause: {', '.join(causes)} (DFSR {cause['raw']})[/dim]")
+        if ctx.json_out:
+            _emit_json(
+                ctx.json_out, {"core": c.name, "pc": f"0x{pc:08X}", "cause": cause}
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1566,13 +1879,15 @@ def _one_core(ctx: Ctx, core_spec: str | None, *, write: bool = True):
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
-        c = _select_cores(core_spec, False, cores)[0]
+        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
         for note in runcontrol.preflight(c, write=write):
             console.print(f"[yellow]![/yellow] {c.name}: {note}")
         if write and c.state.unreachable_reason:
             for note in runcontrol.unlock(dap, c):
                 console.print(f"[dim]{c.name}:[/dim] {note}")
             c.state = runcontrol.read_state(dap, c.debug_base)
+        if write:
+            _session_touch(ctx, dap, c)
         yield dap, c
 
 
@@ -1615,6 +1930,8 @@ def bp_set(ctx: Ctx, address: str, core_spec: str | None, index: int | None, arm
         entry = runcontrol.set_breakpoint(
             dap, c, int(address, 0), index=index, thumb=not arm_state
         )
+        if ctx.session is not None:
+            ctx.session.note_bp(c.name, int(entry["index"]))
         console.print(
             f"[green]breakpoint {entry['index']}[/green] at {entry['address']} on {c.name} "
             f"(DBGBVR {entry['dbgbvr']}, DBGBCR {entry['dbgbcr']}, BAS {entry['bas']})"
@@ -1637,6 +1954,8 @@ def bp_clear(ctx: Ctx, index: int | None, core_spec: str | None, all_slots: bool
         targets = range(total) if all_slots else [index]
         for n in targets:  # type: ignore[arg-type]
             runcontrol.clear_breakpoint(dap, c, int(n))
+        if ctx.session is not None:
+            ctx.session.note_bp_cleared(c.name, None if all_slots else int(index))  # type: ignore[arg-type]
         console.print(f"cleared {'all ' if all_slots else ''}breakpoint(s) on {c.name}")
 
 
@@ -1672,6 +1991,8 @@ def wp_set(ctx: Ctx, address: str, core_spec: str | None, size: str, access: str
             )
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+        if ctx.session is not None:
+            ctx.session.note_wp(c.name, int(entry["index"]))
         console.print(
             f"[green]watchpoint {entry['index']}[/green] at {entry['address']} on {c.name}, "
             f"{entry['bytes']} byte(s), on {entry['on']}"
@@ -1692,7 +2013,267 @@ def wp_clear(ctx: Ctx, index: int | None, core_spec: str | None, all_slots: bool
         _, total = runcontrol.comparator_counts(c)
         for n in (range(total) if all_slots else [index]):  # type: ignore[arg-type]
             runcontrol.clear_watchpoint(dap, c, int(n))
+        if ctx.session is not None:
+            ctx.session.note_wp_cleared(c.name, None if all_slots else int(index))  # type: ignore[arg-type]
         console.print(f"cleared {'all ' if all_slots else ''}watchpoint(s) on {c.name}")
+
+
+# ---------------------------------------------------------------------------
+# debug -- one session, many commands
+# ---------------------------------------------------------------------------
+
+#: Prompt aliases: the run-control commands people type all day, without their
+#: group prefix. `continue` is the name every other debugger uses for resume.
+SESSION_ALIASES: dict[str, tuple[str, ...]] = {
+    "halt": ("core", "halt"),
+    "resume": ("core", "resume"),
+    "continue": ("core", "resume"),
+    "step": ("core", "step"),
+    "regs": ("core", "regs"),
+    "reg": ("core", "reg"),
+    "status": ("core", "status"),
+    "unlock": ("core", "unlock"),
+    "sample": ("core", "sample"),
+    "reset-halt": ("core", "reset-halt"),
+}
+
+#: Commands that cannot run inside a session, and why the refusal is safety
+#: rather than convenience.
+SESSION_BLOCKED: dict[str, str] = {
+    "doctor": "it opens its own commander transport under the held connection",
+    "attach": "it opens and closes many probe sessions while retrying",
+    "release": "it opens and closes probe sessions while retrying",
+    "iface": "a protocol switch would tear down the held connection",
+    "bscan": (
+        "the RM Table 984 preamble changes the JTAG chain (IR 8 -> 16) and takes "
+        "the DAP away until a power cycle -- test-plan ordering rule 3"
+    ),
+    "debug": "a session is already open",
+}
+
+
+def _print_session_help() -> None:
+    console.print(
+        "Session commands: any normal s32edbg command works here without its\n"
+        "global options -- `bp set 0x321D2EE6`, `wp list`, `mem read 0x00410FF0`,\n"
+        "`m33 halt --core smu`, `gates status`, ...\n"
+        "\n"
+        "Aliases for the focused core: halt, resume/continue, step, regs,\n"
+        "reg, status, unlock, sample, reset-halt.\n"
+        "\n"
+        "Session builtins:\n"
+        "  use <core>   focus a core (rtu0.0, rtu0.1, ... or smu/ce0/ce1)\n"
+        "  help         this text\n"
+        "  quit         close the session (clears session breakpoints and\n"
+        "               resumes session-halted cores unless --keep-on-exit)\n"
+        "\n"
+        "Not available in a session: doctor, attach, release, iface, bscan."
+    )
+
+
+def _session_use(ctx: Ctx, args: list[str]) -> None:
+    session = ctx.session
+    assert session is not None
+    if not args:
+        console.print(
+            f"focus: {session.focus or '-'} (R52), {session.m33_focus or '-'} (M33)"
+        )
+        return
+    spec = args[0]
+    if spec.lower() in m33_mod.M33_APS:
+        session.m33_focus = spec.lower()
+        console.print(f"M33 focus: {session.m33_focus}")
+        return
+    if session.cores is None:
+        # `use` right after an in-session `gates apply` on a power-cycled
+        # board: discovery has not run yet -- run it now rather than telling
+        # the operator to issue `core list` first.
+        try:
+            _discover_cores(ctx, session.dap)
+        except S32EError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            return
+    try:
+        c = runcontrol.resolve(spec, session.cores or [])
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        return
+    session.focus = c.name
+    console.print(f"focus: {c.name}")
+
+
+def _session_tokens(line: str) -> list[str] | None:
+    """Split a session line into argv tokens. None on a lexing error."""
+    try:
+        raw = shlex.split(line, posix=False)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        return None
+    # posix=False keeps Windows paths intact but leaves surrounding quotes on;
+    # strip them so `--json "out file.json"` arrives as one clean token.
+    return [
+        t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t
+        for t in raw
+    ]
+
+
+def _session_dispatch(ctx: Ctx, line: str) -> bool:
+    """Run one session command line. Returns False when the session should end."""
+    tokens = _session_tokens(line)
+    if not tokens:
+        return True
+    name = tokens[0].lower()
+    if name in ("quit", "exit", "q"):
+        return False
+    if name in ("help", "?"):
+        _print_session_help()
+        return True
+    if name == "use":
+        _session_use(ctx, tokens[1:])
+        return True
+    if name in SESSION_ALIASES:
+        tokens = [*SESSION_ALIASES[name], *tokens[1:]]
+        name = tokens[0]
+    reason = SESSION_BLOCKED.get(name)
+    if reason is not None:
+        console.print(
+            f"[red]refused:[/red] `{name}` cannot run inside a debug session: {reason}. "
+            "Quit the session first."
+        )
+        return True
+    command = main.commands.get(name)
+    if command is None:
+        console.print(
+            f"[red]error:[/red] unknown command {name!r}. `help` lists what works here."
+        )
+        return True
+    try:
+        with command.make_context(name, tokens[1:], obj=ctx) as command_ctx:
+            command.invoke(command_ctx)
+    except click.exceptions.Exit:
+        pass
+    except click.ClickException as exc:
+        console.print(f"[red]error:[/red] {exc.format_message()}")
+    except click.Abort:
+        console.print("[yellow]aborted[/yellow]")
+    except UnsafeOperation as exc:
+        console.print(f"[red]refused:[/red] {exc}")
+    except S32EError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+    except KeyboardInterrupt:
+        console.print(
+            "\n[yellow]interrupted[/yellow] -- the session is still open; `quit` leaves it"
+        )
+    return True
+
+
+def _session_repl(ctx: Ctx) -> None:
+    console.print("[dim]type commands (`help` lists them); `quit` closes the session[/dim]")
+    while True:
+        session = ctx.session
+        assert session is not None
+        focus = session.focus or session.m33_focus or "-"
+        try:
+            line = console.input(f"[bold cyan]s32edbg\\[{focus}]>[/bold cyan] ")
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+        if not _session_dispatch(ctx, line):
+            break
+
+
+@main.command("debug")
+@click.option("--core", "core_spec", default=None,
+              help="Focus core: an R52 name/index/address, or smu/ce0/ce1.")
+@click.option("--keep-on-exit", is_flag=True,
+              help="Leave the target exactly as the session left it: breakpoints "
+                   "stay armed, halted cores stay halted.")
+@click.option("--keep-breakpoints", is_flag=True,
+              help="Skip the comparator sanitation on first touch of each core "
+                   "(guide §5.7 initialises them because their reset state is UNKNOWN).")
+@click.option("-c", "--command", "batch", multiple=True,
+              help="Run this session command and exit; repeatable, runs in order.")
+@click.pass_obj
+def debug_cmd(
+    ctx: Ctx,
+    core_spec: str | None,
+    keep_on_exit: bool,
+    keep_breakpoints: bool,
+    batch: tuple[str, ...],
+) -> None:
+    """Open one debug session: breakpoints, halt, step, resume -- then close it.
+
+    Every other s32edbg invocation opens and closes its own probe connection,
+    and on this board every connect pulses reset through R439 into the SBC and
+    PMIC -- test-plan defect D-2 -- while halts held *across* invocations
+    deadlocked the application. A session opens the connection once, caches
+    core discovery, keeps run-control state coherent between commands, and
+    closes once.
+
+    On close (quit, end of input, or Ctrl-C at the prompt) the session
+    restores the target: the breakpoints and watchpoints it set are cleared
+    and the cores it halted are resumed, unless --keep-on-exit.
+
+    Non-interactive use: pipe lines into stdin, or give -c commands:
+
+        s32edbg debug --core rtu0.1 -c "halt" -c "regs" -c "resume"
+    """
+    if ctx.transport_kind != "dll":
+        raise UnsafeOperation(
+            "a debug session needs the dll backend: the commander backend runs one "
+            "JLink.exe process per operation, so it cannot hold a connection open."
+        )
+    if ctx.session is not None:
+        raise click.ClickException("a debug session is already open.")
+
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        session = DebugSession(
+            transport=t, dap=dap, keep_breakpoints=keep_breakpoints
+        )
+        ctx.session = session
+        try:
+            try:
+                cores = _discover_cores(ctx, dap)
+                console.print(
+                    f"[green]session open[/green] -- {len(cores)} R52 core(s): "
+                    + " ".join(c.name for c in cores)
+                    + "; M33: " + " ".join(m33_mod.M33_APS)
+                )
+            except S32EError as exc:
+                # A fresh power cycle loses the LADDER-1 enables, so discovery
+                # can legitimately fail before `gates apply` has run. The
+                # session stays open so it can be run *inside* -- rediscovery
+                # happens on the next core command.
+                console.print(f"[yellow]![/yellow] {exc}")
+                console.print(
+                    "[dim]session open with no cores discovered yet -- run "
+                    "`gates apply`, then `core list`.[/dim]"
+                )
+            if core_spec:
+                _session_use(ctx, [core_spec])
+
+            if batch:
+                for line in batch:
+                    if not _session_dispatch(ctx, line):
+                        break
+            elif not sys.stdin.isatty():
+                for line in sys.stdin:
+                    if not _session_dispatch(ctx, line.rstrip("\n")):
+                        break
+            else:
+                _session_repl(ctx)
+        finally:
+            ctx.session = None
+            if keep_on_exit:
+                console.print(
+                    "[yellow]--keep-on-exit:[/yellow] breakpoints stay armed and "
+                    "halted cores stay halted."
+                )
+            else:
+                for note in session.restore():
+                    console.print(f"[dim]restore:[/dim] {note}")
+            console.print("[green]session closed[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -1708,7 +2289,7 @@ def apmap_cmd(ctx: Ctx, method: str) -> None:
     methods = ("direct", "walk") if method == "both" else (method,)
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        _prepare_dap(dap)
+        _prepare_dap(dap, ctx=ctx)
         result = apmap_mod.discover(dap, methods=methods)
         emit.print_apmap(result, console)
         if ctx.json_out:
@@ -1747,7 +2328,7 @@ def romdump_cmd(ctx: Ctx, source: str, ap_base: str | None, rom_base: str | None
     payload: dict[str, object] = {}
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        _prepare_dap(dap)
+        _prepare_dap(dap, ctx=ctx)
 
         gate = gates_mod.status(dap)
         if not gate.mdm.enables_set:
@@ -2034,7 +2615,7 @@ def report_cmd(ctx: Ctx, apply_gates: bool) -> None:
 
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        payload["dap_notes"] = _prepare_dap(dap)
+        payload["dap_notes"] = _prepare_dap(dap, ctx=ctx)
         info = dap.info()
         payload["dap"] = {
             "dpidr": f"0x{info.dpidr.raw:08X}" if info.dpidr else None,
@@ -2093,6 +2674,11 @@ def entry() -> int:
         err_console.print(f"[red]error:[/red] {exc.format_message()}")
         return exc.exit_code
     except click.Abort:
+        err_console.print("[yellow]aborted[/yellow]")
+        return 130
+    except KeyboardInterrupt:
+        # A Ctrl-C that escaped the session prompt (e.g. during discovery or
+        # restore). The context managers above have already closed the probe.
         err_console.print("[yellow]aborted[/yellow]")
         return 130
     return 0

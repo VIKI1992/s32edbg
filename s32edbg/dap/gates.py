@@ -63,6 +63,7 @@ from ..data.ladder1 import (
     SDA_IDR,
     SDA_IDR_EXPECTED,
     SDA_RSTCTRL,
+    SDA_RSTMASK,
     SDA_SYSRSTC,
     SDA_SYSRSTC_SYSFUNCREQ,
     SDA_SYSRSTS,
@@ -299,6 +300,20 @@ FORBIDDEN_WRITE_APS = {AP_SDA: "SDA-AP (one-shot HSE challenge/response)"}
 #: precisely what holds the JTAGC in reset.
 SDA_WRITABLE_OFFSETS = {
     SDA_SYSRSTC: "system reset control (RM 135.11), the only route onto a rebooting target",
+    #: SDARSTMASK is documented (guide §3.6/§5.10.1) as masking the MC_RGM
+    #: functional reset away from the RTU debug logic so breakpoints and an
+    #: armed reset catch survive. **Measured 2026-08-02: it does not deliver
+    #: that on this silicon.** The write lands (reads back exactly), but a
+    #: functional reset still wiped the R52 debug state (OS lock back, EDECR
+    #: cleared) -- and the boot wedged: rtu0.0 stayed in BootROM-range code and
+    #: rtu0.1 was never released, until a clean attach/release recovered it.
+    #: Plausibly the documented PSTATn-invalidation side effect derails boot
+    #: software. Kept writable for experiments; nothing in the tool uses it.
+    SDA_RSTMASK: "RTU functional-reset mask (measured ineffective here -- see comment)",
+    #: SDARSTCTRL carries the R52 RSTREL release bits (0 = hold the core in
+    #: reset) -- the guide §5.10.2 mechanism reset-halt is built on. Reset
+    #: machinery, not the one-shot authentication path.
+    SDA_RSTCTRL: "R52 reset-release control, the §5.10.2 hold behind `core reset-halt`",
 }
 
 
@@ -341,6 +356,53 @@ def hold_in_functional_reset(dap: Dap, *, ap_base: int = AP_SDA) -> None:
     """
     guard_write(ap_base, SDA_SYSRSTC)
     dap.ap_write(ap_base, SDA_SYSRSTC, SDA_SYSRSTC_SYSFUNCREQ)
+
+
+def set_reset_mask(dap: Dap, value: int, *, ap_base: int = AP_SDA) -> None:
+    """Program SDARSTMASK -- which cores' debug state survives functional reset.
+
+    The breakpoints guide §5.10.1: RTU0 cores 0-3 are bits 31:28 and RTU1 cores
+    0-3 bits 23:20 (bit 31 = RTU0 core 0, matching the guide's §5.10.2 example
+    "clear bit31 for RTU0 core0" for the sibling SDARSTCTRL layout). Write 0 to
+    restore the default, in which a functional reset wipes RTU debug state and
+    the MC_RGM.PSTATn status bits are valid again.
+    """
+    guard_write(ap_base, SDA_RSTMASK)
+    dap.ap_write(ap_base, SDA_RSTMASK, value)
+
+
+#: SDARSTMASK bits covering every R52 core: RTU0 cores 0-3 (31:28) and RTU1
+#: cores 0-3 (23:20). The POR-mask bits (27 and 19) are deliberately excluded.
+RSTMASK_ALL_R52 = (0xF << 28) | (0xF << 20)
+
+
+def rstrel_bit(rtu: int, core: int) -> int:
+    """SDARSTCTRL release-bit position for an R52 core.
+
+    Guide §5.10.1/§5.10.2: RTU0 cores 0-3 are bits 31:28 and RTU1 cores 0-3
+    bits 23:20, core 0 highest ("e.g. clear bit31 for RTU0 core0"). The bit is
+    a *release*: 0 holds the core in reset, 1 (the reset value) lets it boot.
+    """
+    if not 0 <= core <= 3:
+        raise ValueError(f"R52 core index {core} is not 0-3")
+    if rtu == 0:
+        return 31 - core
+    if rtu == 1:
+        return 23 - core
+    raise ValueError(f"RTU{rtu} is not a Cortex-R52 cluster on this part")
+
+
+def read_reset_control(dap: Dap, *, ap_base: int = AP_SDA) -> int:
+    return dap.ap_read(ap_base, SDA_RSTCTRL)
+
+
+def write_reset_control(dap: Dap, value: int, *, ap_base: int = AP_SDA) -> None:
+    """Program SDARSTCTRL. Callers read-modify-write one RSTREL bit at a time --
+    the register also carries the M33 CPUWAIT bits with the *opposite*
+    polarity (guide pitfall #10), so absolute writes are how cores get held by
+    accident."""
+    guard_write(ap_base, SDA_RSTCTRL)
+    dap.ap_write(ap_base, SDA_RSTCTRL, value)
 
 
 def release_functional_reset(dap: Dap, *, ap_base: int = AP_SDA) -> None:

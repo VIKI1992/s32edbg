@@ -169,6 +169,14 @@ EDSCR_STATUS_NAMES: dict[int, str] = {
 EDSCR_STATUS_RESTARTING = 0b000001
 EDSCR_STATUS_RUNNING = 0b000010
 
+#: Halt reasons the run-control code branches on, named so the branch reads as
+#: the guide (§5.3) does rather than as a bit pattern.
+EDSCR_STATUS_BREAKPOINT = 0b000111
+EDSCR_STATUS_EXTERNAL_DEBUG_REQUEST = 0b010011
+EDSCR_STATUS_OS_UNLOCK_CATCH = 0b100011
+EDSCR_STATUS_RESET_CATCH = 0b100111
+EDSCR_STATUS_WATCHPOINT = 0b101011
+
 #: Statuses that mean a halting step completed. Three of them, because the
 #: architecture distinguishes a normal step from one that ended in an exclusive
 #: sequence or produced no syndrome.
@@ -552,6 +560,39 @@ def instr_dspsr_to_reg(rt: int, *, t32: bool = True) -> int:
     return instr_mrc_p15(DSPSR_OPC1, DSPSR_CRN, DSPSR_CRM, DSPSR_OPC2, rt, t32=t32)
 
 
+def instr_mcr_p15(opc1: int, crn: int, crm: int, opc2: int, rt: int, *, t32: bool = True) -> int:
+    """``MCR p15, opc1, Rt, CRn, CRm, opc2`` -- write a coprocessor register.
+
+    The same encoding as MRC with bit [20] (the direction bit) clear: the core
+    register moves *into* the coprocessor register. Guide §5.5: "On exit the
+    core restarts from DLR; if you changed the PC, write DLR first" -- this is
+    the instruction that does that write.
+    """
+    _check_reg(rt)
+    a32 = (
+        0xEE00_0010
+        | (opc1 << 21)
+        | (crn << 16)
+        | (rt << 12)
+        | (0xF << 8)  # coproc = p15
+        | (opc2 << 5)
+        | crm
+    )
+    if not t32:
+        return a32
+    return _t32(a32 >> 16, a32 & 0xFFFF)
+
+
+def instr_reg_to_dlr(rt: int, *, t32: bool = True) -> int:
+    """Move core register ``rt`` into DLR -- set the PC the core restarts from."""
+    return instr_mcr_p15(DLR_OPC1, DLR_CRN, DLR_CRM, DLR_OPC2, rt, t32=t32)
+
+
+def instr_reg_to_dspsr(rt: int, *, t32: bool = True) -> int:
+    """Move core register ``rt`` into DSPSR -- the PSR restored on restart."""
+    return instr_mcr_p15(DSPSR_OPC1, DSPSR_CRN, DSPSR_CRM, DSPSR_OPC2, rt, t32=t32)
+
+
 #: CPSR mode field names, for decoding DSPSR. AArch32 M[4:0].
 PSR_MODES: dict[int, str] = {
     0b10000: "User",
@@ -612,6 +653,15 @@ def instr_cpsr_to_reg(rt: int, *, t32: bool = True) -> int:
 # breakpoints guide lists in §7.2 as "breakpoint is accepted but never hits".
 # So the settings below aim to match as widely as possible, and the proof is a
 # breakpoint that actually fires.
+#
+# The guide's §5.7 EL-qualification table gives {HMC, SSC, PMC} = {1, 00, 11}
+# as "Any EL (EL2+EL1+EL0) -- the default choice for a halting debugger", and
+# the same encoding for watchpoints in §5.8. HMC=1 is what extends the match
+# into EL2 (hypervisor) code; the LADDER-1 gate sequence sets HIDEN for every
+# core, so EL2 invasive debug is authorised and the wide match is usable.
+# The earlier {0, 00, 11} words (EL1+EL0 only) fired on the bench because the
+# application runs at EL1 -- they were silicon-proven but narrower than the
+# guide's default, and would silently never hit in hypervisor code.
 
 DBGBCR_E = 1 << 0
 DBGBCR_PMC_SHIFT = 1  #: privilege mode control [2:1]
@@ -661,6 +711,7 @@ def encode_breakpoint(address: int, *, thumb: bool = True) -> tuple[int, int]:
         DBGBCR_E
         | (DBGBCR_PMC_ANY_PRIVILEGE << DBGBCR_PMC_SHIFT)
         | (bas << DBGBCR_BAS_SHIFT)
+        | DBGBCR_HMC  # any-EL match, guide §5.7: {HMC,SSC,PMC} = {1,00,11}
         | (DBGBCR_BT_UNLINKED_ADDRESS << DBGBCR_BT_SHIFT)
     )
     return address & ~0b11, control
@@ -680,6 +731,7 @@ def decode_breakpoint(value: int, control: int) -> dict[str, object]:
         "type": (control >> DBGBCR_BT_SHIFT) & 0xF,
         "privilege": (control >> DBGBCR_PMC_SHIFT) & 0b11,
         "security": (control >> DBGBCR_SSC_SHIFT) & 0b11,
+        "hmc": bool(control & DBGBCR_HMC),
     }
 
 
@@ -710,6 +762,7 @@ def encode_watchpoint(
         | (DBGBCR_PMC_ANY_PRIVILEGE << DBGWCR_PAC_SHIFT)
         | (lsc[on] << DBGWCR_LSC_SHIFT)
         | (bas << DBGWCR_BAS_SHIFT)
+        | DBGWCR_HMC  # any-EL match, guide §5.8: same {1,00,11} as breakpoints
     )
     return address & ~0b111, control
 

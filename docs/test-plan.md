@@ -42,6 +42,12 @@ proves the model was right. Neither substitutes for the other.
 | `bscan length` | `test_bscan.py` | blocked on the same raw-TDO capability | **blocked** |
 | `bscan sample` | `test_bscan.py` | liveness proven — one bit of 64 moved, 63 held | proven |
 | `report` | `test_cli.py` | all 8 sections; both ROM trees walk (9 APs; 12 tables / 74 components) | proven |
+| `debug` (session) | `test_session.py` | one connection, 10 commands, restore-on-close resumed the core | proven |
+| `core reset-halt` | `test_doc_alignment.py` | reset catch at PC `0x32100020` (hold flow; the mask flow failed — see below) | proven |
+| `core resume --sync` | `test_doc_alignment.py` | one pulse released rtu0.0+rtu0.1, SDR on both, gates closed after | proven |
+| `core reg pc` / `dspsr` (write) | `test_doc_alignment.py` | round-tripped on a halted rtu0.1 | proven |
+| `m33 wp` | `test_doc_alignment.py` | programs and read-back verifies (RO ID masked); never seen to *fire* — SMU makes no stores near SP | partial |
+| `m33 reset-halt` | `test_doc_alignment.py` | **SYSRESETREQ takes no effect on this silicon** — no reset, core keeps running, command fails cleanly | **blocked** |
 
 **Three facts settled on silicon**, recorded here because they will otherwise be
 re-discovered the hard way:
@@ -1104,6 +1110,115 @@ tracks board state.
 
 **The boundary scan reaches real boundary cells.** No pin toggle by hand was
 needed in the end; the running application supplied the change.
+
+### Doc-alignment pass and the debug session — implemented 2026-08-02, offline-proven, bench pending
+
+A review against the guide (`S32E27_Debug_HWBreakpoints_RunControl.md`) aligned every run-control
+sequence to what the guide specifies, and added the persistent session the D-2 analysis called
+for. Everything below passes offline against the enriched synthetic target
+(`test_doc_alignment.py`, `test_session.py`), and the bench verification ran the same day — the
+results are at the end of this section. The ⚠ markers flag changes to behaviour that was
+previously silicon-proven; **both ⚠ items passed on silicon**.
+
+**Changed sequences (guide section — change — bench risk):**
+
+- ⚠ **§5.7/§5.8 — comparator control words are now any-EL.** `{HMC,SSC,PMC}` = `{1,00,11}`, the
+  guide's "default choice for a halting debugger": DBGBCR `0x187 → 0x2187` (T32 high halfword),
+  DBGWCR `0x1F7 → 0x21F7`. The old words were silicon-proven but matched EL1/EL0 only. HIDEN is
+  set by LADDER-1 and `DBGAUTHSTATUS` read `0x00000F0F`, so EL2 matching is authorised — but a
+  breakpoint that *fires* with the new word is the only proof. Re-run the §8 breakpoint test.
+- ⚠ **§5.5 — restart is confirmed through `EDPRSR.SDR`**, not by watching EDSCR.STATUS change,
+  and the debug-request acknowledge now polls `CTITRIGOUTSTATUS` until the trigger deasserts
+  before any restart. Both bits are architecturally specified but neither has been read on this
+  silicon. If a bench resume times out with "EDPRSR.SDR never set" while the core visibly runs,
+  the SDR bit position (11) is the suspect.
+- **§6.4 — the M33 step is two writes when masking**: `0xA05F000F` (halted, set step+mask) then
+  `0xA05F000D` (release). The old single write changed `C_MASKINTS` in the write that cleared
+  `C_HALT`, which the architecture calls UNPREDICTABLE — it happened to work on this silicon.
+- **M33 step now suspends armed FPB comparators** and restores them — the same hot-PC re-trigger
+  fix the R52 path already had ("the second time a fix existed on one path and not the other" —
+  now swept across both).
+- **§6.2 — M33 halts report their cause from DFSR** and clear what they report (W1C).
+- **§5.3 — a watchpoint halt reports the data address from `EDWAR`** (high word ignored).
+- **§5.4/§5.5 — the PC (DLR) and DSPSR are writable**: `core reg pc <addr>` redirects execution
+  before a resume, via `MCR p15,3,Rt,c4,c5,1` — the MRC read encoding (silicon-proven) with the
+  direction bit cleared.
+- **CTI routing writes are read-modify-write.** `_prepare_cti` used to write CTIOUTEN absolutely,
+  silently removing the cross-halt channel `core xtrigger on` had routed — a halt after xtrigger
+  disarmed the group. Found by review, not by the bench; the offline test now pins it.
+- **Step-over's instruction fetch obeys the AXI policy**: `read_instruction` now refuses while
+  functional reset is asserted, same as `mem --ap axi` (ordering rule 5 / RM Table 957).
+
+**New capability (all never-run on hardware):**
+
+- **`debug` — the persistent session.** One connection for the whole halt/step/resume cycle;
+  restore-on-close (session comparators cleared first, then session-halted cores resumed);
+  first-touch comparator sanitation per §5.7 ("every field is UNKNOWN after cold reset --
+  including E!"); `--keep-on-exit` / `--keep-breakpoints` to opt out. This is the structural
+  answer to D-2 (every invocation pulses reset into the SBC/PMIC) and to the cross-invocation
+  bugs above — "single-session testing cannot find cross-session state bugs" now has a
+  single-session way to work.
+- **§5.9 `core resume --all --sync`** — group restart on one CTM pulse, gates closed afterwards.
+- **§5.10.2 `core reset-halt`** — the *hold* flow: clear the core's `SDARSTCTRL.RSTREL` bit,
+  functional-reset the system (it boots normally, the core stays held), arm `EDECR.RCE` on the
+  held core (EDECR is §5.2 OS-lock-exempt), set `RSTREL` back — the catch fires before the first
+  instruction, then the OS lock the cold reset re-set is cleared. The SDA-AP write allowlist
+  gained `SDARSTCTRL` and `SDARSTMASK` (reset machinery, not the one-shot auth path). This was
+  originally built on the §5.10.3 SDARSTMASK variant; the bench killed that — see below.
+- **§6.8 `m33 reset-halt`** — VC_CORERESET + AIRCR.SYSRESETREQ. The reach of SYSRESETREQ on this
+  SoC is unknown; treat the system as rebooted until the bench narrows it.
+- **§6.7 `m33 wp`** — DWT data watchpoints (TRCENA first, natural alignment enforced,
+  ACTION=debug-event). Closes the "DWT watchpoints on any M33" gap this plan recorded.
+
+#### Bench verification run — 2026-08-02, S32E277 SOM, application flashed
+
+Driven by two library checkpoint scripts (one connection each) plus CLI `debug` sessions.
+**26/26 scripted checks passed** after two findings were fixed; the session smoke and the R52
+reset-halt then passed end to end.
+
+Proven on silicon:
+
+- ⚠ **`EDPRSR.SDR` confirms restarts** (bit 11 correct) — observed on plain resume, on
+  resume-onto-a-hot-breakpoint, and on every member of a group restart.
+- ⚠ **The any-EL comparator words fire**: DBGBCR `0x2067` hit at `0x321D2EE8`, EDSCR read
+  breakpoint, DLR and `halt_location` agreed. DBGWCR `0x3FF7` fired on a stack store and
+  **EDWAR reported exactly the watched address** (`0x3040A3F8`).
+- **CTITRIGOUTSTATUS deasserts after the acknowledge** (read `0x0` post-halt).
+- **§5.9 synchronized restart**: one pulse released rtu0.0+rtu0.1, SDR on both, channel gates
+  closed afterwards.
+- **M33 two-write masked step** advances the PC (`0x25001F6C → 6E → 70`), stepping off an armed
+  FPB comparator moves the PC (suspension works), halts report DFSR causes.
+- **The `debug` session**: one connection for status/halt/regs/bp/resume/step/clear/gates,
+  correct "ran and immediately re-halted" reporting, restore-on-close resumed the core.
+- **`core reset-halt` (hold flow)**: reset catch at PC `0x32100020` — the application's reset
+  vector — `EDSCR 0x03050227`, fetched nothing, resumed cleanly into a normal boot.
+
+**Finding 1 — SDARSTMASK does not protect the RTU debug state, and wedges the boot.** The
+first reset-halt implementation followed §5.10.3: mask, arm RCE, functional reset. Measured: the
+mask write *lands* (reads back `0xF0F00000` exactly), but the reset wiped the debug state anyway
+(OS lock back, EDECR cleared, no catch) — and the boot jammed: rtu0.0 stuck executing at
+BootROM-range addresses (`0x1B4`), rtu0.1 never released, for as long as we watched. Plausibly
+the documented PSTATn-invalidation side effect derails boot software. A plain `attach`/`release`
+recovered the board completely. The flow was rebuilt on §5.10.2's RSTREL hold, which passed.
+Guide §3.6/§5.10.1's claim that SDARSTMASK preserves debug state is **contradicted by this
+silicon** — trust accordingly.
+
+**Finding 2 — `DWT_FUNCTION` reads back its RO ID field.** FUNCTION written `0x815` reads back
+`0x58000815`: bits [31:27] are the comparator's capability ID (`0b01011`). The read-back verify
+flagged it as a mismatch — correct instinct, wrong mask. Fixed (RO bits masked), and the fake
+now models the ID bits so the offline suite would catch a regression.
+
+**Finding 3 — M33 `SYSRESETREQ` takes no effect on this silicon.** `m33 reset-halt` armed
+`C_DEBUGEN` + `VC_CORERESET`, wrote `AIRCR = 0x05FA0004` (accepted, no bus fault), and nothing
+happened: `S_RESET_ST` never set, the SMU kept running, the rest of the system was untouched.
+The command fails cleanly and disarms the catch. The SoC evidently gates M33 SYSRESETREQ
+somewhere outside the guide's sources (its own §6.8 note points at SDA-AP `RSTWAIT*` CPUWAIT
+holds for SoC-level control — a candidate follow-up, not implemented). Until then, M33
+reset-and-halt is **blocked** on this part.
+
+Still unproven: an M33 DWT watchpoint actually *firing* (it programs and verifies; the SMU's
+idle loop performs no stores near its SP, so nothing triggered within the poll window), and the
+CE cores generally (still not executing).
 
 ### The 12 ROM-walk error nodes are correct behaviour
 

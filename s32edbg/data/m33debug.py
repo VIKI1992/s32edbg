@@ -88,8 +88,9 @@ DHCSR_S_HALT = 1 << 17
 DHCSR_S_SLEEP = 1 << 18
 DHCSR_S_LOCKUP = 1 << 19
 DHCSR_S_SDE = 1 << 20  #: secure debug enabled
-DHCSR_S_RETIRE_ST = 1 << 24
-DHCSR_S_RESET_ST = 1 << 25
+DHCSR_S_RETIRE_ST = 1 << 24  #: an instruction retired since the last read (clear-on-read)
+DHCSR_S_RESET_ST = 1 << 25  #: a reset occurred since the last read (clear-on-read)
+DHCSR_S_RESTART_ST = 1 << 26  #: the core left Debug state since the last read (clear-on-read)
 
 
 def decode_dhcsr(raw: int) -> dict[str, object]:
@@ -116,6 +117,52 @@ def dhcsr_write(bits: int) -> int:
 
 DEMCR_VC_CORERESET = 1 << 0  #: halt on reset -- catch startup code
 DEMCR_TRCENA = 1 << 24  #: enables the DWT, including its PC sampler
+
+
+# --------------------------------------------------------------------------
+# DFSR -- why the core halted. Armv8-M D1.2 / guide §6.2
+# --------------------------------------------------------------------------
+#
+# Write-1-to-clear: the bits accumulate across halts, so the cause of *this*
+# halt is only readable if the previous one was cleared. The tool clears what
+# it reports.
+
+DFSR = 0xE000_ED30
+
+DFSR_HALTED = 1 << 0  #: halt request or step
+DFSR_BKPT = 1 << 1  #: FPB comparator or BKPT instruction
+DFSR_DWTTRAP = 1 << 2  #: DWT watchpoint
+DFSR_VCATCH = 1 << 3  #: vector catch (incl. VC_CORERESET)
+DFSR_EXTERNAL = 1 << 4  #: external debug request (MDM-AP EDBGREQ / CTI)
+
+_DFSR_NAMES: tuple[tuple[int, str], ...] = (
+    (DFSR_EXTERNAL, "external debug request"),
+    (DFSR_VCATCH, "vector catch"),
+    (DFSR_DWTTRAP, "watchpoint (DWT)"),
+    (DFSR_BKPT, "breakpoint"),
+    (DFSR_HALTED, "halt request or step"),
+)
+
+
+def decode_dfsr(raw: int) -> dict[str, object]:
+    causes = [name for bit, name in _DFSR_NAMES if raw & bit]
+    return {
+        "raw": f"0x{raw:08X}",
+        "causes": causes,
+        "cause": causes[0] if len(causes) == 1 else None,
+    }
+
+
+# --------------------------------------------------------------------------
+# AIRCR -- the warm-reset request, for reset-and-halt. Guide §6.8
+# --------------------------------------------------------------------------
+
+AIRCR = 0xE000_ED0C
+
+#: VECTKEY (0x05FA in [31:16]) | SYSRESETREQ (bit 2). Guide §6.8: "warm reset
+#: request -- not guaranteed to take effect immediately". Like DHCSR, a write
+#: without the key is silently ignored.
+AIRCR_SYSRESETREQ = 0x05FA_0004
 
 
 # --------------------------------------------------------------------------
@@ -256,3 +303,63 @@ DWT_MATCH_FOR: dict[str, int] = {
     "store": DWT_MATCH_ADDR_WRITE,
     "both": DWT_MATCH_ADDR_RW,
 }
+
+# DWT_FUNCTION field layout for a watchpoint, Armv8-M / guide §6.7:
+#   MATCH [3:0], ACTION [5:4] (0b01 = generate a debug event, i.e. halt),
+#   DATAVSIZE [11:10] (00 byte, 01 halfword, 10 word), MATCHED bit 24
+#   (set on match, clears on read).
+DWT_FUNCTION_MATCH_MASK = 0xF
+DWT_FUNCTION_ACTION_SHIFT = 4
+DWT_FUNCTION_ACTION_DEBUG_EVENT = 0b01
+DWT_FUNCTION_DATAVSIZE_SHIFT = 10
+DWT_FUNCTION_MATCHED = 1 << 24
+#: ID [31:27] identifies what this comparator supports. Read-only -- measured
+#: on the SMU: FUNCTION written 0x815 reads back 0x58000815, ID = 0b01011. Any
+#: read-back comparison must mask it out along with MATCHED.
+DWT_FUNCTION_ID_MASK = 0x1F << 27
+#: The RO bits to ignore when verifying a FUNCTION write landed.
+DWT_FUNCTION_RO_MASK = DWT_FUNCTION_ID_MASK | DWT_FUNCTION_MATCHED
+
+_DATAVSIZE_FOR_SIZE = {1: 0b00, 2: 0b01, 4: 0b10}
+_MATCH_NAMES = {v: k for k, v in DWT_MATCH_FOR.items()}
+
+
+def encode_watchpoint(address: int, *, size: int = 4, on: str = "both") -> tuple[int, int]:
+    """Build (DWT_COMP, DWT_FUNCTION) for a data-address watchpoint.
+
+    Guide §6.7: the comparator address must be **naturally aligned** to
+    DATAVSIZE, else the behaviour is UNPREDICTABLE -- so misalignment is
+    rejected rather than rounded. ACTION = 0b01 makes a match a debug event
+    (halt) rather than a trace packet or a bare CMPMATCH trigger.
+    """
+    datavsize = _DATAVSIZE_FOR_SIZE.get(size)
+    if datavsize is None:
+        raise ValueError(f"M33 watchpoint size must be 1, 2 or 4 bytes, not {size}")
+    if address % size:
+        raise ValueError(
+            f"a {size}-byte watchpoint must be {size}-byte aligned; 0x{address:08X} "
+            "is not (DWT_COMP must be naturally aligned to DATAVSIZE)"
+        )
+    match = DWT_MATCH_FOR.get(on)
+    if match is None:
+        raise ValueError(f"watchpoint access must be load, store or both, not {on!r}")
+    function = (
+        match
+        | (DWT_FUNCTION_ACTION_DEBUG_EVENT << DWT_FUNCTION_ACTION_SHIFT)
+        | (datavsize << DWT_FUNCTION_DATAVSIZE_SHIFT)
+    )
+    return address, function
+
+
+def decode_watchpoint(comp: int, function: int) -> dict[str, object]:
+    match = function & DWT_FUNCTION_MATCH_MASK
+    datavsize = (function >> DWT_FUNCTION_DATAVSIZE_SHIFT) & 0b11
+    return {
+        "enabled": match != DWT_MATCH_DISABLED,
+        "address": f"0x{comp:08X}",
+        "comp": f"0x{comp:08X}",
+        "function": f"0x{function:08X}",
+        "bytes": {0b00: 1, 0b01: 2, 0b10: 4}.get(datavsize),
+        "on": _MATCH_NAMES.get(match, f"0b{match:04b}"),
+        "matched": bool(function & DWT_FUNCTION_MATCHED),
+    }

@@ -224,14 +224,31 @@ def _wait_halted(
 
 
 def halt(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> int:
-    """Stop the core. One write, unlike the R52's cross-trigger dance.
+    """Stop the core. Two DHCSR writes, per the guide §6.2.
 
-    ``C_DEBUGEN`` goes in the same write as ``C_HALT``: halting without it is
-    accepted and does nothing, because halting debug has to be enabled for the
-    halt request to mean anything.
+    ``C_DEBUGEN`` is enabled first, on its own -- the architecture requires the
+    write that raises C_DEBUGEN to carry ``C_MASKINTS = 0``, and the guide's
+    §6.2 sequence enables before it halts. ``C_HALT`` follows in a second
+    write. (Both writes carry the DBGKEY, or they are silently ignored.)
     """
+    _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN)
     _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN | m33.DHCSR_C_HALT)
     return _wait_halted(dap, core, True, timeout_s=timeout_s)
+
+
+def halt_cause(dap: Dap, core: M33Core) -> dict[str, object]:
+    """Read and clear DFSR -- why the core is halted (guide §6.2).
+
+    DFSR bits are write-1-to-clear and accumulate across halts, so what is
+    reported is also cleared: without that, the *next* halt's cause would be
+    polluted by this one's.
+    """
+    raw = _read(dap, core.ap_base, m33.DFSR)
+    if raw is None:
+        return {"error": "DFSR did not read"}
+    if raw:
+        _write(dap, core.ap_base, m33.DFSR, raw)  # W1C what we report
+    return m33.decode_dfsr(raw)
 
 
 def resume(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> tuple[int, bool]:
@@ -251,7 +268,15 @@ def resume(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> tuple[int, boo
 
     The R52 path had the identical bug and reported a working breakpoint as a
     failed resume.
+
+    ``S_RESTART_ST`` is checked alongside it: the guide §6.5 names it as the
+    architected restart confirmation -- "the core left Debug state since the
+    last read". Both bits clear on read, which is why both are tested in the
+    same read that checks S_HALT.
     """
+    # Flush the sticky clear-on-read bits so what the loop below sees was
+    # produced by *this* resume, not left over from an earlier halt cycle.
+    _read(dap, core.ap_base, m33.DHCSR)
     _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN)
 
     deadline = time.monotonic() + timeout_s
@@ -261,12 +286,13 @@ def resume(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> tuple[int, boo
             raise RunControlError(f"{core.name}: DHCSR became unreadable.")
         if not dhcsr & m33.DHCSR_S_HALT:
             return dhcsr, False
-        if dhcsr & m33.DHCSR_S_RETIRE_ST:
+        if dhcsr & (m33.DHCSR_S_RETIRE_ST | m33.DHCSR_S_RESTART_ST):
             return dhcsr, True
         if time.monotonic() > deadline:
             raise RunControlError(
                 f"{core.name} did not resume within {timeout_s:.1f}s (DHCSR "
-                f"0x{dhcsr:08X}). No instruction retired either, so it never started."
+                f"0x{dhcsr:08X}). Neither S_RESTART_ST nor S_RETIRE_ST set either, "
+                "so it never left Debug state."
             )
         time.sleep(0.005)
 
@@ -279,29 +305,62 @@ def step(
     Interrupts are masked by default. Without that, a step at almost any point
     in a running system lands in an interrupt handler rather than the next
     instruction, which looks like the step going somewhere random.
+
+    **Masking takes two DHCSR writes, not one.** The guide §6.4: C_MASKINTS may
+    only be *changed* while halted, and "changing C_MASKINTS in the same write
+    that clears C_HALT is UNPREDICTABLE -- so 'set MASKINTS' and 'start the
+    step' must be two writes: first 0xA05F000F (halted, set step+mask), then
+    0xA05F000D (release)."
+
+    **Armed FPB comparators are suspended for the duration.** A comparator at
+    the current PC matches the fetch the moment the core leaves Debug state,
+    before the instruction executes -- the same re-trigger the R52 path fixed;
+    "this is the second time a fix existed on one path and not the other" is
+    the test plan's own warning. They are restored whatever happens.
     """
     dhcsr = _read(dap, core.ap_base, m33.DHCSR)
     if dhcsr is None or not dhcsr & m33.DHCSR_S_HALT:
         raise RunControlError(f"{core.name} is not halted, so it cannot be stepped.")
 
-    bits = m33.DHCSR_C_DEBUGEN | m33.DHCSR_C_STEP
-    if mask_interrupts:
-        bits |= m33.DHCSR_C_MASKINTS
-    _set_dhcsr(dap, core, bits)
+    suspended: list[tuple[int, int]] = []
+    try:
+        for entry in list_breakpoints(dap, core):
+            if entry.get("enabled") and not entry.get("error"):
+                index = int(entry["index"])
+                raw = int(str(entry["raw"]), 16)
+                suspended.append((index, raw))
+                _write(dap, core.ap_base, m33.fp_comp(index), raw & ~m33.FP_COMP_BE)
+    except RunControlError:
+        pass  # no believable comparator count; nothing to suspend
 
-    deadline = time.monotonic() + timeout_s
-    while True:
-        dhcsr = _read(dap, core.ap_base, m33.DHCSR)
-        if dhcsr is not None and dhcsr & m33.DHCSR_S_HALT:
-            # Leave interrupts unmasked again, or the next resume runs with them
-            # off and the system quietly stops servicing anything.
-            _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN | m33.DHCSR_C_HALT)
-            return dhcsr
-        if time.monotonic() > deadline:
-            raise RunControlError(
-                f"{core.name}: the step did not complete within {timeout_s:.1f}s."
-            )
-        time.sleep(0.002)
+    step_bits = m33.DHCSR_C_DEBUGEN | m33.DHCSR_C_STEP
+    if mask_interrupts:
+        step_bits |= m33.DHCSR_C_MASKINTS
+        # Write 1: still halted -- raise C_STEP and C_MASKINTS with C_HALT kept.
+        _set_dhcsr(dap, core, step_bits | m33.DHCSR_C_HALT)
+    # Write 2 (or the only write, unmasked): clear C_HALT to release the step.
+    _set_dhcsr(dap, core, step_bits)
+
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            dhcsr = _read(dap, core.ap_base, m33.DHCSR)
+            if dhcsr is not None and dhcsr & m33.DHCSR_S_HALT:
+                # Leave interrupts unmasked again, or the next resume runs with
+                # them off and the system quietly stops servicing anything.
+                # Changing C_MASKINTS here is legal: C_HALT stays set.
+                _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN | m33.DHCSR_C_HALT)
+                return dhcsr
+            if time.monotonic() > deadline:
+                raise RunControlError(
+                    f"{core.name}: the step did not complete within {timeout_s:.1f}s."
+                )
+            time.sleep(0.002)
+    finally:
+        for index, raw in suspended:
+            # Put them back even if the step failed, or the session silently
+            # loses the breakpoints the operator armed.
+            _write(dap, core.ap_base, m33.fp_comp(index), raw)
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +485,184 @@ def set_breakpoint(
 
 def clear_breakpoint(dap: Dap, core: M33Core, index: int) -> None:
     _write(dap, core.ap_base, m33.fp_comp(index), 0)
+
+
+# ---------------------------------------------------------------------------
+# Watchpoints, via the DWT (guide §6.7)
+# ---------------------------------------------------------------------------
+
+
+def watchpoint_count(core: M33Core) -> int:
+    count = core.identity.watchpoints
+    if count is None or not 1 <= count <= 15:
+        raise RunControlError(
+            f"{core.name}: DWT_CTRL 0x{core.identity.dwt_ctrl or 0:08X} does not give "
+            "a believable comparator count."
+        )
+    return count
+
+
+def _enable_dwt(dap: Dap, core: M33Core) -> None:
+    """DEMCR.TRCENA gates the whole DWT -- guide §6.7: it "must be 1 first"."""
+    demcr = _read(dap, core.ap_base, m33.DEMCR)
+    if demcr is not None and not demcr & m33.DEMCR_TRCENA:
+        if not _write(dap, core.ap_base, m33.DEMCR, demcr | m33.DEMCR_TRCENA):
+            raise RunControlError(f"{core.name}: the DEMCR.TRCENA write faulted.")
+
+
+def list_watchpoints(dap: Dap, core: M33Core) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for n in range(watchpoint_count(core)):
+        comp = _read(dap, core.ap_base, m33.dwt_comp(n))
+        function = _read(dap, core.ap_base, m33.dwt_function(n))
+        if comp is None or function is None:
+            out.append({"index": n, "error": "comparator registers did not read"})
+        else:
+            out.append({"index": n, **m33.decode_watchpoint(comp, function)})
+    return out
+
+
+def set_watchpoint(
+    dap: Dap,
+    core: M33Core,
+    address: int,
+    *,
+    size: int = 4,
+    on: str = "both",
+    index: int | None = None,
+) -> dict[str, object]:
+    """Arm a DWT comparator as a halting data watchpoint (guide §6.7).
+
+    ``DEMCR.TRCENA`` is enabled first (and left enabled -- the PC sampler wants
+    it too). The comparator address goes in before the function word arms it,
+    and both are read back: comparator capabilities differ per slot
+    (``DWT_FUNCTIONn.ID``), so a slot that cannot do data-address matching
+    shows up here as a read-back mismatch rather than as a watchpoint that
+    silently never fires.
+    """
+    total = watchpoint_count(core)
+    if index is None:
+        free = [
+            e for e in list_watchpoints(dap, core) if not e.get("enabled") and not e.get("error")
+        ]
+        if not free:
+            raise RunControlError(
+                f"all {total} DWT comparators on {core.name} are in use. Clear one first."
+            )
+        index = int(free[0]["index"])
+    if not 0 <= index < total:
+        raise RunControlError(f"{core.name} implements {total} comparators, not {index + 1}.")
+
+    comp, function = m33.encode_watchpoint(address, size=size, on=on)
+    _enable_dwt(dap, core)
+    ok = _write(dap, core.ap_base, m33.dwt_function(index), m33.DWT_MATCH_DISABLED)
+    ok &= _write(dap, core.ap_base, m33.dwt_comp(index), comp)
+    ok &= _write(dap, core.ap_base, m33.dwt_function(index), function)
+    if not ok:
+        raise RunControlError(f"{core.name}: a DWT comparator write faulted.")
+
+    back_comp = _read(dap, core.ap_base, m33.dwt_comp(index))
+    back_function = _read(dap, core.ap_base, m33.dwt_function(index))
+    # Ignore the read-only bits when comparing what was programmed: MATCHED
+    # (bit 24, clears on read) and the ID capability field [31:27] -- measured
+    # on the SMU, 0x815 reads back as 0x58000815.
+    if back_comp != comp or (
+        back_function is None or (back_function & ~m33.DWT_FUNCTION_RO_MASK) != function
+    ):
+        raise RunControlError(
+            f"{core.name}: watchpoint {index} did not take. Wrote COMP 0x{comp:08X} / "
+            f"FUNCTION 0x{function:08X}, read back 0x{back_comp or 0:08X} / "
+            f"0x{back_function or 0:08X}. This DWT slot may not support data-address "
+            "matching (DWT_FUNCTION.ID) -- try another --index."
+        )
+    return {"index": index, **m33.decode_watchpoint(comp, function)}
+
+
+def clear_watchpoint(dap: Dap, core: M33Core, index: int) -> None:
+    _write(dap, core.ap_base, m33.dwt_function(index), 0)
+    _write(dap, core.ap_base, m33.dwt_comp(index), 0)
+
+
+def sanitize_comparators(dap: Dap, core: M33Core) -> int:
+    """Blank every FPB and DWT comparator on this core.
+
+    The M33 counterpart of the R52 sanitation: FP_COMP contents are UNKNOWN out
+    of reset and the first ``bp set`` writes ``FP_CTRL = ENABLE``, which arms
+    every comparator including garbage ones. Returns how many slots read as
+    armed before sanitising.
+    """
+    armed = 0
+    for entry in list_breakpoints(dap, core):
+        if entry.get("enabled"):
+            armed += 1
+        if not entry.get("error"):
+            _write(dap, core.ap_base, m33.fp_comp(int(entry["index"])), 0)
+    for entry in list_watchpoints(dap, core):
+        if entry.get("enabled"):
+            armed += 1
+        if not entry.get("error"):
+            index = int(entry["index"])
+            _write(dap, core.ap_base, m33.dwt_function(index), 0)
+            _write(dap, core.ap_base, m33.dwt_comp(index), 0)
+    return armed
+
+
+# ---------------------------------------------------------------------------
+# Reset-and-halt (guide §6.8)
+# ---------------------------------------------------------------------------
+
+
+def reset_halt(dap: Dap, core: M33Core, *, timeout_s: float = 5.0) -> tuple[int, int]:
+    """Warm-reset the core and halt it at the reset handler's first instruction.
+
+    The architected flow, guide §6.8: ``C_DEBUGEN`` (survives warm resets) +
+    ``DEMCR.VC_CORERESET`` (reset vector catch), flush the sticky
+    ``S_RESET_ST`` with one DHCSR read, request the reset through
+    ``AIRCR.SYSRESETREQ``, then poll for ``S_RESET_ST && S_HALT``. On success
+    the core is halted at the reset handler entry with MSP loaded.
+
+    Returns ``(dhcsr, pc)``. ``VC_CORERESET`` is cleared afterwards whatever
+    happens, so a later reset does not halt unexpectedly.
+
+    **Scope caveat**: how far SYSRESETREQ reaches on this SoC (this core, its
+    subsystem, or wider) is not stated in the guide's sources -- treat the
+    system state after this as rebooted until proven narrower.
+    """
+    _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN)
+    demcr = _read(dap, core.ap_base, m33.DEMCR)
+    if demcr is None:
+        raise RunControlError(f"{core.name}: DEMCR did not read; cannot arm the vector catch.")
+    if not _write(dap, core.ap_base, m33.DEMCR, demcr | m33.DEMCR_VC_CORERESET):
+        raise RunControlError(f"{core.name}: the DEMCR.VC_CORERESET write faulted.")
+
+    try:
+        _read(dap, core.ap_base, m33.DHCSR)  # flush sticky S_RESET_ST
+        if not _write(dap, core.ap_base, m33.AIRCR, m33.AIRCR_SYSRESETREQ):
+            raise RunControlError(f"{core.name}: the AIRCR.SYSRESETREQ write faulted.")
+
+        reset_seen = False
+        deadline = time.monotonic() + timeout_s
+        while True:
+            dhcsr = _read(dap, core.ap_base, m33.DHCSR)
+            if dhcsr is not None:
+                if dhcsr & m33.DHCSR_S_RESET_ST:
+                    reset_seen = True  # clear-on-read: latch it across the poll
+                if reset_seen and dhcsr & m33.DHCSR_S_HALT:
+                    break
+            if time.monotonic() > deadline:
+                raise RunControlError(
+                    f"{core.name}: no reset-and-halt within {timeout_s:.1f}s "
+                    f"(DHCSR 0x{dhcsr or 0:08X}, reset seen: {reset_seen}). The guide "
+                    "notes SYSRESETREQ is not guaranteed to take effect immediately."
+                )
+            time.sleep(0.005)
+    finally:
+        now = _read(dap, core.ap_base, m33.DEMCR)
+        if now is not None:
+            _write(dap, core.ap_base, m33.DEMCR, now & ~m33.DEMCR_VC_CORERESET)
+
+    pc = read_register(dap, core, "pc")
+    return dhcsr, pc
 
 
 # ---------------------------------------------------------------------------

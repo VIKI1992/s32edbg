@@ -158,11 +158,13 @@ Ordering is not cosmetic here. Five rules, each with a consequence:
 
 1. **`gates apply` before anything touching APBIC2** — see above.
 2. **Anything that needs the application running goes before `attach`**, which stops it.
-3. **Keep halts short, and inside one invocation.** Every `s32edbg` run is a separate J-Link
-   session, so halting in one command and resuming in another leaves the core stopped for seconds.
-   On this board that deadlocked the application: CAN stopped, and it did **not** come back when
-   the core was resumed — the other core had been left spinning on shared state. Recovery was a
-   functional reset (`attach` then `release`), not a resume. Halt, look, resume.
+3. **Keep halts short, and inside one connection.** Every one-shot `s32edbg` run is a separate
+   J-Link session, so halting in one command and resuming in another leaves the core stopped for
+   seconds. On this board that deadlocked the application: CAN stopped, and it did **not** come
+   back when the core was resumed — the other core had been left spinning on shared state.
+   Recovery was a functional reset (`attach` then `release`), not a resume. Halt, look, resume —
+   **and for any run-control work beyond a single command, use `s32edbg debug`**, which holds one
+   connection for the whole halt-step-resume cycle and restores the target when it closes.
 4. **Boundary scan goes after all DAP work.** The RM Table 984 preamble links `JTAGC_AE` into the
    scan chain, taking `TotalIRLen` from 8 to 16 — and J-Link's DAP addressing assumes the chain it
    scanned at connect. After the preamble, `connect`, `gates`, `apmap`, `romdump`, `mem`, `core`
@@ -754,15 +756,24 @@ preferring one.
 s32edbg core halt --core rtu0.1
 s32edbg core resume --core rtu0.1
 s32edbg core halt --all
+s32edbg core resume --all --sync      :: one CTM pulse restarts every halted core (guide §5.9)
 s32edbg core unlock --core rtu1.0     :: clear the OS lock without stopping anything
 ```
 
 Armv8 has no halt bit — the request is a CTI trigger — so this programs the core's cross-trigger
-interface and pulses the channel wired to the debug request.
+interface and pulses the channel wired to the debug request. Once the halt has taken, the request
+is acknowledged and its deassertion confirmed through `CTITRIGOUTSTATUS` — guide §5.5: a
+still-asserted request makes the core swallow the next restart. The restart itself is confirmed
+through `EDPRSR.SDR`, the architected sticky-debug-restart flag, not by watching the status change.
 
 **A resume can legitimately come back halted.** If a breakpoint sits on a hot address, the core
 re-enters Debug state faster than any poll can see it running. That is reported as *"ran and
-immediately re-halted at 0x…"*, not as a failure — it is a working breakpoint.
+immediately re-halted at 0x…"*, not as a failure — it is a working breakpoint, and `SDR` proves
+the core did leave Debug state.
+
+`--sync` implements the guide's §5.9 synchronized restart: each halted core's restart channel is
+gated onto the cross-trigger matrix, one pulse releases them all, and the gates are closed again
+so later single-core resumes stay local.
 
 ### `core regs` / `core reg`
 
@@ -770,6 +781,9 @@ immediately re-halted at 0x…"*, not as a failure — it is a working breakpoin
 s32edbg core regs --core rtu0.1
 s32edbg core reg r3 --core rtu0.1
 s32edbg core reg r3 0x1234 --core rtu0.1
+s32edbg core reg pc --core rtu0.1               :: read DLR, the Debug-state PC
+s32edbg core reg pc 0x321D2EE6 --core rtu0.1    :: redirect execution before a resume
+s32edbg core reg dspsr --core rtu0.1
 ```
 
 ```
@@ -840,6 +854,25 @@ core's debug request, so one core stopping stops them all — a coherent multico
 **off by default and single-core halts deliberately do not propagate**; `CTIGATE` is cleared for the
 single-core channels so an ordinary halt cannot disturb anything else.
 
+### `core reset-halt` — own a core from its first instruction
+
+```bat
+s32edbg core reset-halt --core rtu0.1
+```
+
+The guide's §5.10.2 **hold flow**: the core's `SDARSTCTRL.RSTREL` bit is cleared so it stays in
+reset while `SDASYSRSTC` functional-resets the system (the same proven mechanism
+`attach`/`release` use — the debug connection survives and everything else boots normally), then
+`EDECR.RCE` is armed on the held core (EDECR is OS-lock-exempt) and the bit is set back. The
+catch fires before the first instruction; the OS lock the cold reset re-set is cleared, and the
+core sits at its reset vector having fetched nothing. Proven: caught rtu0.1 at `PC 0x32100020`.
+
+**The functional reset is system-wide**: every core reboots; only the chosen one is caught, and
+comparators on the other cores are wiped (functional reset resets RTU debug state — and the
+§5.10.3 SDARSTMASK protection the guide describes measurably does **not** work on this silicon;
+worse, a reset taken with the mask set wedged the boot. See the test plan's finding 1). The
+catch bit and the release bit are restored whatever happens.
+
 ---
 
 ### Worked example — breakpoint, step, continue, from a power cycle
@@ -908,16 +941,21 @@ s32edbg wp clear --all --core rtu0.1
 ```
 
 ```
-breakpoint 0 at 0x321D2EE6 on rtu0.1 (DBGBVR 0x321D2EE4, DBGBCR 0x00000187, BAS 0b1100)
+breakpoint 0 at 0x321D2EE6 on rtu0.1 (DBGBVR 0x321D2EE4, DBGBCR 0x00002187, BAS 0b1100)
 ```
 
-Three things handled for you, each of which silently produces a comparator that never fires:
+Four things handled for you, each of which silently produces a comparator that never fires:
 
 - **The Thumb bit is stripped.** A function pointer to T32 code has bit 0 set to mark the
   instruction set; it is not part of the address.
 - **`DBGBVR` is word-aligned**, so which halfword within the word is selected by `BAS` — note
   `0b1100` above, the high halfword. Selecting all four bytes would also cover the neighbouring
   instruction.
+- **The comparator matches at any exception level.** The control words carry the guide §5.7/§5.8
+  any-EL qualification `{HMC,SSC,PMC} = {1,00,11}` — "the default choice for a halting debugger" —
+  so a breakpoint also fires in EL2 (hypervisor) code. Proven on silicon 2026-08-02: DBGBCR
+  `0x2067` fired at `0x321D2EE8`, and DBGWCR `0x3FF7` fired with EDWAR reporting the exact
+  watched address.
 - **Every write is verified by read-back.** Comparator writes that read back as zero are the classic
   sign that invasive debug is not actually authorised.
 
@@ -943,6 +981,9 @@ s32edbg m33 sample --core smu
 s32edbg m33 bp list --core smu
 s32edbg m33 bp set 0x25001F70 --core smu
 s32edbg m33 bp clear 0 --core smu
+s32edbg m33 wp set 0x250BFF40 --size 4 --on store --core smu
+s32edbg m33 wp list --core smu
+s32edbg m33 reset-halt --core smu
 ```
 
 ```
@@ -973,6 +1014,78 @@ ce0: 100 samples, 100 invalid, 0 distinct addresses
 ! every sample was invalid, so no PC was captured: the core is not executing --
   held in reset, or its clock is gated.
 ```
+
+`m33 wp` arms a DWT comparator as a halting data watchpoint (guide §6.7): `DEMCR.TRCENA` is
+enabled first, the address must be naturally aligned to the watched size, and a halt reports
+`DFSR.DWTTRAP`. DWT watchpoints are **asynchronous** — the core halts *near* the access, not at
+it. Halts report their cause from `DFSR` (halt request, breakpoint, watchpoint, vector catch,
+external), and the reported bits are cleared so the next halt's cause is fresh.
+
+`m33 reset-halt` is the architected reset-and-halt (guide §6.8): `C_DEBUGEN` +
+`DEMCR.VC_CORERESET`, then `AIRCR.SYSRESETREQ`. **Blocked on this silicon**: measured 2026-08-02,
+the AIRCR write is accepted but SYSRESETREQ takes no effect — no reset occurs and the core keeps
+running; the command reports the failure cleanly and disarms the vector catch. The SoC gates M33
+SYSRESETREQ somewhere outside the guide's sources; the SDA-AP `RSTWAIT*` CPUWAIT hold is the
+documented candidate for a future SoC-level flow.
+
+---
+
+## `debug` — one session, many commands
+
+Every other command opens and closes its own J-Link connection, and on this board **every connect
+pulses reset through R439 into the SBC and PMIC** (test-plan defect D-2) — while a halt held
+*across* invocations once deadlocked the application, and three separate run-control bugs came
+from state straddling invocations. `debug` opens the connection once, caches core discovery, and
+closes once.
+
+```bat
+s32edbg debug --core rtu0.1
+```
+
+```
+session open -- 4 R52 core(s): rtu0.0 rtu0.1 rtu1.0 rtu1.1; M33: smu ce0 ce1
+s32edbg[rtu0.1]> halt
+rtu0.1 halted -- halted: external debug request (EDSCR 0x03054113, EDPRSR 0x00000011)
+s32edbg[rtu0.1]> bp set 0x321D2EE6
+breakpoint 0 at 0x321D2EE6 on rtu0.1 (DBGBVR 0x321D2EE4, DBGBCR 0x00002187, BAS 0b1100)
+s32edbg[rtu0.1]> resume
+rtu0.1 running -- running (non-debug state)
+s32edbg[rtu0.1]> step
+step 1  0x321D2EE6 -> 0x321D2EE8  (halted: halting step, normal)
+s32edbg[rtu0.1]> quit
+restore: cleared breakpoint 0 on rtu0.1
+restore: resumed rtu0.1
+session closed
+```
+
+Inside the prompt every normal command works, minus the global options — `bp set …`, `wp list`,
+`mem read 0x00410FF0`, `m33 halt --core smu`, `gates status`. The focused core (set with
+`--core` or `use <name>`) is the default target, and the bare aliases `halt`, `resume`
+(`continue`), `step`, `regs`, `reg`, `status`, `unlock`, `sample` and `reset-halt` act on it.
+
+**Closing restores the target.** On `quit`, end of piped input, or Ctrl-C at the prompt, the
+breakpoints and watchpoints the session set are cleared *first*, then the cores the session
+halted are resumed — in that order, so a resumed core does not trip over a session breakpoint.
+`--keep-on-exit` leaves everything exactly as the session left it instead.
+
+**First touch of a core sanitises its comparators.** Guide §5.7: every comparator field is
+UNKNOWN after cold reset, *including the enable bit*, so the session starts each core it drives
+from a known state and reports what it discarded. `--keep-breakpoints` skips this for workflows
+that deliberately carry comparators between sessions.
+
+Non-interactive use — for scripts and for the bench harness:
+
+```bat
+s32edbg debug --core rtu0.1 -c "halt" -c "regs" -c "resume"
+type script.txt | s32edbg debug --core rtu0.1
+```
+
+Two commands cannot run inside a session and are refused with their reasons: `bscan` (the RM
+Table 984 preamble changes the JTAG chain under the held connection — ordering rule 3), and
+`doctor`/`attach`/`release`/`iface`, which open their own transports or tear the connection down.
+Raw-JTAG `tap` subcommands need the commander backend and are refused the same way. A session
+requires the `dll` backend — the commander backend runs one `JLink.exe` process per operation and
+cannot hold a connection open.
 
 ---
 
@@ -1184,7 +1297,7 @@ This is the right thing to attach to a bug report.
 been proven on silicon, what has only run against test doubles, and what has never been executed.
 
 ```
-pytest                              470 tests, no probe and no SEGGER install needed
+pytest                              524 tests, no probe and no SEGGER install needed
 pytest -m hardware -v -x            21 bench gates, in dependency order
 .\tools\bench-acceptance.ps1        the same sequence, with per-step JSON and wire-level logs
 ```
@@ -1311,5 +1424,5 @@ docs/
   virgin-board.md             getting a foothold on blank flash
 tools/
   bench-acceptance.ps1        runs the hardware sequence, keeps the artifacts
-tests/                470 hardware-free tests, plus 21 bench gates behind `-m hardware`
+tests/                524 hardware-free tests, plus 21 bench gates behind `-m hardware`
 ```

@@ -15,9 +15,12 @@ from s32edbg.dap import adiv6
 from s32edbg.dap import romtable as rt
 from s32edbg.data import a32
 from s32edbg.data import coresight as cs
+from s32edbg.data import ladder1 as lad
+from s32edbg.data import m33debug as m33d
 from s32edbg.data import r52debug as r52
 from s32edbg.data.expected_apmap import (
     AP_APB,
+    AP_SDA,
     APBIC1_ROM_BASE,
     APBIC2_ROM_BASE,
     EXPECTED_APS,
@@ -154,7 +157,7 @@ class MemApFake(FakeTransport):
                     self._fault()
                 self._advance()
                 return 0
-            value = self.mem.get(self.tar, 0)
+            value = self.on_mem_read(self.tar, self.mem.get(self.tar, 0))
             self._advance()
             return value
         if off == adiv6.AP_TAR_LO:
@@ -173,13 +176,22 @@ class MemApFake(FakeTransport):
             if self.tar in self.faulting:
                 self._fault()
             elif not self.ctrl_stat & adiv6.STICKYERR:
-                self.on_mem_write(self.tar, value)
-                self.mem[self.tar] = value
+                if not self.on_mem_write(self.tar, value):
+                    self.mem[self.tar] = value
             self._advance()
         super().ap_reg_write(index, value)
 
-    def on_mem_write(self, addr: int, value: int) -> None:
-        """Hook for subclasses that model side effects of a write."""
+    def on_mem_write(self, addr: int, value: int) -> bool | None:
+        """Hook for subclasses that model side effects of a write.
+
+        Return True to claim the write entirely -- the raw store is skipped,
+        which is how registers with non-storage semantics (write-1-to-clear,
+        key-guarded control words) are modelled.
+        """
+
+    def on_mem_read(self, addr: int, value: int) -> int:
+        """Hook for subclasses that model read side effects (clear-on-read)."""
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +311,7 @@ class SyntheticTarget(MemApFake):
             self.ap_space[ap.base + adiv6.AP_IDR] = ap.idr or 0
             put_id_block(self.ap_space, ap.base, devarch=DEVARCH_MEM_AP)
         self.ap_space[0x01C1_0000 + MDM_DEVARCH] = MDM_DEVARCH_EXPECTED
+        self.ap_space[AP_SDA + lad.SDA_RSTCTRL] = lad.SDA_RSTCTRL_RESET_VALUE
 
         # The AP-space ROM table: RM Table 957's map, as a walkable tree.
         put_rom_table(self.ap_space, APBIC1_ROM_BASE, [ap.base for ap in EXPECTED_APS])
@@ -335,6 +348,10 @@ class SyntheticTarget(MemApFake):
         self.accepts_t32 = True
         #: Whether CTI pulses have any effect. See on_mem_write.
         self.cti_enabled = True
+        #: When set, CTIINTACK does not deassert the debug-request trigger, so
+        #: the guide §5.5 acknowledge-poll times out -- the failure the poll
+        #: exists to catch.
+        self.cti_ack_broken = False
         #: Every write to a core's EDSCR, so tests can assert on transient values
         #: like the interrupt mask that are restored before the call returns.
         self.edscr_writes: list[tuple[int, int]] = []
@@ -342,9 +359,40 @@ class SyntheticTarget(MemApFake):
         #: step is observable after the call returns.
         self.dbgbcr_writes: list[tuple[int, int]] = []
 
+        # -- one Cortex-M33 (the SMU), behind its own AHB-AP -----------------
+        #
+        # The M33 debug registers live at fixed 0xE000_xxxx addresses in the
+        # core's private bus, which do not collide with the APBIC2 map, so the
+        # single shared memory dict can carry both. Only one M33 is modelled;
+        # the tests drive it as `--core smu`.
+        self.mem[m33d.CPUID] = 0x410F_D214  # Arm, Cortex-M33
+        self.mem[m33d.FP_CTRL] = 0x1000_0080  # eight BPU comparators
+        self.mem[m33d.DWT_CTRL] = 0x4 << 28  # four DWT comparators
+        self.mem[m33d.DEMCR] = 0
+        self.mem[m33d.DFSR] = 0
+        #: The M33 behavioural state. DHCSR is *not* backed by the memory dict:
+        #: its write side is key-guarded control and its read side is composed
+        #: status, so the fake owns both (see on_mem_write / on_mem_read).
+        self.m33 = {
+            "control": 0,  # accepted C_DEBUGEN/C_HALT/C_STEP/C_MASKINTS bits
+            "halted": False,
+            "sticky": 0,  # S_RETIRE_ST / S_RESET_ST / S_RESTART_ST accumulate here
+            "pc": 0x2500_1F70,
+            "regs": {},
+        }
+        #: Every *accepted* DHCSR control word, in order -- what pins the
+        #: guide §6.4 two-write step sequence.
+        self.m33_dhcsr_writes: list[int] = []
+        #: DHCSR writes that hit the §6.4 UNPREDICTABLE case: C_MASKINTS
+        #: changed in the same write that clears C_HALT.
+        self.m33_unpredictable: list[int] = []
+        #: Every FP_COMP write, so the suspend-and-restore around an M33 step
+        #: is observable after the call returns.
+        self.fp_comp_writes: list[tuple[int, int]] = []
+
     # -- run-control side effects -------------------------------------------
 
-    def on_mem_write(self, addr: int, value: int) -> None:
+    def on_mem_write(self, addr: int, value: int) -> bool | None:
         """Model the writes that actually change core state.
 
         Without this a fake accepts a CTIAPPPULSE and nothing happens, so a halt
@@ -352,6 +400,9 @@ class SyntheticTarget(MemApFake):
         code under test relies on: channel 0 -> trigger out 0 -> debug request,
         channel 1 -> trigger out 1 -> restart.
         """
+        handled = self._m33_write(addr, value)
+        if handled:
+            return True
         for debug_base, cti_base in self.core_frames.items():
             # `cti_enabled` models a CTI whose pulses go nowhere -- a mis-wired
             # trigger, or a core that is not listening. It is deliberately
@@ -361,8 +412,34 @@ class SyntheticTarget(MemApFake):
             if self.cti_enabled and addr == cti_base + r52.CTIAPPPULSE:
                 if value & (1 << r52.CHANNEL_HALT):
                     self._set_halted(debug_base, True)
+                    # The CTI holds the debug-request trigger asserted until it
+                    # is acknowledged -- the state CTITRIGOUTSTATUS reports and
+                    # CTIINTACK clears (guide §5.5).
+                    self.mem[cti_base + r52.CTITRIGOUTSTATUS] = (
+                        self.mem.get(cti_base + r52.CTITRIGOUTSTATUS, 0)
+                        | (1 << r52.TRIGOUT_DEBUG_REQUEST)
+                    )
                 if value & (1 << r52.CHANNEL_RESTART):
                     self._restart(debug_base)
+                    # CTM broadcast (guide §5.9): with the restart channel gated
+                    # out to the matrix, one pulse reaches every other core
+                    # whose gate is open too. A closed gate keeps it local,
+                    # which is the tool's single-core default.
+                    mask = 1 << r52.CHANNEL_RESTART
+                    if self.mem.get(cti_base + r52.CTIGATE, 0) & mask:
+                        for other_debug, other_cti in self.core_frames.items():
+                            if other_debug != debug_base and (
+                                self.mem.get(other_cti + r52.CTIGATE, 0) & mask
+                            ):
+                                self._restart(other_debug)
+            if (
+                addr == cti_base + r52.CTIINTACK
+                and value & (1 << r52.TRIGOUT_DEBUG_REQUEST)
+                and not self.cti_ack_broken
+            ):
+                self.mem[cti_base + r52.CTITRIGOUTSTATUS] = self.mem.get(
+                    cti_base + r52.CTITRIGOUTSTATUS, 0
+                ) & ~(1 << r52.TRIGOUT_DEBUG_REQUEST)
             if addr == debug_base + r52.EDSCR:
                 self.edscr_writes.append((debug_base, value))
             for _n in range(8):
@@ -384,6 +461,30 @@ class SyntheticTarget(MemApFake):
                 )
                 # The lock is what was gating the core-domain registers.
                 self.faulting.discard(debug_base + r52.EDSCR)
+        return None
+
+    def on_mem_read(self, addr: int, value: int) -> int:
+        # EDPRSR.SDR is clear-on-read (guide §5.5) -- the read that observes
+        # the restart consumes the evidence.
+        for debug_base in self.core_frames:
+            if addr == debug_base + r52.EDPRSR:
+                self.mem[addr] = value & ~r52.EDPRSR_SDR
+                return value
+        if addr == m33d.DHCSR:
+            state = self.m33
+            status = state["sticky"] | m33d.DHCSR_S_REGRDY
+            if state["halted"]:
+                status |= m33d.DHCSR_S_HALT
+            state["sticky"] = 0  # S_RETIRE/S_RESET/S_RESTART are clear-on-read
+            return state["control"] | status
+        for n in range(4):
+            if addr == m33d.dwt_function(n):
+                # The RO ID field [31:27] reads back on silicon (measured
+                # 0b01011 on the SMU) -- a read-back check that forgets to
+                # mask it fails against real hardware, so the fake fails it
+                # the same way.
+                return value | (0b01011 << 27)
+        return value
 
     def _armed_breakpoint(self, debug_base: int) -> int | None:
         """Address of the first enabled breakpoint comparator, if any."""
@@ -408,6 +509,11 @@ class SyntheticTarget(MemApFake):
           This is what makes step-over's temporary breakpoint testable.
         * otherwise -- run.
         """
+        # Whatever the outcome, the PE left Debug state: EDPRSR.SDR (Sticky
+        # Debug Restart) latches until read -- the guide §5.5 confirmation.
+        self.mem[debug_base + r52.EDPRSR] = (
+            self.mem.get(debug_base + r52.EDPRSR, 0) | r52.EDPRSR_SDR
+        )
         if self.mem.get(debug_base + r52.EDECR, 0) & r52.EDECR_SS:
             pc = self.dlr.get(debug_base, 0)
             instruction = a32.decode(pc, self.mem.get(pc & ~1, 0), thumb=True)
@@ -475,6 +581,12 @@ class SyntheticTarget(MemApFake):
             if instruction == r52.instr_dspsr_to_reg(rt, t32=self.accepts_t32):
                 regs[rt] = self.dspsr.get(debug_base, 0)
                 return
+            if instruction == r52.instr_reg_to_dlr(rt, t32=self.accepts_t32):
+                self.dlr[debug_base] = regs.get(rt, 0)
+                return
+            if instruction == r52.instr_reg_to_dspsr(rt, t32=self.accepts_t32):
+                self.dspsr[debug_base] = regs.get(rt, 0)
+                return
 
         # Anything else -- including the right instruction in the wrong
         # encoding -- sets EDSCR.ERR, which is what silicon does.
@@ -486,6 +598,181 @@ class SyntheticTarget(MemApFake):
         """Put a core in the state three of the four bench cores come up in."""
         self.mem[debug_base + r52.EDPRSR] = (
             self.mem.get(debug_base + r52.EDPRSR, 0) | r52.EDPRSR_OSLK | r52.EDPRSR_EDAD
+        )
+        self.faulting.add(debug_base + r52.EDSCR)
+
+    # -- the M33 behavioural model -------------------------------------------
+
+    def _m33_armed_fp(self) -> bool:
+        """Whether an enabled FP_COMP matches the M33's current PC."""
+        fp_ctrl = self.mem.get(m33d.FP_CTRL, 0)
+        if not fp_ctrl & m33d.FP_CTRL_ENABLE:
+            return False
+        for n in range(m33d.fp_num_code(fp_ctrl)):
+            raw = self.mem.get(m33d.fp_comp(n), 0)
+            if raw & m33d.FP_COMP_BE and (raw & ~1) == self.m33["pc"]:
+                return True
+        return False
+
+    def _m33_write(self, addr: int, value: int) -> bool:
+        """The M33 registers whose write side is not plain storage."""
+        state = self.m33
+
+        if addr == m33d.FP_CTRL:
+            # NUM_CODE is read-only; ENABLE takes effect only with KEY set, and
+            # a KEY-less write is discarded entirely -- both like silicon.
+            if value & m33d.FP_CTRL_KEY:
+                current = self.mem.get(m33d.FP_CTRL, 0)
+                self.mem[m33d.FP_CTRL] = (current & ~m33d.FP_CTRL_ENABLE) | (
+                    value & m33d.FP_CTRL_ENABLE
+                )
+            return True
+
+        if addr == m33d.DHCSR:
+            if (value >> 16) & 0xFFFF != 0xA05F:
+                return True  # no DBGKEY: silently discarded, like silicon
+            bits = value & 0x3F
+            self.m33_dhcsr_writes.append(bits)
+            previous = state["control"]
+            # Guide §6.4: changing C_MASKINTS in the same write that clears
+            # C_HALT is UNPREDICTABLE. Recorded, never guessed at.
+            if (
+                state["halted"]
+                and not bits & m33d.DHCSR_C_HALT
+                and (bits ^ previous) & m33d.DHCSR_C_MASKINTS
+            ):
+                self.m33_unpredictable.append(bits)
+            state["control"] = bits
+            if not bits & m33d.DHCSR_C_DEBUGEN:
+                return True
+            if bits & m33d.DHCSR_C_HALT:
+                if not state["halted"]:
+                    state["halted"] = True
+                    self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_HALTED
+            elif state["halted"]:
+                state["sticky"] |= m33d.DHCSR_S_RESTART_ST
+                if bits & m33d.DHCSR_C_STEP:
+                    if self._m33_armed_fp():
+                        # Re-trigger before the instruction executes: PC does
+                        # not move -- the case comparator suspension prevents.
+                        self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_BKPT
+                    else:
+                        state["pc"] += 2
+                        state["sticky"] |= m33d.DHCSR_S_RETIRE_ST
+                        self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_HALTED
+                elif self._m33_armed_fp():
+                    state["sticky"] |= m33d.DHCSR_S_RETIRE_ST
+                    self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_BKPT
+                else:
+                    state["halted"] = False
+            return True
+
+        if addr == m33d.DCRSR:
+            selector = value & 0x7F
+            if value & (1 << 16):  # REGWNR: write
+                target = self.mem.get(m33d.DCRDR, 0)
+                if selector == 15:
+                    state["pc"] = target
+                else:
+                    state["regs"][selector] = target
+            else:
+                source = state["pc"] if selector == 15 else state["regs"].get(selector, 0)
+                self.mem[m33d.DCRDR] = source
+            return True
+
+        if addr == m33d.DFSR:
+            # Write-1-to-clear, not storage.
+            self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) & ~value
+            return True
+
+        if addr == m33d.AIRCR:
+            if value == m33d.AIRCR_SYSRESETREQ:
+                state["sticky"] |= m33d.DHCSR_S_RESET_ST
+                demcr = self.mem.get(m33d.DEMCR, 0)
+                if demcr & m33d.DEMCR_VC_CORERESET and state["control"] & m33d.DHCSR_C_DEBUGEN:
+                    state["halted"] = True
+                    state["pc"] = 0x2500_0000  # the reset handler entry
+                    self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_VCATCH
+                else:
+                    state["halted"] = False
+            return True
+
+        count = m33d.fp_num_code(self.mem.get(m33d.FP_CTRL, 0))
+        for n in range(count):
+            if addr == m33d.fp_comp(n):
+                self.fp_comp_writes.append((addr, value))
+                return False  # observable, but stored normally
+        return False
+
+    # -- SDA-AP reset machinery ----------------------------------------------
+    #
+    # Modelled to the *measured* behaviour, not the guide's §5.10.3 claim: a
+    # functional reset wipes the R52 debug state whether or not SDARSTMASK is
+    # set (bench, 2026-08-02), the cold reset re-sets each core's OS lock, and
+    # a core whose SDARSTCTRL RSTREL bit is 0 stays held in reset until the
+    # bit is set again -- at which point an armed EDECR.RCE catches it.
+
+    #: rtu0.0 / rtu0.1 -> their SDARSTCTRL release-bit masks.
+    RSTREL_BITS = {CORE0_DEBUG: 1 << 31, CORE1_DEBUG: 1 << 30}
+
+    def ap_reg_write(self, index: int, value: int) -> None:
+        addr = self._addr(index)
+        if addr == AP_SDA + lad.SDA_SYSRSTC:
+            sysrsts = self.ap_space.get(AP_SDA + lad.SDA_SYSRSTS, 0)
+            if value & lad.SDA_SYSRSTC_SYSFUNCREQ:
+                self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
+                    sysrsts | lad.SDA_SYSRSTS_SYSTEM_RESET
+                )
+            else:
+                self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
+                    sysrsts & ~lad.SDA_SYSRSTS_SYSTEM_RESET
+                )
+                self._functional_reset_released()
+        if addr == AP_SDA + lad.SDA_RSTCTRL:
+            previous = self.ap_space.get(AP_SDA + lad.SDA_RSTCTRL, 0)
+            super().ap_reg_write(index, value)
+            in_reset = self.ap_space.get(AP_SDA + lad.SDA_SYSRSTS, 0) & (
+                lad.SDA_SYSRSTS_SYSTEM_RESET
+            )
+            if not in_reset:
+                for debug_base, bit in self.RSTREL_BITS.items():
+                    if value & bit and not previous & bit:
+                        self._core_released(debug_base)
+            return
+        super().ap_reg_write(index, value)
+
+    def _functional_reset_released(self) -> None:
+        rstctrl = self.ap_space.get(
+            AP_SDA + lad.SDA_RSTCTRL, lad.SDA_RSTCTRL_RESET_VALUE
+        )
+        for debug_base in self.core_frames:
+            # The reset wipes the RTU debug state and re-sets the OS lock;
+            # while locked, EDSCR faults (measured on rtu1.*).
+            for n in range(8):
+                self.mem[debug_base + r52.dbgbcr(n)] = 0
+                self.mem[debug_base + r52.dbgwcr(n)] = 0
+            self.mem[debug_base + r52.EDECR] = 0
+            self._set_halted(debug_base, False)
+            edprsr = self.mem.get(debug_base + r52.EDPRSR, 0) | r52.EDPRSR_OSLK
+            held = not rstctrl & self.RSTREL_BITS.get(debug_base, 1)
+            if held:
+                edprsr |= r52.EDPRSR_R
+                edprsr &= ~r52.EDPRSR_HALTED
+            self.mem[debug_base + r52.EDPRSR] = edprsr
+            self.faulting.add(debug_base + r52.EDSCR)
+
+    def _core_released(self, debug_base: int) -> None:
+        """An RSTREL bit went 0 -> 1: the held core leaves reset."""
+        edprsr = self.mem.get(debug_base + r52.EDPRSR, 0) & ~r52.EDPRSR_R
+        self.mem[debug_base + r52.EDPRSR] = edprsr
+        if self.mem.get(debug_base + r52.EDECR, 0) & r52.EDECR_RCE:
+            self.dlr[debug_base] = 0x0040_0000  # the reset vector
+            self._set_status(debug_base, r52.EDSCR_STATUS_RESET_CATCH)
+        else:
+            self._set_halted(debug_base, False)
+        # The OS lock (set by the cold reset) still gates EDSCR until OSLAR=0.
+        self.mem[debug_base + r52.EDPRSR] = (
+            self.mem.get(debug_base + r52.EDPRSR, 0) | r52.EDPRSR_OSLK
         )
         self.faulting.add(debug_base + r52.EDSCR)
 
