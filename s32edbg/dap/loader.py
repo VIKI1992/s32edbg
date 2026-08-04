@@ -58,6 +58,14 @@ from .adiv6 import Dap
 FAST_SAMPLE_STRIDE = 256
 #: Sub-block size for progress + fast-path granularity.
 WRITE_SLICE_WORDS = 16 * 1024 // 4
+#: WriteMem attempts per block before that block falls back to ADIv6, and the
+#: pause between attempts. Measured 2026-08-04: the -1 failures cluster in
+#: the FETK region (0x326Bxxxx) and come in bursts -- consistent with bus
+#: contention from the measurement hardware polling its page, not with a
+#: broken writer -- so back-to-back retries fail together and a short pause
+#: gives the window time to pass.
+FAST_ATTEMPTS = 3
+FAST_RETRY_PAUSE_S = 0.025
 
 
 class ResetDriver(Protocol):
@@ -383,6 +391,7 @@ class SegmentWriter:
         self.fast_alive = bool(use_fast and getattr(transport, "can_block_write", False))
         self.fast_ever_used = False
         self.fast_demoted = False
+        self.fast_strikes = 0
         self._first_fast_block = True
         if self.fast_alive:
             # Tell the DLL where the AXI-AP lives (guide §7.2 command strings)
@@ -403,26 +412,75 @@ class SegmentWriter:
                 self.dap.invalidate_csw_cache()
 
     def write_block(self, addr: int, words: list[int]) -> str:
-        """Write one block; returns the path that actually landed it."""
+        """Write one block; returns the path that actually landed it.
+
+        Failure policy, tiered by what the failure means:
+
+        * a TransportError (WriteMem returned an ambiguous rc -- measured:
+          -1 in bursts over the FETK region, consistent with bus contention
+          from the measurement hardware) -- retry with a pause, then fall
+          back **for this block only** and keep the fast path. The cost of a
+          hostile region is bounded to its own blocks; healthy blocks stay
+          fast. There is no permanent demotion for this class: the failed
+          attempts cost milliseconds, the ADIv6 rewrite of one block costs
+          seconds, and a demote-forever policy turned three clustered
+          failures into minutes of word writes for the rest of the load.
+        * a verify MISMATCH (the DLL claimed success and the data is wrong)
+          or an UnsupportedOperation (missing export) -- permanent demotion
+          immediately: a lying writer is never trusted again this load.
+        """
         if self.fast_alive:
             try:
-                self._write_fast(addr, words)
+                self._write_fast_with_retry(addr, words)
                 self.fast_ever_used = True
                 return "dll"
-            except (TransportError, UnsupportedOperation, DapError, LoadError, S32EError) as exc:
-                self.note(
-                    f"fast path demoted at 0x{addr:08X} ({type(exc).__name__}: {exc}) "
-                    "-- rewriting this block via ADIv6 and staying there"
-                )
-                self.fast_alive = False
-                self.fast_demoted = True
-                # u4: a misbehaving DLL call may have disturbed more than
-                # SELECT; prove the AXI-AP is still usable before continuing.
-                self.dap.invalidate_select_cache()
-                self.dap.invalidate_csw_cache(AP_AXI)
-                memaccess.preflight(self.dap, AP_AXI, write=True)
+            except UnsupportedOperation as exc:  # missing export never heals
+                self._fall_back(addr, exc, permanent=True)
+            except TransportError as exc:
+                self.fast_strikes += 1
+                self._fall_back(addr, exc, permanent=False)
+            except S32EError as exc:  # verify mismatch, DapError
+                self._fall_back(addr, exc, permanent=True)
         memaccess.write_words(self.dap, AP_AXI, addr, words)
         return "adiv6"
+
+    def _write_fast_with_retry(self, addr: int, words: list[int]) -> None:
+        last: TransportError | None = None
+        for attempt in range(FAST_ATTEMPTS):
+            if attempt:
+                time.sleep(FAST_RETRY_PAUSE_S)  # let a contention window pass
+            try:
+                self._write_fast(addr, words)
+                return
+            except UnsupportedOperation:
+                raise
+            except TransportError as exc:
+                last = exc
+                # The failed call may have moved SELECT/CSW anyway.
+                self.dap.invalidate_select_cache()
+                self.dap.invalidate_csw_cache(AP_AXI)
+        assert last is not None
+        raise last
+
+    def _fall_back(self, addr: int, exc: Exception, *, permanent: bool) -> None:
+        if permanent:
+            self.fast_alive = False
+            self.fast_demoted = True
+            self.note(
+                f"fast path demoted at 0x{addr:08X} ({type(exc).__name__}: {exc}) "
+                "-- rewriting this block via ADIv6 and staying there"
+            )
+        else:
+            self.note(
+                f"WriteMem failed at 0x{addr:08X} ({exc}) -- rewriting this "
+                f"block via ADIv6; the fast path stays on for the next block "
+                f"(block fallback #{self.fast_strikes})"
+            )
+        # u4: a misbehaving DLL call may have disturbed more than SELECT;
+        # prove the AXI-AP is still usable before continuing.
+        self.dap.invalidate_select_cache()
+        self.dap.invalidate_csw_cache(AP_AXI)
+        memaccess.preflight(self.dap, AP_AXI, write=True)
 
     def _write_fast(self, addr: int, words: list[int]) -> None:
         data = b"".join(w.to_bytes(4, "little") for w in words)
@@ -640,6 +698,12 @@ def load_image(
     report.fast_path = (
         "demoted" if writer.fast_demoted else ("used" if writer.fast_ever_used else "unused")
     )
+    if writer.fast_strikes and not writer.fast_demoted:
+        report.notes.append(
+            f"{writer.fast_strikes} block(s) fell back to ADIv6 on WriteMem "
+            "transients (clustered failures are bus contention, e.g. the FETK "
+            "region -- the fast path stayed on)"
+        )
 
     # P8a -- re-pin the core before verifying anything. The DLL's WriteMem
     # resumes the halted core behind the debugger's back (measured 2026-08-04:

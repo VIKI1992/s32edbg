@@ -1387,3 +1387,23 @@ offline regression:
   halted instantly on the still-latched request; core0 would hang at the OS
   boot barrier. All R52 latches are now dropped once the parked core is
   pinned (the M33 bits in CONTROL stay, exactly as the plugin leaves them).
+
+### Finding 8 — WriteMem's -1 failures cluster over the FETK region (policy changed 2026-08-04)
+
+A user run at 16 MHz hit `JLINK_WriteMem(...) returned -1` for three
+consecutive 16 KB blocks at 0x326B0000/0x326B4000/0x326B8000 -- inside
+`.FETK_referencePageVars` -- and the very first demotion ever observed was in
+the same region (0x326B4000), while three intervening runs wrote it clean.
+Clustered, region-specific, intermittent: consistent with bus contention from
+the FETK/ETK measurement hardware polling its page, not with a broken writer
+(the tool's own single-word ADIv6 writes to the same addresses always land).
+
+Policy consequence: rc-class WriteMem failures no longer demote the fast path
+permanently. Each failing block is retried (3 attempts, 25 ms apart, so a
+contention window can pass), then rewritten via ADIv6 **individually**, and
+the fast path stays on for the next block -- the cost of a hostile region is
+bounded to its own blocks. The demote-forever response is reserved for what
+it was designed for: a data mismatch (the DLL claimed success and the
+read-back disagrees) or a missing export. The old one-strike/three-strike
+policies turned three clustered transients into 85 s of word-writing for the
+rest of a segment.

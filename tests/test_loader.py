@@ -449,3 +449,55 @@ def test_a_writemem_that_resumes_the_core_is_re_halted_before_verify_and_pc() ->
     assert device.dlr[CORE0_DEBUG] == 0x3210_0020
     assert report.pc == 0x3210_0020
     assert report.fast_path == "used"
+
+
+class FlakyFastTarget(FastTarget):
+    """WriteMem fails (rc-style TransportError) for every attempt of exactly
+    one block, then behaves -- the measured clustered -1 (FETK contention)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_left = loader.FAST_ATTEMPTS  # every attempt of one block
+
+    def write_mem_block(self, addr: int, data: bytes) -> None:
+        if self.failures_left:
+            self.failures_left -= 1
+            from s32edbg.errors import TransportError
+
+            raise TransportError(f"JLINK_WriteMem(0x{addr:08X}) returned -1")
+        super().write_mem_block(addr, data)
+
+
+class BrokenFastTarget(FastTarget):
+    """WriteMem fails every single time (rc-style, never a data lie)."""
+
+    def write_mem_block(self, addr: int, data: bytes) -> None:
+        from s32edbg.errors import TransportError
+
+        raise TransportError("returned -1")
+
+
+def test_a_failing_block_falls_back_alone_and_the_fast_path_stays_on() -> None:
+    """The measured FETK-contention shape: one block's attempts all fail. That
+    block is rewritten via ADIv6; the NEXT block uses WriteMem again. The old
+    demote-forever policy turned three clustered failures into minutes of
+    word-writing for the rest of the load."""
+    _dap, device, report, notes = run_full_load(FlakyFastTarget())
+    assert any("block fallback #1" in n for n in notes)
+    assert report.fast_path == "used"
+    assert any("fell back to ADIv6 on WriteMem transients" in n for n in report.notes)
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+    assert device.mem[0x3178_0000] == 0x4433_2211
+    assert device.block_writes, "WriteMem was used again after the fallback"
+
+
+def test_writemem_failing_every_block_never_costs_correctness() -> None:
+    """rc failures are never a reason for permanent demotion -- each block just
+    falls back individually, and with no block ever landing via the DLL the
+    report says the fast path went unused."""
+    _dap, device, report, notes = run_full_load(BrokenFastTarget())
+    assert report.fast_path == "unused"
+    assert not any("staying there" in n for n in notes)
+    assert all(s.path == "adiv6" for s in report.segments)
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+    assert device.mem[0x3178_0000] == 0x4433_2211

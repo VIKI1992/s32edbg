@@ -473,6 +473,8 @@ def print_load_report(report, console: Console | None = None) -> None:
         f"{report.seconds:.2f}s ({report.kb_per_s:,.0f} KB/s), "
         f"fast path {report.fast_path}, verify {report.verify}"
     )
+    for note in report.notes:
+        console.print(f"[dim]note: {note}[/dim]")
     console.print(
         f"[green]rtu0.0 halted at the entry[/green]  "
         f"PC 0x{report.pc:08X}  DSPSR 0x{report.dspsr:08X}"
