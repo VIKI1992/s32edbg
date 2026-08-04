@@ -58,6 +58,29 @@ MDM_STATUS_JTAG_ACTIVE = 1 << 8  # TRST of AUX TAPs deasserted
 MDM_CONTROL_MSK_DBG_FAULT = 1 << 23  # mask debug faults to the FCCU
 
 # --------------------------------------------------------------------------
+# RAM-load debug-request values -- verbatim from the reference plugin's
+# `_reset_to_first_instruction()` (s32z2e2_init_sequence.py:122-126), written
+# to MDM CONTROL/CONTROL2/CONTROL3 while reset is asserted so every R52 halts
+# the moment it leaves reset. Offsets cross-checked three ways: plugin
+# write_mdm index*4 == guide §1.5 map == RM 135.10.1.x. Bit layout to verify
+# against RM 135.10.1.5/.6 at bench: CONTROL2/3 EDBGREQ nibble is bits 19:16,
+# core 0 = bit 16 (guide §1.5: "CR52_RTU0_{3..0}_EDBGREQ bits 19:16").
+# --------------------------------------------------------------------------
+
+#: CONTROL value the plugin asserts during its RAM-load reset: MSK_DBG_FAULT
+#: (bit 23), the three M33 EDBGREQ bits (10:8), plus bits 30:29.
+MDM_CONTROL_LOAD_ASSERT = 0x6080_0700
+MDM_CONTROL2_EDBGREQ_RTU0_ALL = 0x000F_0000
+MDM_CONTROL3_EDBGREQ_RTU1_ALL = 0x000F_0000
+
+
+def edbgreq_bit(core: int) -> int:
+    """CONTROL2/CONTROL3 EDBGREQ bit for one R52 core (core 0 = bit 16)."""
+    if not 0 <= core <= 3:
+        raise ValueError(f"R52 core index {core} is not 0-3")
+    return 1 << (16 + core)
+
+# --------------------------------------------------------------------------
 # SDA-AP register offsets -- RM section 135.13.2.1 (L418722-418814)
 # Read-only use here: the challenge/response is one-shot ("HSE allows one only
 # attempt for C/R comparison. If it fails, no further attempts are accepted.")

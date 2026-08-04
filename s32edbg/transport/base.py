@@ -114,6 +114,28 @@ class Transport(abc.ABC):
     @abc.abstractmethod
     def ap_reg_write(self, index: int, value: int) -> None: ...
 
+    # -- bulk memory / reset pin -------------------------------------------
+    #: Whether write_mem_block() can push a byte block through the probe's own
+    #: memory machinery in one call. Off everywhere except the DLL backend
+    #: when its (hand-bound, unverifiable-on-this-machine) WriteMem export
+    #: resolves -- callers must verify by read-back and fall back to the pure
+    #: ADIv6 path on any doubt.
+    can_block_write: bool = False
+
+    def write_mem_block(self, addr: int, data: bytes) -> None:
+        raise UnsupportedOperation(
+            f"{self.name} transport cannot block-write target memory"
+        )
+
+    #: Whether set_reset_pin() can drive the probe's nRESET line.
+    can_pin_reset: bool = False
+
+    def set_reset_pin(self, asserted: bool) -> None:
+        """Drive nRESET: True pulls the line low (reset asserted)."""
+        raise UnsupportedOperation(
+            f"{self.name} transport cannot drive the reset pin"
+        )
+
     # -- raw JTAG ----------------------------------------------------------
     #: Whether raw_shift() can drive arbitrary TMS/TDI vectors at all.
     can_raw_shift: bool = False

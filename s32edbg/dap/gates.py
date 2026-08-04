@@ -47,6 +47,12 @@ from ..data.expected_apmap import AP_MDM, AP_SDA
 from ..data.ladder1 import (
     GATE_READBACK,
     LADDER1,
+    MDM_CONTROL,
+    MDM_CONTROL2,
+    MDM_CONTROL3,
+    MDM_CONTROL2_EDBGREQ_RTU0_ALL,
+    MDM_CONTROL3_EDBGREQ_RTU1_ALL,
+    MDM_CONTROL_LOAD_ASSERT,
     MDM_DEVARCH,
     MDM_DEVARCH_EXPECTED,
     MDM_IDR,
@@ -56,6 +62,7 @@ from ..data.ladder1 import (
     MDM_STATUS_CSYSPWRUPREQ,
     MDM_STATUS_JTAG_ACTIVE,
     MDM_STATUS_SYSTEM_RESET,
+    edbgreq_bit,
     SDA_AUTHSTTS,
     SDA_AUTHSTTS_APPDBGEN,
     SDA_AUTHSTTS_CHALRDY,
@@ -265,6 +272,53 @@ def apply_ladder1(dap: Dap, ap_base: int = AP_MDM, *, verify: bool = True) -> Ga
                     "at the HSE gate rather than at this sequence."
                 )
     return report
+
+
+def arm_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
+    """Latch external debug requests so every R52 halts on leaving reset.
+
+    The reference plugin's RAM-load values, verbatim (its
+    `_reset_to_first_instruction()`): CONTROL gets MSK_DBG_FAULT plus the M33
+    request bits, CONTROL2/CONTROL3 get the EDBGREQ nibble for all four cores
+    of RTU0/RTU1. Written while reset is asserted -- the MDM-AP is a debug
+    component and survives functional reset (guide §3.6), so the requests are
+    still pending when the cores come out and they halt before executing
+    anything.
+    """
+    dap.ap_write(ap_base, MDM_CONTROL, MDM_CONTROL_LOAD_ASSERT)
+    dap.ap_write(ap_base, MDM_CONTROL2, MDM_CONTROL2_EDBGREQ_RTU0_ALL)
+    dap.ap_write(ap_base, MDM_CONTROL3, MDM_CONTROL3_EDBGREQ_RTU1_ALL)
+
+
+def clear_core_edbgreq(dap: Dap, core: int = 0, ap_base: int = AP_MDM) -> None:
+    """De-assert one RTU0 core's external debug request (read-modify-write).
+
+    The plugin's `start_debug_by_core_name` equivalent: once the core is in
+    Debug state the request has served its purpose, and leaving it asserted
+    would fight every later resume. RMW so the other cores' still-pending
+    requests -- and the M33 bits in CONTROL -- stay as the flow left them.
+    """
+    current = dap.ap_read(ap_base, MDM_CONTROL2)
+    dap.ap_write(ap_base, MDM_CONTROL2, current & ~edbgreq_bit(core))
+
+
+def clear_all_r52_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
+    """Drop every latched R52 debug request (RTU0 and RTU1, RMW).
+
+    Once the load flow has its core pinned by a real CTI halt, the latches
+    have done their job -- they existed to stop cores running away between
+    the reset release and the RGM holds. Leaving them armed is a trap:
+    measured 2026-08-04, the application's own core-1 release ran into the
+    stale latch and core1 halted instead of booting, so core0 hung at the OS
+    boot barrier. The M33 request bits in CONTROL are left exactly as the
+    plugin leaves them.
+    """
+    for reg, mask in (
+        (MDM_CONTROL2, MDM_CONTROL2_EDBGREQ_RTU0_ALL),
+        (MDM_CONTROL3, MDM_CONTROL3_EDBGREQ_RTU1_ALL),
+    ):
+        current = dap.ap_read(ap_base, reg)
+        dap.ap_write(ap_base, reg, current & ~mask)
 
 
 def assert_axi_safe(report: GateReport) -> None:

@@ -104,6 +104,26 @@ class DebugSession:
     def note_m33_wp_cleared(self, core: str, index: int) -> None:
         self.m33_wp_set.discard((core, index))
 
+    def note_system_reset(self) -> None:
+        """A flow (`load`) reset the whole SoC under this session.
+
+        Guide §3.6: a functional reset wipes RTU debug state -- comparators,
+        OS-lock clears, halts -- so the session's per-target bookkeeping now
+        describes a machine that no longer exists. Forget it, or restore()
+        would try to undo changes the reset already undid. What survives:
+        ``prepared`` (CDBGPWRUPREQ and the AP-read calibration hold -- the
+        bench-validated `reset-halt` flow never re-prepares either), the core
+        identity caches (frame addresses are stable; state is re-read on every
+        use), and the focus.
+        """
+        self.halted_r52.clear()
+        self.halted_m33.clear()
+        self.bp_set.clear()
+        self.wp_set.clear()
+        self.m33_bp_set.clear()
+        self.m33_wp_set.clear()
+        self.sanitized.clear()
+
     # -- restore-on-close ----------------------------------------------------
 
     def restore(self) -> list[str]:

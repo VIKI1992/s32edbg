@@ -247,10 +247,23 @@ works.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | usage error — bad `--ap`, misaligned dump, missing required argument |
-| `2` | tool error — no DAP, power-up refused, transport failure |
+| `1` | usage error — bad `--ap`, misaligned dump, missing required argument, malformed address or value |
+| `2` | tool error — no DAP, power-up refused, transport failure. Also the fallback for an internal error: anything that escapes a command is reported as `internal error: <type>: <message>` with this exit code, never as a Python traceback (`S32EDBG_TRACE=1` re-raises for debugging) |
 | `3` | **refused by safety policy** |
 | `130` | aborted at a confirmation prompt |
+
+### Address and value syntax
+
+Three kinds of numeric argument, three rules:
+
+| Kind | Rule | Examples |
+|---|---|---|
+| **Address** (`bp set`, `wp set`, `m33 bp/wp set`, `mem read/dump/write` ADDR, `romdump --rom`, a numeric `--ap`) | **`0x`-prefixed hex only.** A bare number is rejected with an error — `32169874` could be hex or decimal, and both guesses have burned users: base-0 silently read it as decimal and armed a comparator at `0x01EADF92` instead of `0x32169874`, while unprefixed hex like `321D2EE6` crashed the whole session. | `bp set 0x321D2EE6` ✓ · `bp set 0X32100020` ✓ · `bp set 32169874` ✗ (error, session survives) |
+| **Data value** (`mem write` VALUE, `core reg` VALUE, `tap ir/dr`) | Decimal, or `0x`/`0o`/`0b`-prefixed (Python `int(x, 0)`), unchanged. | `mem write 0x1000 57005` ✓ · `mem write 0x1000 0xDEAD` ✓ · `mem write 0x1000 banana` ✗ (error) |
+| **Comparator index** (`bp clear`, `wp clear`, `m33 bp/wp clear`) | Bare decimal. | `m33 bp clear 2` ✓ |
+
+Malformed input of any kind exits `1` one-shot and prints an error inside a
+`debug` session — **it never terminates the session**.
 
 ---
 
@@ -1087,6 +1100,75 @@ Raw-JTAG `tap` subcommands need the commander backend and are refused the same w
 requires the `dll` backend — the commander backend runs one `JLink.exe` process per operation and
 cannot hold a connection open.
 
+**No input ends the session.** A malformed address (`bp set 32169874` — bare numbers are
+rejected, see *Address and value syntax*), a refused operation, a target error, even an internal
+tool bug: all of them print and the prompt returns. The session is the asset on this board;
+losing it costs a reconnect and another D-2 reset pulse.
+
+---
+
+## `load` — write a build into RAM and park at its entry
+
+The fast build/debug loop: compile, `load`, breakpoint, `resume` — no flashing.
+
+```bat
+s32edbg debug
+s32edbg[-]> load C:\br1_rear_ecu\build\bin\br1_rear.elf
+```
+
+What it does, in order (the reference S32-Debug-Probe plugin's flow, replicated register for
+register — see `s32edbg/data/rtuboot.py` for every value with its citation):
+
+1. **P0** — debug power-up, the LADDER-1 debug enables, and halting the three M33s.
+2. **P1/P2** — a system reset (SDA-AP functional reset by default) with **MDM EDBGREQ latched
+   for every R52** across it, so each core halts the instant it leaves reset. All AXI-AP
+   traffic waits until both reset flags read clear (guide §9 #3).
+3. **P3** — MC_ME/RGM partition bring-up for RTU0 and RTU1, plus NXP's generic SRAM scrubs.
+4. **P4** — the SRAMC D0/D1/D2 ECC init **with the edge-trigger fix**: `RAMCR.INIT` is
+   edge-triggered, so each controller gets `RAMCR=0` first, and three witness words must read
+   exactly `0x00000000` afterwards or the load aborts — uninitialised DataRAM ECC is the
+   documented `Os_Hal_CoreFreeze` panic.
+5. **P5** — rtu0.0 is parked on a `b .` loop via its MC_ME boot address and caught halted by
+   the pending EDBGREQ, then unlocked and sanitised like any session core.
+6. **P6/P7** — every `PT_LOAD` segment is written at its **LMA** (GDB-`load` semantics: file
+   bytes only, no BSS fill; one ragged tail is zero-padded into its final word). The J-Link
+   DLL's `WriteMem` fast path is used while it proves itself — the first block is fully read
+   back through the independent ADIv6 path, later blocks are sample-verified — and any
+   mismatch demotes the whole load to pure ADIv6 word bursts. `--verify` compares every word.
+7. **P8** — PC = the ELF entry (Thumb bit stripped into DSPSR.T), and the core **stays
+   halted**. Set breakpoints, then `resume`.
+
+```
+load: SRAMC D0/D1/D2 ECC init verified (witness words read 0)
+load: parking rtu0.0 on a `b .` loop and releasing it into the halt
+load: WriteMem fast path proven by full read-back of the first block (512 words)
+load: wrote 0x3210C580    781,560 bytes    6.76s     112.9 KB/s
+...
+total 3,677,786 bytes in 33.58s (107 KB/s), fast path used, verify sampled
+rtu0.0 halted at the entry  PC 0x32100020  DSPSR 0x400001FA
+focus: rtu0.0 -- set breakpoints, then `resume` (or `continue`) when ready.
+```
+
+(Measured 2026-08-04, V13 probe at `--speed 16000` — the reference plugin's own
+JTAG clock; the tool's default is 4 MHz, which loads at ~71 KB/s. The pure
+ADIv6 fallback runs at ~4 KB/s — the fast path is what makes the loop fast.)
+
+**Flags.** `--verify` full word-for-word read-back; `--no-fast` pure ADIv6 writes only;
+`--reset {sda,pin}` — `pin` replicates the plugin's RESET_B toggle literally (the pulse reaches
+the SBC/PMIC through R439); `--core1 {leave,park,release}` — default `leave`, because core0's
+own firmware performs the complete rtu0.1 bring-up (`BrsHwEarlyInitPowerOn()`,
+`BrsHw.c:159-212`, verified in the br1_rear sources, and it asserts core-1 reset first so any
+debugger pre-state is tolerated). `park`/`release` are the plugin-faithful fallback.
+
+**Run it inside `debug`.** A one-shot `s32edbg load app.elf` works and says so loudly — but the
+*next* connect pulses reset into the SBC/PMIC (D-2) and reboots away what was loaded. Inside a
+session, quitting resumes the parked core (the normal restore contract) unless `--keep-on-exit`.
+
+**This resets the whole SoC.** Everything running stops; every core reboots. The image must be
+linked for the RTU0 RAM windows (DataRAM `0x3178_0000`+, extended `0x3180_0000`+, CodeRAM
+`0x3210_0000`+); an ELF whose LMAs fall outside — a flash-linked image — is refused before a
+single write.
+
 ---
 
 ## `bscan` — boundary scan
@@ -1408,15 +1490,18 @@ those. The CLI never calls `Dap.mem_*` directly.
 ```
 s32edbg/
   cli.py              click command groups
+  elf.py              minimal ELF32 reader for `load` (stdlib struct, PT_LOAD + entry only)
   transport/          base ABC, ctypes DLL, Commander subprocess, SVF/JTAGLoad, install discovery
   dap/                adiv6 (SELECT, power-up, MEM-AP), apmap, romtable, gates,
                       memaccess (bus policy), iface (protocol detection),
-                      runcontrol (Cortex-R52), m33 (Cortex-M33)
+                      runcontrol (Cortex-R52), m33 (Cortex-M33),
+                      loader (the RAM-load flow: bring-up, SRAMC, segment writer)
   jtag/               tapseq (pure TMS/TDI vectors), tap, bscan
   data/               RM / ADIv6 / SoC-600 / TRM tables, each citing its source:
                       known_ids, expected_apmap, ladder1, bscan, swj,
                       coresight (shared component offsets), r52debug, m33debug,
-                      a32 (just enough decode to step over a call)
+                      a32 (just enough decode to step over a call),
+                      rtuboot (the verbatim MC_ME/RGM/SRAMC bring-up tables for `load`)
   report/             rich + JSON rendering
 docs/
   system-debug-interface.md   how the interface is built, the switching sequences, the preamble
@@ -1424,5 +1509,5 @@ docs/
   virgin-board.md             getting a foothold on blank flash
 tools/
   bench-acceptance.ps1        runs the hardware sequence, keeps the artifacts
-tests/                524 hardware-free tests, plus 21 bench gates behind `-m hardware`
+tests/                598 hardware-free tests, plus 21 bench gates behind `-m hardware`
 ```

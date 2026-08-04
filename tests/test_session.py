@@ -225,3 +225,139 @@ def test_unknown_session_commands_point_at_help(run, opened) -> None:
     code, out = run("debug", "-c", "frobnicate")
     assert code == EXIT_OK
     assert "unknown command" in out
+
+
+def test_a_malformed_address_reports_and_the_session_survives(run, opened) -> None:
+    """The reported defect: `bp set 32169874` (no 0x) used to raise an uncaught
+    ValueError that unwound the REPL and killed the process -- and with it the
+    session whose whole purpose is avoiding reconnects (defect D-2). Now it is
+    a printed error; the next command still runs and the close is orderly."""
+    device, opens = opened
+    code, out = run(
+        "debug", "--core", "rtu0.0",
+        "-c", "bp set 32169874",   # rejected: bare number
+        "-c", "bp set zzz",        # rejected: not hex at all
+        "-c", "halt",              # still runs
+    )
+    assert code == EXIT_OK
+    assert out.count("0x-prefixed") == 2
+    assert "restore: resumed rtu0.0" in out
+    assert "session closed" in out
+    assert len(opens) == 1
+
+
+def test_an_internal_error_reports_and_the_session_survives(run, opened, monkeypatch) -> None:
+    """Defence in depth: even a genuine bug inside a command must not end the
+    session. It is reported as an internal error and the REPL keeps going."""
+    device, _ = opened
+
+    real_halt = cli.runcontrol.halt
+    calls: list[int] = []
+
+    def flaky_halt(dap, c):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("simulated bug")
+        return real_halt(dap, c)
+
+    monkeypatch.setattr(cli.runcontrol, "halt", flaky_halt)
+    code, out = run(
+        "debug", "--core", "rtu0.0",
+        "-c", "halt",   # internal error, survives
+        "-c", "halt",   # works
+    )
+    assert code == EXIT_OK
+    assert "internal error" in out
+    assert "simulated bug" in out
+    assert "still open" in out
+    assert "restore: resumed rtu0.0" in out
+    assert "session closed" in out
+
+
+# ---------------------------------------------------------------------------
+# load -- the RAM-load flow driven end to end through the session
+# ---------------------------------------------------------------------------
+
+
+def _write_load_elf(tmp_path):
+    """A two-segment ELF inside the loadable windows, ragged tail included."""
+    import struct
+
+    from s32edbg import elf as elf_mod
+
+    segments = [
+        (0x3210_0020, b"\x21\x00\x00\xea\x55\xaa\x55\xaa"),
+        (0x3178_0000, b"\x11\x22\x33\x44\x55\x66"),
+    ]
+    phoff, phnum = 52, len(segments)
+    data_off = phoff + phnum * elf_mod.PHDR_SIZE
+    ident = elf_mod.ELF_MAGIC + bytes([1, 1, 1, 0]) + b"\x00" * 8
+    ehdr = struct.pack(
+        "<HHIIIIIHHHHHH", 2, elf_mod.EM_ARM, 1, 0x3210_0021, phoff, 0, 0, 52,
+        elf_mod.PHDR_SIZE, phnum, 0, 0, 0,
+    )
+    phdrs, blobs, off = b"", b"", data_off
+    for paddr, data in segments:
+        phdrs += struct.pack(
+            "<IIIIIIII", elf_mod.PT_LOAD, off, paddr, paddr, len(data), len(data), 5, 4
+        )
+        blobs += data
+        off += len(data)
+    p = tmp_path / "app.elf"
+    p.write_bytes(ident + ehdr + phdrs + blobs)
+    return p
+
+
+def test_load_in_a_session_lands_the_image_and_parks_the_core(run, opened, tmp_path) -> None:
+    device, opens = opened
+    p = _write_load_elf(tmp_path)
+    code, out = run("debug", "-c", f'load "{p}"')
+    assert code == EXIT_OK
+    assert len(opens) == 1, "load must reuse the held session connection"
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+    assert device.mem[0x3178_0004] == 0x0000_6655, "ragged tail zero-padded"
+    assert device.dlr[CORE0_DEBUG] == 0x3210_0020
+    assert "rtu0.0 halted at the entry" in out
+    assert "resets the whole SoC" in out
+    # note_halted + restore-on-close: the parked core is resumed at quit.
+    assert "restore: resumed rtu0.0" in out
+
+
+def test_load_keep_on_exit_leaves_the_core_parked(run, opened, tmp_path) -> None:
+    device, _ = opened
+    p = _write_load_elf(tmp_path)
+    code, out = run("debug", "--keep-on-exit", "-c", f'load "{p}"')
+    assert code == EXIT_OK
+    assert "restore:" not in out
+    from s32edbg.data import r52debug as r52mod
+
+    assert device.mem[CORE0_DEBUG + r52mod.EDPRSR] & r52mod.EDPRSR_HALTED
+
+
+def test_load_argument_errors_never_touch_the_probe_and_never_kill_the_session(
+    run, opened, tmp_path
+) -> None:
+    device, opens = opened
+    not_elf = tmp_path / "not.elf"
+    not_elf.write_bytes(b"MZ definitely not an ELF")
+    code, out = run(
+        "debug", "--core", "rtu0.0",
+        "-c", "load",                       # missing argument
+        "-c", f'load "{tmp_path / "gone.elf"}"',  # missing file
+        "-c", f'load "{not_elf}"',          # not an ELF
+        "-c", "halt",                       # session still works
+    )
+    assert code == EXIT_OK
+    assert "Missing argument" in out
+    assert "cannot read" in out
+    assert "not an ELF" in out
+    assert "restore: resumed rtu0.0" in out
+    assert "session closed" in out
+
+
+def test_a_one_shot_load_warns_about_the_reconnect_reset(run, opened, tmp_path) -> None:
+    p = _write_load_elf(tmp_path)
+    code, out = run("load", str(p))
+    assert code == EXIT_OK
+    assert "one-shot load" in out
+    assert "D-2" in out

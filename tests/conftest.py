@@ -18,8 +18,10 @@ from s32edbg.data import coresight as cs
 from s32edbg.data import ladder1 as lad
 from s32edbg.data import m33debug as m33d
 from s32edbg.data import r52debug as r52
+from s32edbg.data import rtuboot
 from s32edbg.data.expected_apmap import (
     AP_APB,
+    AP_MDM,
     AP_SDA,
     APBIC1_ROM_BASE,
     APBIC2_ROM_BASE,
@@ -390,6 +392,74 @@ class SyntheticTarget(MemApFake):
         #: is observable after the call returns.
         self.fp_comp_writes: list[tuple[int, int]] = []
 
+        # -- load-flow (MC_ME / RGM / SRAMC) model ---------------------------
+        #
+        # RGM PRST_0[1] comes up with the partition and all four cores in
+        # reset; PSTAT mirrors it. Clearing a core's PRST bit while its MDM
+        # EDBGREQ is latched halts the core straight out of reset -- the park
+        # mechanism the load flow relies on.
+        self.mem[rtuboot.RGM_PRST0_1] = 0x1F
+        self.mem[rtuboot.RGM_PSTAT0_1] = 0x1F
+        #: (pconf, pupd, stat) triples the MC_ME key handshake commits.
+        self._mc_me_triples = (
+            (0x4190_0300, 0x4190_0304, 0x4190_0308),
+            (0x4190_0340, 0x4190_0344, 0x4190_0348),
+            (0x4190_0360, 0x4190_0364, 0x4190_0368),
+            (0x4190_0500, 0x4190_0504, 0x4190_0508),
+            (0x4190_0540, 0x4190_0544, 0x4190_0548),
+        )
+        #: SRAMC controllers whose RAMCR.INIT edge is modelled, with the
+        #: witness word each D-bank's scrub must zero. RAMCR.INIT is
+        #: EDGE-triggered on silicon (root-caused 2026-07-03): writing INIT=1
+        #: while it is already 1 does nothing, registers read back perfect.
+        self._sramc_witness = {
+            0x761D_0000: 0x3178_E1A0,
+            0x761E_0000: 0x317C_0010,
+            0x761F_0000: 0x3180_0010,
+        }
+        #: Every SRAMC base the tables touch: v2 D-banks plus the generic
+        #: scrub's SMU/CE/RTU controllers (all offsets are <= 0x40, so masking
+        #: the low byte recovers the base).
+        self._sramc_bases = {a & ~0xFF for a, _v in rtuboot.SRAMC_V2_WRITES} | {
+            a.addr & ~0xFF
+            for a in rtuboot.ACTIONS_GENERIC_SRAM
+            if a.op in ("write32", "poll")
+        }
+
+    def _loadflow_write(self, addr: int, value: int) -> None:
+        """MC_ME key commits, SRAMC INIT edges, RGM mirror + EDBGREQ halts."""
+        if addr == rtuboot.MC_ME_CTL_KEY and value == 0xA50F:
+            # The inverted-key write commits pending process updates: STAT
+            # mirrors PCONF, PUPD clears.
+            for pconf, pupd, stat in self._mc_me_triples:
+                self.mem[stat] = self.mem.get(pconf, 0)
+                self.mem[pupd] = 0
+            return
+        if addr in self._sramc_bases:
+            old = self.mem.get(addr, 0)
+            if value & 1 and not old & 1:  # 0 -> 1 edge on INIT
+                self.mem[addr + 0xC] = self.mem.get(addr + 0xC, 0) | 1  # IDONE
+                witness = self._sramc_witness.get(addr)
+                if witness is not None:
+                    start = self.mem.get(addr + 0x4, 0)
+                    end = self.mem.get(addr + 0x8, 0)
+                    if start <= witness <= end:
+                        self.mem[witness] = 0
+            return
+        if addr == rtuboot.RGM_PRST0_1:
+            old = self.mem.get(rtuboot.RGM_PRST0_1, 0)
+            self.mem[rtuboot.RGM_PSTAT0_1] = value
+            control2 = self.ap_space.get(AP_MDM + lad.MDM_CONTROL2, 0)
+            for debug_base, bit in ((CORE0_DEBUG, 0x2), (CORE1_DEBUG, 0x4)):
+                if old & bit and not value & bit:
+                    core_idx = 0 if debug_base == CORE0_DEBUG else 1
+                    if control2 & lad.edbgreq_bit(core_idx):
+                        # Out of cold reset with EDBGREQ pending: halted at the
+                        # park loop, OS lock set exactly as silicon sets it.
+                        self._set_halted(debug_base, True)
+                        self.mem[debug_base + r52.EDPRSR] |= r52.EDPRSR_OSLK
+                        self.faulting.add(debug_base + r52.EDSCR)
+
     # -- run-control side effects -------------------------------------------
 
     def on_mem_write(self, addr: int, value: int) -> bool | None:
@@ -400,6 +470,7 @@ class SyntheticTarget(MemApFake):
         code under test relies on: channel 0 -> trigger out 0 -> debug request,
         channel 1 -> trigger out 1 -> restart.
         """
+        self._loadflow_write(addr, value)
         handled = self._m33_write(addr, value)
         if handled:
             return True
@@ -558,6 +629,13 @@ class SyntheticTarget(MemApFake):
         execute. That matters: a fake that quietly accepted any encoding would
         let a wrong instruction encoding pass the round-trip oracle, which is
         the one thing the oracle exists to catch.
+
+        Fidelity limit worth knowing: measured 2026-08-04, a core halted by an
+        out-of-reset EDBGREQ with EDSCR.HDE clear refused the register round
+        trip on silicon, while a reset-catch halt (also HDE-clear) allowed it
+        on the 2026-08-02 bench -- so a naive HDE gate here would be wrong in
+        one direction or the other. The load flow sets HDE explicitly
+        (loader P5), like halt() always has.
         """
         regs = self.regfile.setdefault(debug_base, {})
 

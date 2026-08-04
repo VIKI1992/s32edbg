@@ -37,19 +37,22 @@ from .adiv6 import STICKYERR, Dap
 def resolve_ap(spec: str) -> int:
     """Turn an --ap value into an AP base address.
 
-    Accepts a short name from RM Table 957 or a raw base address.
+    Accepts a short name from RM Table 957 or a 0x-prefixed base address. A
+    bare number is rejected like every other address argument: it could be hex
+    or decimal, and both guesses have produced confidently-wrong accesses.
     """
     key = spec.strip().lower()
     if key in AP_ALIASES:
         return AP_ALIASES[key]
-    try:
-        value = int(spec, 0)
-    except ValueError:
-        raise ValueError(
-            f"unknown AP {spec!r}. Use one of {', '.join(sorted(AP_ALIASES))}, "
-            "or a base address such as 0x01C20000."
-        ) from None
-    return value
+    if key[:2] == "0x":
+        try:
+            return int(key, 16)
+        except ValueError:
+            pass
+    raise ValueError(
+        f"unknown AP {spec!r}. Use one of {', '.join(sorted(AP_ALIASES))}, "
+        "or a 0x-prefixed base address such as 0x01C20000."
+    )
 
 
 def ap_label(ap_base: int) -> str:
@@ -146,6 +149,32 @@ def write_word(dap: Dap, ap_base: int, addr: int, value: int, *, size: int = 32)
     gates.guard_write(ap_base)
     if not dap.mem_write_checked(ap_base, addr, value, size=size):
         raise DapError(_fault_message(ap_base, addr))
+
+
+def write_words(
+    dap: Dap, ap_base: int, addr: int, values: list[int], *, size: int = 32
+) -> None:
+    """Write a block of values, raising if any access faulted.
+
+    Callers must have run preflight(write=True) first. Mirrors read_words'
+    block mode: checked once at the end, because STICKYERR is latching -- if
+    any word in the block faulted the flag is still set when the block
+    finishes. Ordinary memory only (see Dap.mem_write_block on the fallback's
+    write-twice behaviour).
+    """
+    gates.guard_write(ap_base)
+    if not values:
+        return
+    dap.clear_sticky()
+    dap.mem_write_block(ap_base, addr, values, size=size)
+    if dap.read_ctrl_stat() & STICKYERR:
+        dap.clear_sticky()
+        raise DapError(
+            _fault_message(ap_base, addr)
+            + f" Somewhere in the {len(values)} words from 0x{addr:08X} a write "
+            "faulted, so the whole block is suspect -- nothing past the faulting "
+            "word landed."
+        )
 
 
 def apb_range_note(ap_base: int, addr: int) -> str | None:

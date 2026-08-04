@@ -44,3 +44,25 @@ class UnsafeOperation(S32EError):
 
 class RomTableError(S32EError):
     """Malformed ROM table or component ID block."""
+
+
+class ElfError(S32EError):
+    """The file is not an ELF this tool can load.
+
+    Raised by ``elf.parse`` for anything outside the supported shape: not an
+    ELF at all, ELF64, big-endian, not ARM, no entry point, a truncated
+    program-header table, or overlapping load segments. An S32EError so it
+    travels the standard route (message + exit 2 one-shot, printed error inside
+    a session); the CLI downgrades argument-quality cases (missing file, not an
+    ELF) to a usage error.
+    """
+
+
+class LoadError(S32EError):
+    """A step of the RAM-load flow failed on the target.
+
+    Distinct from DapError: the access worked at the DAP level but the flow's
+    oracle failed -- an init-action poll timed out, the SRAMC post-init witness
+    read non-zero, the core never halted in the park loop, or the post-load
+    verify mismatched.
+    """

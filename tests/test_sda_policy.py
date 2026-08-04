@@ -93,3 +93,41 @@ def test_holding_touches_no_register_but_the_reset_control() -> None:
     gates.hold_in_functional_reset(Dap(t))
     written = {addr for op, _i, addr in t.log if op == "ap_write"}
     assert written == {AP_SDA + SDA_SYSRSTC}
+
+
+# ---------------------------------------------------------------------------
+# EDBGREQ latching for the RAM-load flow
+# ---------------------------------------------------------------------------
+
+
+def test_arm_edbgreq_writes_the_plugin_values_to_the_three_control_registers() -> None:
+    """Verbatim replication of the reference plugin's _reset_to_first_instruction
+    MDM writes (its write_mdm index*4 == the RM 135.10.1.x offsets)."""
+    from s32edbg.data.ladder1 import (
+        MDM_CONTROL,
+        MDM_CONTROL2,
+        MDM_CONTROL3,
+        MDM_CONTROL_LOAD_ASSERT,
+    )
+
+    t = FakeTransport(pipelined=False)
+    gates.arm_edbgreq(Dap(t))
+    assert t.ap_space[AP_MDM + MDM_CONTROL] == MDM_CONTROL_LOAD_ASSERT == 0x6080_0700
+    assert t.ap_space[AP_MDM + MDM_CONTROL2] == 0x000F_0000
+    assert t.ap_space[AP_MDM + MDM_CONTROL3] == 0x000F_0000
+
+
+def test_clear_core_edbgreq_is_a_true_read_modify_write() -> None:
+    """Only the target core's request bit drops; the other cores' pending
+    requests survive. Core 0 = bit 16 (guide §1.5, CR52_RTU0_{3..0} bits 19:16)."""
+    from s32edbg.data.ladder1 import MDM_CONTROL2
+
+    t = FakeTransport(pipelined=False)
+    t.ap_space[AP_MDM + MDM_CONTROL2] = 0x000F_0000
+    gates.clear_core_edbgreq(Dap(t), core=0)
+    assert t.ap_space[AP_MDM + MDM_CONTROL2] == 0x000E_0000
+
+
+def test_clear_core_edbgreq_rejects_an_impossible_core_index() -> None:
+    with pytest.raises(ValueError, match="not 0-3"):
+        gates.clear_core_edbgreq(Dap(FakeTransport(pipelined=False)), core=4)

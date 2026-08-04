@@ -37,7 +37,10 @@
 param(
     [string] $OutDir,
     [switch] $Yes,
-    [switch] $SkipStateChanging
+    [switch] $SkipStateChanging,
+    # Application ELF for the `load` (RAM-load) step. Omit to skip the step.
+    # Expected on this bench: C:\br1_rear_ecu\build\bin\br1_rear.elf
+    [string] $ElfPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -249,6 +252,27 @@ try {
     Invoke-Step -Name 'release' -Arguments @('release') `
         -ChangesTargetState `
         -Expect 'RESTARTS THE APPLICATION; SDASYSRSTC[SYSFUNCREQ] clears'
+
+    # -- Tier 2c2: the RAM-load flow ----------------------------------------
+    #
+    # After `release` (the board may boot; load resets it anyway) and before
+    # bscan (ordering rule 3: nothing that needs the DAP may follow the
+    # preamble). Resets the whole SoC, loads the ELF, parks rtu0.0 at its
+    # entry, full-verifies every word.
+    if ($ElfPath) {
+        Invoke-Step -Name 'load' -Arguments @('load', $ElfPath, '--verify') `
+            -ChangesTargetState `
+            -Expect 'SRAMC witnesses 0; all segments written + verified; rtu0.0 halted at entry' `
+            -Check {
+                param($p)
+                ($p.verify -eq 'full') -and
+                ($p.segments.Count -gt 0) -and
+                ($p.total_bytes -gt 0) -and
+                ((Hex $p.pc) -eq ((Hex $p.entry) -band (-bnot [uint64]1)))
+            }
+    } else {
+        Write-Host "  (load step skipped: pass -ElfPath <app.elf> to run it)" -ForegroundColor DarkGray
+    }
 
     # -- Tier 2d: the whole-tool artifact -----------------------------------
     Invoke-Step -Name 'report' -Arguments @('report') `

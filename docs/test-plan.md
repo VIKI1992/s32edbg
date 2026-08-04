@@ -202,10 +202,17 @@ layer that carries the safety policy. The exit-code contract:
 | exit | meaning | raised by |
 |---|---|---|
 | 0 | success | — |
-| 1 | usage error | `click.ClickException` — bad `--ap`, misaligned dump, missing `--bsr-length` |
-| 2 | tool error | any `S32EError` — no DAP, power-up refused, transport failure |
+| 1 | usage error | `click.ClickException` — bad `--ap`, misaligned dump, missing `--bsr-length`, malformed address/value/index (addresses require the `0x` prefix; bare numbers are rejected, never guessed) |
+| 2 | tool error | any `S32EError` — no DAP, power-up refused, transport failure. Also any *other* escaped exception: reported as `internal error`, never a traceback (`S32EDBG_TRACE=1` re-raises) |
 | 3 | **refused by safety policy** | `UnsafeOperation` |
 | 130 | aborted at a prompt | `click.Abort` |
+
+Inside a `debug` session none of these end the session: `ClickException`,
+`S32EError`, `UnsafeOperation` and even an escaped `Exception` are printed and
+the REPL continues (2026-08-04 fix: `bp set 32169874` — a bare number — used to
+raise an uncaught `ValueError` that unwound the REPL, killed the process, and
+cost a reconnect-with-reset-pulse, defect D-2; the all-digit variant was worse,
+silently arming a comparator at the decimal reading of a hex address).
 
 The refusals that must stay refused:
 
@@ -257,6 +264,7 @@ pytest -m hardware -v -x
 | 7 | block read across a 1 KB boundary | block == word-at-a-time reads | **The failure here is silent.** ADIv6 C2.6.4 only guarantees auto-increment inside a 1 KB window; without a TAR rewrite you get correct-looking values from the wrong addresses and no fault anywhere. |
 | 8 | `attach` | held, `SYSFUNCREQ` set | See §9 on virgin boards. |
 | 9 | `release` | `SYSFUNCREQ` clear, board runs | If the DAP is unreachable, a power cycle clears the hold unconditionally. |
+| 9b | `load <app.elf> --verify` (with `-ElfPath`) | SRAMC witnesses read 0; every segment written and full-verified; rtu0.0 halted with PC = entry | See "The `load` flow" section below for the phase order and what each abort means. Resets the whole SoC by design. |
 | 10 | `bscan preamble --run-svf` | "Download successful. SVF ok" | A parser complaint usually means the 208-bit operand; the SVF path exists because the raw path cannot carry it. |
 | 11 | `bscan sample --bsr-length 64` | two captures agree | Disagreement means the target is not quiescent, or the capture is not stable. |
 | 12 | `report` | every section present | A section reporting an error is acceptable and by design — see below. |
@@ -1236,3 +1244,146 @@ small illustration of why two independent paths to the same address are worth
 having.
 
 Consequence: the hardware test must assert `tables >= 12` and not `errors == 0`.
+
+---
+
+## The `load` (RAM-load) flow and the parse-safety pass — implemented 2026-08-04
+
+Two changes in one pass: every numeric argument is now parse-safe (addresses
+require `0x`; nothing the operator types can end a session or escape as a
+traceback — see §5), and a new `load` command writes an application ELF
+straight into RTU0 RAM and parks rtu0.0 halted at its entry.
+
+### Sources
+
+The user-designated reference is the S32 Debug VS Code plugin
+(`C:/veh_ctrl_tools/s32_debug_VScode_plugin`), gta-probe flow, replicated
+register for register — every value in `s32edbg/data/rtuboot.py` carries its
+citation. Two user-decided divergences: the RESET_B pin toggle is an SDA-AP
+functional reset by default (`--reset pin` restores the literal mechanism),
+and the flow ends halted at the entry instead of running to a startup catch.
+Core-1 policy (`--core1 leave` default) is grounded in the br1_rear firmware
+itself: `BrsHwEarlyInitPowerOn()` (`BSw/StartUpCode/src/BrsHw.c:159-212`,
+confirmed in the disassembly at 0x32100608) performs the complete rtu0.1
+bring-up — assert core-1 reset, boot address `0x4190036C = &brsStartupEntryHyp`,
+CCE+CCUPD+key, release — and asserts reset *first*, so any debugger pre-state
+is tolerated. One firmware caveat recorded for completeness: its MC_ME key
+handshake is coded as `CTL_KEY &= 0x5AF0` (a read-modify-write, confirmed in
+the disassembly), so if `CTL_KEY` reads 0 on this silicon the CCE commit rides
+on `Mcu_SetMode()`'s correct key writes later in EcuM driver-init — either
+way core1 comes up with no debugger involvement.
+
+### Phase order (the load-bearing constraints)
+
+P1 assert reset + latch MDM EDBGREQ (MDM-only traffic — the AXI-AP is
+forbidden during functional reset, guide §9 #3, and `gates.assert_axi_safe`
+enforces it) → P2 release + poll both reset views clear + ONE AXI preflight →
+P3 MC_ME/RGM partitions + NXP generic SRAM scrubs (verbatim, including their
+local 0x0-0xFFFF ranges) → P4 SRAMC D0/D1/D2 v2 ladder → P5 park rtu0.0 →
+P6 write LMAs → P7 verify → P8 PC/DSPSR.T → P9 core1 (optional).
+
+**P4 is the edge-trigger fix.** `RAMCR.INIT` is edge-triggered (root-caused
+on target 2026-07-03 in the reference repo): the P3 scrub leaves INIT=1, so
+without a `RAMCR=0` pre-write the re-init is a silent no-op with
+perfect-looking registers, DataRAM ECC stays uninitialised, and the OS dies
+in `Os_Hal_CoreFreeze` ~1 s after boot. The flow therefore *requires* the
+three witness words `0x3178E1A0 / 0x317C0010 / 0x31800010` to read exactly 0
+and aborts loudly otherwise. The synthetic target models the edge, and
+`tests/test_loader.py` proves both the no-op and the fix.
+
+**P5 before P6** because the park word at `0x79900000` is the same physical
+RAM as the ELF's first word at `0x32100000` (`r0_code0_6`, "same memory as
+R0-Code0-F"): the image may only overwrite the park loop once the core is
+already halted.
+
+### The WriteMem fast path — uncertainties u1-u4, recorded verbatim
+
+- **u1 signature.** `int WriteMem(U32 addr, U32 count, void*)` is conventional
+  but unverifiable on this machine (no SDK header); the return convention
+  (0 vs bytes-written) varies by DLL vintage. Only an unambiguous success
+  counts; anything else is a TransportError the fallback catches.
+- **u2 routing.** WriteMem writes through the DLL's own notion of the current
+  memory AP. Under this tool's raw connect (no identified core) that routing
+  is unknown. The mitigation is empirical: the **first fast block is fully
+  read back through the independent ADIv6 path**; later blocks are
+  sample-verified (first, last, every 256th word). Any mismatch demotes the
+  load to pure ADIv6 for the rest of the run, after rewriting the suspect
+  block there.
+- **u3 state clobbering.** WriteMem moves SELECT/CSW/TAR beneath the `Dap`
+  object; the wrapper invalidates both caches after every burst.
+- **u4 side effects on failure.** The DLL is known to pulse reset on its own
+  when confused; the fast path runs only after the flow's own reset, and a
+  demotion re-runs the AXI preflight before continuing.
+
+### Open bench items for `load`
+
+- **XRDC and the `0x76xxxxxx` slice.** Measured previously: XRDC can deny the
+  debugger this slice (SRAMC controllers, RTU GPR) while cores reach it
+  freely. The plugin's RDC-unlock ordering plausibly opens it and the tables
+  keep that order; every write is checked so a denial aborts with the
+  existing XRDC hint. If bench shows the denial, the recorded fallback
+  experiment is to compare against the plugin's probe on the same board state.
+- **gta `monitor reset debug`.** A closed-binary operation between the init
+  replay and the SRAMC ladder in the plugin's flow; unknowable from sources.
+  This flow performs the documented explicit actions only — first suspect if
+  bench shows a state mismatch after P3.
+- **M33s stay halted after load** (EDBGREQ latched in MDM CONTROL, exactly as
+  the plugin leaves them). The gta flow ran the application daily in this
+  state; if bench disagrees, clearing the M33 request bits post-load is the
+  knob.
+- Timing: record pure-path vs fast-path KB/s here after the bench run.
+
+### Finding 4 — DPBANKSEL cannot be trusted after the DLL's connect (fixed 2026-08-04)
+
+With a V13 J-Link (firmware "V13 compiled Jun 25 2026"), every DP CTRL/STAT
+access through the dll backend silently hit the wrong DP bank: reads returned
+`0x00000000`, writes were discarded, and power-up "never acknowledged" — on
+either DLL vintage (V9.62 and current), while the commander backend on the
+same install worked. Root cause: newer DLL `Connect()` sequences leave
+`SELECT.DPBANKSEL` on a non-zero bank, and `Dap` assumed bank 0 at
+construction, so the banked-access shortcut never re-selected. The V11 probe
+the 2026-08-02 bench used did not leave the bank dirty, which is why this
+never showed before. Fix: `Dap` now starts with the bank marked unknown
+(`_bank = -1`) and re-selects on the first banked DP access;
+`invalidate_select_cache()` restores the same distrust after any operation
+that lets the DLL move SELECT (the WriteMem fast path does this per burst).
+
+### Bench results 2026-08-04 — `load` validated on target (V13 probe, 16 MHz JTAG)
+
+`s32edbg --speed 16000 debug` → `gates apply` → `load br1_rear.elf`:
+
+- **3,677,786 bytes in 33.6 s (107 KB/s), fast path used for every segment**,
+  first block proven by full ADIv6 read-back, later blocks sample-verified,
+  entry word verified. Pure-ADIv6 fallback measured at ~4.1 KB/s (the 311 KB
+  FETK segment took 74 s on it in one run after a transient WriteMem
+  demotion) — the fast path is a ~26x difference. At the default 4 MHz the
+  fast path ran at ~71 KB/s; 16 MHz is the plugin's own configured speed.
+- End state exactly as designed: `rtu0.0 halted at the entry PC 0x32100020
+  DSPSR 0x400001FA` — the reference's documented parked-at-entry state
+  (CPSR 0x1FA: HYP, T32, AIF).
+- `bp set 32169874` mid-session → rejected with the 0x-prefix message, session
+  alive (the original session-killing defect, re-proven fixed on target).
+- `resume` → the loaded application boots.
+
+Three silicon findings folded into the flow during validation, each with an
+offline regression:
+
+- **Finding 5 — XRDC denies the RTU0 GPR but not the SRAMC controllers.** The
+  plugin's split-lock write at 0x76120000 faults from the J-Link (as
+  memaccess.py had recorded for reads). Tolerated as an `optional` action:
+  the register keeps its reset default, LOCKSTEP — the mode this ECU boots
+  with naturally (its firmware never writes CFG_CORE).
+- **Finding 6 — the DLL's WriteMem resumes the halted core.** EDPRSR.SDR set
+  after the first fast block on every run; a core parked on the plugin's
+  0x7990_0000 address (which aliases the image's first word) escaped into
+  the half-written image. Fixes: the park lives in DataRAM (0x317FFFF0,
+  ECC-initialised by the P4 ladder, outside every LMA), the EDBGREQ hold is
+  converted to a real acknowledged CTI halt (`halt()`) before the MDM latch
+  is dropped — an EDBGREQ-held core reads EDPRSR.HALTED without being
+  architecturally in Debug state, and clearing the latch resumed it — and
+  P8 re-halts before verify/PC if the DLL resumed the core mid-load.
+- **Finding 7 — a stale EDBGREQ latch breaks the application's own core-1
+  release.** rtu0.1 left reset when core0's firmware released it, then
+  halted instantly on the still-latched request; core0 would hang at the OS
+  boot barrier. All R52 latches are now dropped once the parked core is
+  pinned (the M33 bits in CONTROL stay, exactly as the plugin leaves them).

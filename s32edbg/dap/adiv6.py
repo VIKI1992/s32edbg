@@ -148,8 +148,17 @@ class Dap:
 
     def __init__(self, transport: Transport) -> None:
         self.t = transport
-        self._bank = 0
+        #: -1 = unknown: never trust the DP's DPBANKSEL at construction. The
+        #: J-Link DLL's own Connect() runs before this object exists and newer
+        #: DLL versions leave DPBANKSEL on a non-zero bank (measured with a
+        #: V13 probe, 2026-08-04: every CTRL/STAT access silently hit the
+        #: wrong bank -- reads 0x00000000, writes discarded -- so the DAP
+        #: "never powered up"). The first banked DP access re-selects.
+        self._bank = -1
         self._select_addr = 0
+        #: Whether _select_addr/_bank mirror the DP's real SELECT. False until
+        #: the first write, and after invalidate_select_cache().
+        self._select_valid = False
         self.ap_read_pipelined = transport.ap_read_pipelined
         self._csw_cache: dict[int, int] = {}
         self._cfg_cache: dict[int, MemApConfig] = {}
@@ -157,10 +166,34 @@ class Dap:
     # ---------------------------------------------------------------- DP ---
 
     def _write_select(self, addr: int, bank: int) -> None:
+        # Skip the DP write when SELECT already holds this value. CSW, TAR and
+        # DRW share one 16-byte SELECT granule by design (ADIv6 B2.2.11), so a
+        # block transfer would otherwise pay one redundant SELECT write -- a
+        # whole USB round trip on the DLL transport -- per data word. Only
+        # valid while nothing else moves SELECT beneath this object; anything
+        # that lets the DLL run its own transactions (a fast-path block write,
+        # a command string, a reconnect) must call invalidate_select_cache().
+        if (
+            self._select_valid
+            and self._select_addr == (addr & 0xFFFF_FFF0)
+            and self._bank == (bank & 0xF)
+        ):
+            return
         value = (addr & 0xFFFF_FFF0) | (bank & 0xF)
         self.t.dp_reg_write(DP_REG_SELECT, value)
         self._select_addr = addr & 0xFFFF_FFF0
         self._bank = bank & 0xF
+        self._select_valid = True
+
+    def invalidate_select_cache(self) -> None:
+        """Forget the mirrored SELECT value.
+
+        Call after any operation that may have moved SELECT outside this
+        object's view -- the WriteMem fast path, exec_command, a reconnect.
+        ``_bank`` is set to an impossible value so the banked-DP-read shortcut
+        in dp_read/dp_write cannot trust it either."""
+        self._select_valid = False
+        self._bank = -1
 
     def dp_read(self, addr: int, bank: int = BANK_DPIDR) -> int:
         """Read a DP register at ``addr`` (0x0/0x4/0x8/0xC) in ``bank``."""
@@ -467,6 +500,47 @@ class Dap:
                     continue
             i += chunk
         return out
+
+    def mem_write_block(
+        self, ap_base: int, addr: int, values: list[int], *, size: int = 32
+    ) -> None:
+        """Write consecutive ``size``-bit values using auto-increment.
+
+        The write-side mirror of mem_read_block: TAR is rewritten at every 1 KB
+        boundary (ADIv6 C2.6.4 only guarantees auto-increment inside one such
+        window), and an AP whose AddrInc is RO 0b00 is detected by reading TAR
+        back after the first multi-value chunk.
+
+        **Ordinary memory only, never FIFOs or W1C registers.** When AddrInc
+        turns out not to be implemented, every value of the affected chunk has
+        already been stored at the chunk's first address; the fallback then
+        re-issues the whole chunk one TAR write per value, so addresses can be
+        written more than once. Idempotent on RAM, wrong for anything with
+        side effects.
+        """
+        count = len(values)
+        stride = size // 8
+        autoinc_works = True
+        i = 0
+        while i < count:
+            here = addr + i * stride
+            window_left = TAR_AUTOINC_BOUNDARY - (here % TAR_AUTOINC_BOUNDARY)
+            chunk = min(count - i, max(1, window_left // stride))
+            if not autoinc_works:
+                chunk = 1
+            self._program_access(ap_base, here, size=size, autoinc=CSW_ADDRINC_SINGLE)
+            for j in range(chunk):
+                self.ap_write(
+                    ap_base, AP_DRW, _lane_place(values[i + j], here + j * stride, size)
+                )
+            if autoinc_works and chunk > 1:
+                advanced = self.ap_read(ap_base, AP_TAR_LO)
+                if advanced == (here & 0xFFFF_FFFF):
+                    # AddrInc is not implemented: everything in this chunk
+                    # landed at its first address. Re-issue it value by value.
+                    autoinc_works = False
+                    continue
+            i += chunk
 
     # Kept so existing callers (romtable's readers) keep working; they now
     # inherit CSW preservation for free.

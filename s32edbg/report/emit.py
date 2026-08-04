@@ -448,3 +448,33 @@ def print_m33_registers(name: str, values: dict, console: Console | None = None)
             cells += [names[i], f"0x{values[names[i]]:08X}"] if i < len(names) else ["", ""]
         table.add_row(*cells)
     console.print(table)
+
+
+def print_load_report(report, console: Console | None = None) -> None:
+    """The `load` command's closing table: what landed where, how, how fast."""
+    console = console or Console()
+    table = Table(title=f"loaded {report.image}")
+    table.add_column("LMA", style="bold")
+    table.add_column("Bytes", justify="right")
+    table.add_column("Path")
+    table.add_column("Verify")
+    table.add_column("Time", justify="right")
+    for seg in report.segments:
+        table.add_row(
+            f"0x{seg.paddr:08X}",
+            f"{seg.nbytes:,}",
+            seg.path,
+            seg.verified,
+            f"{seg.seconds:.2f}s",
+        )
+    console.print(table)
+    console.print(
+        f"total [bold]{report.total_bytes:,}[/bold] bytes in "
+        f"{report.seconds:.2f}s ({report.kb_per_s:,.0f} KB/s), "
+        f"fast path {report.fast_path}, verify {report.verify}"
+    )
+    console.print(
+        f"[green]rtu0.0 halted at the entry[/green]  "
+        f"PC 0x{report.pc:08X}  DSPSR 0x{report.dspsr:08X}"
+        + ("  [dim](T bit corrected)[/dim]" if report.dspsr_t_fixed else "")
+    )

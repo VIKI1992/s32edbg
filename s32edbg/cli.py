@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from contextlib import contextmanager
@@ -14,10 +15,12 @@ import click
 from rich.console import Console
 
 from . import __version__
+from . import elf as elf_mod
 from .dap import adiv6
 from .dap import apmap as apmap_mod
 from .dap import gates as gates_mod
 from .dap import iface as iface_mod
+from .dap import loader as loader_mod
 from .dap import memaccess
 from .dap import romtable
 from .dap import m33 as m33_mod
@@ -29,7 +32,7 @@ from .data.bscan import BSCAN_DEFAULT_IRLEN, BSCAN_PROBE_BITS
 from .data.expected_apmap import AP_ALIASES, AP_APB, AP_MDM, AP_SDA, APBIC1_ROM_BASE
 from .data.known_ids import decode_dpidr
 from .data.ladder1 import MDM_IDR_EXPECTED, SDA_SYSRSTC, SDA_SYSRSTC_SYSFUNCREQ
-from .errors import PowerUpError, S32EError, TransportError, UnsafeOperation
+from .errors import ElfError, PowerUpError, S32EError, TransportError, UnsafeOperation
 from .jtag import bscan as bscan_mod
 from .jtag import tap as tap_mod
 from .report import emit
@@ -250,7 +253,8 @@ def main(ctx: click.Context, transport_kind: str, serial: str | None, speed_khz:
     cores (core, m33, bp, wp -- halt, step, resume, breakpoints, watchpoints,
     reset-and-halt), and `debug`, a persistent session that holds one probe
     connection for a whole halt/step/resume workflow and restores the target
-    when it closes.
+    when it closes. `load` writes a build's ELF straight into RTU0 RAM and
+    parks rtu0.0 halted at its entry -- the fast build/debug loop.
 
     First command on a freshly power-cycled board: `gates apply` -- the debug
     clocks are off by default (RM 135.11) and the enables are lost on power
@@ -846,6 +850,50 @@ def _resolve_ap_or_fail(spec: str) -> int:
         raise click.ClickException(str(exc)) from exc
 
 
+def _parse_address(text: str, *, what: str = "address") -> int:
+    """Parse an ADDRESS argument: 0x-prefixed hex only.
+
+    A bare number is rejected rather than guessed at. `32169874` could be hex
+    or decimal, and both guesses have burned users: base-0 silently read it as
+    decimal and armed a comparator at the wrong address, while an unprefixed
+    hex string such as `321D2EE6` raised a ValueError that no handler caught
+    and took the whole debug session down with it (reconnecting pulses reset
+    into the SBC/PMIC -- test-plan defect D-2).
+    """
+    s = text.strip()
+    if s[:2].lower() == "0x":
+        try:
+            return int(s, 16)
+        except ValueError:
+            pass
+    raise click.ClickException(
+        f"{what} {text!r} must be 0x-prefixed hex, e.g. 0x321D2EE6. A bare "
+        "number is rejected rather than guessed at: 32169874 could be hex or "
+        "decimal."
+    )
+
+
+def _parse_value(text: str, *, what: str = "value") -> int:
+    """Parse a data VALUE argument: decimal, or 0x/0o/0b-prefixed (int base 0)."""
+    try:
+        return int(text.strip(), 0)
+    except ValueError:
+        raise click.ClickException(
+            f"{what} {text!r} is not a number. Use decimal (57005) or 0x-prefixed "
+            "hex (0xDEAD)."
+        ) from None
+
+
+def _parse_index(text: str, *, what: str = "comparator index") -> int:
+    """Parse a comparator-index argument: bare decimal."""
+    try:
+        return int(text.strip(), 10)
+    except ValueError:
+        raise click.ClickException(
+            f"{what} {text!r} is not a decimal index (0, 1, ...)."
+        ) from None
+
+
 @main.group()
 def mem() -> None:
     """Read and write memory through the debug access ports.
@@ -898,7 +946,7 @@ def mem_info(ctx: Ctx, ap_spec: str) -> None:
 def mem_read(ctx: Ctx, addr: str, ap_spec: str, size: str, count: int) -> None:
     """Read one or more values from a bus."""
     ap_base = _resolve_ap_or_fail(ap_spec)
-    start = int(addr, 0)
+    start = _parse_address(addr)
     width = int(size)
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
@@ -932,7 +980,7 @@ def mem_read(ctx: Ctx, addr: str, ap_spec: str, size: str, count: int) -> None:
 def mem_dump(ctx: Ctx, addr: str, nbytes: int, ap_spec: str) -> None:
     """Hex-dump a region of a bus."""
     ap_base = _resolve_ap_or_fail(ap_spec)
-    start = int(addr, 0)
+    start = _parse_address(addr)
     if start % 4 or nbytes % 4:
         raise click.ClickException("dump address and length must both be 4-byte aligned")
     with open_transport(ctx) as (_t, dap):
@@ -963,8 +1011,8 @@ def mem_dump(ctx: Ctx, addr: str, nbytes: int, ap_spec: str) -> None:
 def mem_write(ctx: Ctx, addr: str, value: str, ap_spec: str, size: str, yes: bool) -> None:
     """Write one value to a bus."""
     ap_base = _resolve_ap_or_fail(ap_spec)
-    target = int(addr, 0)
-    data = int(value, 0)
+    target = _parse_address(addr)
+    data = _parse_value(value)
     width = int(size)
     if not yes:
         click.confirm(
@@ -1546,6 +1594,7 @@ def core_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> N
         raise click.ClickException(
             f"{name!r} is not a supported register. Use r0-r14, pc (= dlr), or dspsr."
         )
+    data = _parse_value(value, what=f"value for {key}") if value is not None else None
 
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
@@ -1560,14 +1609,14 @@ def core_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> N
             )
         if is_gp:
             n = int(key[1:])
-            if value is not None:
-                runcontrol.write_reg(dap, c, n, int(value, 0))
+            if data is not None:
+                runcontrol.write_reg(dap, c, n, data)
             got = runcontrol.read_reg(dap, c, n)
             label = f"r{n}"
         else:
             reader, writer, label = special[key]
-            if value is not None:
-                writer(dap, c, int(value, 0))
+            if data is not None:
+                writer(dap, c, data)
             got = reader(dap, c)
         console.print(f"{c.name}  {label} = 0x{got:08X}")
         if ctx.json_out:
@@ -1765,26 +1814,35 @@ def m33_bp(ctx: Ctx, action: str, address: str | None, core_spec: str | None) ->
     These come from the Breakpoint Unit, not the R52's DBGBVR comparators -- four
     or eight of them, read from FP_CTRL rather than assumed.
     """
+    # Parse before the probe opens: a typo must cost nothing.
+    target: int | None = None
+    slot: int | None = None
+    if action == "set":
+        if address is None:
+            raise click.ClickException("`bp set` needs an address")
+        target = _parse_address(address)
+    elif action == "clear":
+        if address is None:
+            raise click.ClickException("`bp clear` needs a comparator index")
+        slot = _parse_index(address)
     with _one_m33(ctx, core_spec, write=action != "list") as (dap, c):
         if action == "list":
             entries = m33_mod.list_breakpoints(dap, c)
             emit.print_comparators(f"{c.name} breakpoints", entries, console)
         elif action == "set":
-            if address is None:
-                raise click.ClickException("`bp set` needs an address")
-            entry = m33_mod.set_breakpoint(dap, c, int(address, 0))
+            assert target is not None
+            entry = m33_mod.set_breakpoint(dap, c, target)
             if ctx.session is not None:
                 ctx.session.note_m33_bp(c.name, int(entry["index"]))
             console.print(
                 f"[green]breakpoint {entry['index']}[/green] at {entry['address']} on {c.name}"
             )
         else:
-            if address is None:
-                raise click.ClickException("`bp clear` needs a comparator index")
-            m33_mod.clear_breakpoint(dap, c, int(address, 0))
+            assert slot is not None
+            m33_mod.clear_breakpoint(dap, c, slot)
             if ctx.session is not None:
-                ctx.session.note_m33_bp_cleared(c.name, int(address, 0))
-            console.print(f"cleared breakpoint {address} on {c.name}")
+                ctx.session.note_m33_bp_cleared(c.name, slot)
+            console.print(f"cleared breakpoint {slot} on {c.name}")
 
 
 @m33.command("wp")
@@ -1814,6 +1872,17 @@ def m33_wp(
     §6.7. DWT watchpoints are asynchronous: the core halts *near* the access,
     not at it, and DFSR reports DWTTRAP.
     """
+    # Parse before the probe opens: a typo must cost nothing.
+    target: int | None = None
+    slot: int | None = None
+    if action == "set":
+        if address is None:
+            raise click.ClickException("`wp set` needs an address")
+        target = _parse_address(address)
+    elif action == "clear":
+        if address is None:
+            raise click.ClickException("`wp clear` needs a comparator index")
+        slot = _parse_index(address)
     with _one_m33(ctx, core_spec, write=action != "list") as (dap, c):
         if action == "list":
             entries = m33_mod.list_watchpoints(dap, c)
@@ -1821,11 +1890,10 @@ def m33_wp(
             if ctx.json_out:
                 _emit_json(ctx.json_out, {"core": c.name, "watchpoints": entries})
         elif action == "set":
-            if address is None:
-                raise click.ClickException("`wp set` needs an address")
+            assert target is not None
             try:
                 entry = m33_mod.set_watchpoint(
-                    dap, c, int(address, 0), size=int(size), on=access, index=index
+                    dap, c, target, size=int(size), on=access, index=index
                 )
             except ValueError as exc:
                 raise click.ClickException(str(exc)) from exc
@@ -1838,12 +1906,11 @@ def m33_wp(
             if ctx.json_out:
                 _emit_json(ctx.json_out, {"core": c.name, "watchpoint": entry})
         else:
-            if address is None:
-                raise click.ClickException("`wp clear` needs a comparator index")
-            m33_mod.clear_watchpoint(dap, c, int(address, 0))
+            assert slot is not None
+            m33_mod.clear_watchpoint(dap, c, slot)
             if ctx.session is not None:
-                ctx.session.note_m33_wp_cleared(c.name, int(address, 0))
-            console.print(f"cleared watchpoint {address} on {c.name}")
+                ctx.session.note_m33_wp_cleared(c.name, slot)
+            console.print(f"cleared watchpoint {slot} on {c.name}")
 
 
 @m33.command("reset-halt")
@@ -1889,29 +1956,35 @@ def m33_reset_halt(ctx: Ctx, core_spec: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-@contextmanager
-def _one_core(ctx: Ctx, core_spec: str | None, *, write: bool = True):
-    """Open a session, discover, select one core, preflight it.
+def _attach_core(ctx: Ctx, dap: Dap, c: runcontrol.Core, *, write: bool = True) -> None:
+    """Preflight one already-selected core, unlocking and sanitising for writes.
 
     Clears the OS lock when the command is going to write. Most cores come up
     locked after a power cycle, and while the lock is set every core-domain
     register access faults -- so without this a `bp set` on a freshly booted
     board failed with "a comparator write faulted", which describes the symptom
-    and not the cause. `core halt` already unlocked; this makes the comparator
-    commands behave the same way.
+    and not the cause. Shared between `_one_core` (every bp/wp command) and the
+    `load` flow, which reaches the same state through its own bring-up and must
+    not re-open the transport to get the unlock and §5.7 sanitation.
     """
+    for note in runcontrol.preflight(c, write=write):
+        console.print(f"[yellow]![/yellow] {c.name}: {note}")
+    if write and c.state.unreachable_reason:
+        for note in runcontrol.unlock(dap, c):
+            console.print(f"[dim]{c.name}:[/dim] {note}")
+        c.state = runcontrol.read_state(dap, c.debug_base)
+    if write:
+        _session_touch(ctx, dap, c)
+
+
+@contextmanager
+def _one_core(ctx: Ctx, core_spec: str | None, *, write: bool = True):
+    """Open a session, discover, select one core, preflight it via _attach_core."""
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
         cores = _discover_cores(ctx, dap)
         c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
-        for note in runcontrol.preflight(c, write=write):
-            console.print(f"[yellow]![/yellow] {c.name}: {note}")
-        if write and c.state.unreachable_reason:
-            for note in runcontrol.unlock(dap, c):
-                console.print(f"[dim]{c.name}:[/dim] {note}")
-            c.state = runcontrol.read_state(dap, c.debug_base)
-        if write:
-            _session_touch(ctx, dap, c)
+        _attach_core(ctx, dap, c, write=write)
         yield dap, c
 
 
@@ -1950,9 +2023,10 @@ def bp_set(ctx: Ctx, address: str, core_spec: str | None, index: int | None, arm
     is not part of the address and is stripped. Writing it into the comparator
     would give one that can never match.
     """
+    target = _parse_address(address)  # before the probe opens: a typo must cost nothing
     with _one_core(ctx, core_spec) as (dap, c):
         entry = runcontrol.set_breakpoint(
-            dap, c, int(address, 0), index=index, thumb=not arm_state
+            dap, c, target, index=index, thumb=not arm_state
         )
         if ctx.session is not None:
             ctx.session.note_bp(c.name, int(entry["index"]))
@@ -2015,10 +2089,11 @@ def wp_list(ctx: Ctx, core_spec: str | None) -> None:
 @click.pass_obj
 def wp_set(ctx: Ctx, address: str, core_spec: str | None, size: str, access: str, index: int | None) -> None:
     """Watch a data address for load, store or both."""
+    target = _parse_address(address)  # before the probe opens: a typo must cost nothing
     with _one_core(ctx, core_spec) as (dap, c):
         try:
             entry = runcontrol.set_watchpoint(
-                dap, c, int(address, 0), size=int(size), on=access, index=index
+                dap, c, target, size=int(size), on=access, index=index
             )
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2089,8 +2164,15 @@ def _print_session_help() -> None:
         "global options -- `bp set 0x321D2EE6`, `wp list`, `mem read 0x00410FF0`,\n"
         "`m33 halt --core smu`, `gates status`, ...\n"
         "\n"
+        "Addresses are 0x-prefixed hex (`bp set 0x321D2EE6`); a bare number\n"
+        "like `32169874` is rejected rather than guessed at.\n"
+        "\n"
         "Aliases for the focused core: halt, resume/continue, step, regs,\n"
         "reg, status, unlock, sample, reset-halt.\n"
+        "\n"
+        "`load <app.elf>` writes a build straight into RAM and parks rtu0.0\n"
+        "halted at its entry (resets the whole SoC first) -- the fast\n"
+        "build/debug loop. Then `bp set 0x...` and `continue`.\n"
         "\n"
         "Session builtins:\n"
         "  use <core>   focus a core (rtu0.0, rtu0.1, ... or smu/ce0/ce1)\n"
@@ -2194,6 +2276,12 @@ def _session_dispatch(ctx: Ctx, line: str) -> bool:
     except KeyboardInterrupt:
         console.print(
             "\n[yellow]interrupted[/yellow] -- the session is still open; `quit` leaves it"
+        )
+    except Exception as exc:  # defence in depth: no input may end the session
+        console.print(f"[red]internal error:[/red] {type(exc).__name__}: {exc}")
+        console.print(
+            "[dim]This is a bug in s32edbg, not target state -- the session is "
+            "still open. Please report it with the command that caused it.[/dim]"
         )
     return True
 
@@ -2312,6 +2400,139 @@ def debug_cmd(
 
 
 # ---------------------------------------------------------------------------
+# load -- write an ELF straight into RAM and park rtu0.0 at its entry
+# ---------------------------------------------------------------------------
+
+
+@main.command("load")
+@click.argument("elf_path")
+@click.option("--verify", "verify_full", is_flag=True,
+              help="Read every word back and compare (slow on the pure ADIv6 "
+                   "path -- roughly the write time again). Sampled verification "
+                   "always runs regardless.")
+@click.option("--no-fast", is_flag=True,
+              help="Never use the J-Link WriteMem fast path; pure ADIv6 word "
+                   "bursts only.")
+@click.option("--reset", "reset_via", type=click.Choice(["sda", "pin"]),
+              default="sda", show_default=True,
+              help="Reset mechanism: 'sda' = chip-internal SDA-AP functional "
+                   "reset (bench-validated, default); 'pin' = the probe's "
+                   "nRESET line, the reference plugin's literal mechanism -- "
+                   "on this board the pulse reaches the SBC/PMIC through R439.")
+@click.option("--core1", "core1_mode", type=click.Choice(["leave", "park", "release"]),
+              default="leave", show_default=True,
+              help="rtu0.1 handling. 'leave' (default): untouched -- br1_rear's "
+                   "core0 firmware does the whole core-1 bring-up itself "
+                   "(verified in BrsHw.c). 'park': bring it up halted at the "
+                   "entry. 'release': bring it up and let it free-run.")
+@click.pass_obj
+def load_cmd(
+    ctx: Ctx,
+    elf_path: str,
+    verify_full: bool,
+    no_fast: bool,
+    reset_via: str,
+    core1_mode: str,
+) -> None:
+    """Load an ELF into RTU0 RAM and leave rtu0.0 halted at its entry.
+
+    The fast build/debug loop: no flashing. Replicates the reference plugin's
+    debugger-does-everything flow -- system reset with debug requests latched,
+    MC_ME/RGM partition bring-up, SRAMC ECC init (with the edge-trigger fix
+    and witness verification), park rtu0.0, write every PT_LOAD segment at its
+    LMA, verify, set PC = entry. You set breakpoints and `resume` when ready.
+
+    This resets the WHOLE SoC: every core reboots and everything running
+    stops. Run it inside a `debug` session -- a one-shot invocation works, but
+    the next connect pulses reset into the SBC/PMIC (defect D-2) and undoes
+    the load.
+    """
+    # Parse and sanity-check before the probe opens: a bad path or a
+    # flash-linked image must cost nothing.
+    try:
+        image, blob = elf_mod.load(elf_path)
+        loader_mod.check_windows(image)
+    except S32EError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    console.print(
+        f"[yellow]![/yellow] `load` resets the whole SoC: every core reboots. "
+        f"Image: {image.name}, {image.total_filesz:,} bytes in "
+        f"{len(image.segments)} segments, entry 0x{image.entry_pc:08X}"
+        + (" (Thumb)" if image.entry_thumb else "")
+    )
+    if ctx.session is None:
+        console.print(
+            "[yellow]![/yellow] one-shot load: the NEXT s32edbg connect will "
+            "pulse reset into the SBC/PMIC (defect D-2) and reboot away what "
+            "was just loaded. Run `load` inside `s32edbg debug` instead."
+        )
+
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        for note in _prepare_dap(dap, ctx=ctx):
+            console.print(f"[dim]note:[/dim] {note}")
+        report = gates_mod.apply_ladder1(dap)
+        for w in report.warnings:
+            console.print(f"[yellow]![/yellow] {w}")
+
+        def note(text: str) -> None:
+            console.print(f"[dim]load:[/dim] {text}")
+
+        loader_mod.halt_m33s(dap, note)
+
+        if reset_via == "pin":
+            if not getattr(t, "can_pin_reset", False):
+                raise click.ClickException(
+                    "--reset pin needs the DLL's SetRESET/ClrRESET exports, "
+                    "which this transport does not provide"
+                )
+            driver: loader_mod.ResetDriver = loader_mod.PinReset(t)
+        else:
+            driver = loader_mod.SdaReset(dap)
+
+        session = ctx.session
+        hooks = loader_mod.LoadHooks(
+            note=note,
+            attach_core=lambda c: _attach_core(ctx, dap, c),
+            discover_cores=lambda: _discover_cores(ctx, dap),
+            on_system_reset=(
+                session.note_system_reset if session is not None else (lambda: None)
+            ),
+            note_halted=(
+                session.note_halted if session is not None else (lambda name: None)
+            ),
+        )
+        load_report = loader_mod.load_image(
+            dap,
+            t,
+            image,
+            blob,
+            hooks,
+            reset=driver,
+            verify_full=verify_full,
+            use_fast=not no_fast,
+            core1=core1_mode,
+        )
+
+        emit.print_load_report(load_report, console)
+        if session is not None:
+            session.focus = "rtu0.0"
+            console.print(
+                "[dim]focus: rtu0.0 -- set breakpoints, then `resume` (or "
+                "`continue`) when ready. Quitting the session resumes the "
+                "core unless --keep-on-exit.[/dim]"
+            )
+        else:
+            console.print(
+                "[dim]rtu0.0 stays halted at the entry after this process "
+                "exits; resume it from a debug session.[/dim]"
+            )
+        if ctx.json_out:
+            _emit_json(ctx.json_out, load_report.as_dict())
+
+
+# ---------------------------------------------------------------------------
 # apmap / romdump
 # ---------------------------------------------------------------------------
 
@@ -2360,6 +2581,8 @@ def apmap_cmd(ctx: Ctx, method: str) -> None:
 @click.pass_obj
 def romdump_cmd(ctx: Ctx, source: str, ap_base: str | None, rom_base: str | None, max_depth: int) -> None:
     """Walk and dump every reachable CoreSight ROM table."""
+    rom_override = _parse_address(rom_base, what="--rom") if rom_base else None
+    ap_override = _resolve_ap_or_fail(ap_base) if ap_base else None
     payload: dict[str, object] = {}
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
@@ -2373,7 +2596,7 @@ def romdump_cmd(ctx: Ctx, source: str, ap_base: str | None, rom_base: str | None
             )
 
         if source in ("both", "apspace"):
-            base = int(rom_base, 0) if rom_base else (dap.read_baseptr() or APBIC1_ROM_BASE) & 0xFFFFFFFF
+            base = rom_override if rom_override is not None else (dap.read_baseptr() or APBIC1_ROM_BASE) & 0xFFFFFFFF
             console.rule(f"AP-space ROM table at 0x{base:08X}")
             root = romtable.walk(dap.apspace_reader(), base, max_depth=max_depth)
             emit.print_rom_tree(root, console)
@@ -2381,7 +2604,7 @@ def romdump_cmd(ctx: Ctx, source: str, ap_base: str | None, rom_base: str | None
             payload["apspace"] = emit.node_to_dict(root)
 
         if source in ("both", "apb"):
-            mem_ap = int(ap_base, 0) if ap_base else AP_APB
+            mem_ap = ap_override if ap_override is not None else AP_APB
             rom, present = dap.read_ap_base(mem_ap)
             if not present or rom is None:
                 console.rule(f"MEM-AP 0x{mem_ap:08X}")
@@ -2440,10 +2663,11 @@ def tap_info(ctx: Ctx) -> None:
 @click.pass_obj
 def tap_ir(ctx: Ctx, value: str, bits: int | None) -> None:
     """Shift a value into the instruction register."""
+    v = _parse_value(value, what="IR value")
     with open_transport(ctx, tif=Tif.JTAG, connect_dap=False, needs_raw_jtag=True) as (t, _):
         width = bits or ctx.irlen or tap_mod.measure_ir_length(t)  # type: ignore[arg-type]
-        tdo = t.ir_shift(int(value, 0), width)  # type: ignore[union-attr]
-        console.print(f"IR {width} bits <- 0x{int(value, 0):X}, TDO 0x{tdo:X}")
+        tdo = t.ir_shift(v, width)  # type: ignore[union-attr]
+        console.print(f"IR {width} bits <- 0x{v:X}, TDO 0x{tdo:X}")
 
 
 @tap.command("dr")
@@ -2452,9 +2676,10 @@ def tap_ir(ctx: Ctx, value: str, bits: int | None) -> None:
 @click.pass_obj
 def tap_dr(ctx: Ctx, value: str, bits: int) -> None:
     """Shift a value through the data register (instruction must already be loaded)."""
+    v = _parse_value(value, what="DR value")
     with open_transport(ctx, tif=Tif.JTAG, connect_dap=False, needs_raw_jtag=True) as (t, _):
-        tdo = t.dr_shift(int(value, 0), bits)  # type: ignore[union-attr]
-        console.print(f"DR {bits} bits <- 0x{int(value, 0):X}, TDO 0x{tdo:X}")
+        tdo = t.dr_shift(v, bits)  # type: ignore[union-attr]
+        console.print(f"DR {bits} bits <- 0x{v:X}, TDO 0x{tdo:X}")
 
 
 # ---------------------------------------------------------------------------
@@ -2716,6 +2941,14 @@ def entry() -> int:
         # restore). The context managers above have already closed the probe.
         err_console.print("[yellow]aborted[/yellow]")
         return 130
+    except Exception as exc:
+        # An escaped exception is a tool bug. The exit-code contract
+        # (test-plan §5) has no traceback bucket, so it degrades to a tool
+        # error. S32EDBG_TRACE=1 re-raises for debugging.
+        err_console.print(f"[red]internal error:[/red] {type(exc).__name__}: {exc}")
+        if os.environ.get("S32EDBG_TRACE"):
+            raise
+        return 2
     return 0
 
 

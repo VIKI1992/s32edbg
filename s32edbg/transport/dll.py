@@ -238,6 +238,38 @@ class DllTransport(Transport):
         except TransportError:
             self._jtag_get_device_id = None  # type: ignore[assignment]
 
+        # WriteMem: the `load` fast path. `int WriteMem(U32 addr, U32 count,
+        # const void* data)` is the conventional signature but nothing on this
+        # machine can verify it, and the return convention (0 vs bytes-written)
+        # varies by DLL vintage -- so the loader treats anything other than
+        # unambiguous success as a failure, verifies the first block by full
+        # independent ADIv6 read-back, and demotes itself to the pure word path
+        # on any doubt. It also routes through the DLL's *own* notion of the
+        # current memory AP, moving SELECT/CSW/TAR beneath the Dap object: the
+        # caller must invalidate those caches after every burst.
+        try:
+            self._write_mem = self._fn("JLINK_WriteMem", "JLINKARM_WriteMem")
+            self._write_mem.restype = c_int
+            self._write_mem.argtypes = [c_uint32, c_uint32, c_void_p]
+        except TransportError:
+            self._write_mem = None  # type: ignore[assignment]
+
+        # nRESET pin control for the `load --reset pin` variant. void(void),
+        # so the ABI risk is as small as a hand binding gets. Board note: on
+        # this board nRESET ties to SBC-PMIC_RSTb through R439 (defect D-2), so
+        # a pin pulse reaches the power-management chips -- which is why the
+        # SDA-AP functional reset is the default and this is the fallback.
+        try:
+            self._set_reset = self._fn("JLINK_SetRESET", "JLINKARM_SetRESET")
+            self._set_reset.restype = None
+            self._set_reset.argtypes = []
+            self._clr_reset = self._fn("JLINK_ClrRESET", "JLINKARM_ClrRESET")
+            self._clr_reset.restype = None
+            self._clr_reset.argtypes = []
+        except TransportError:
+            self._set_reset = None  # type: ignore[assignment]
+            self._clr_reset = None  # type: ignore[assignment]
+
     # ------------------------------------------------------- bring-up -----
 
     def set_jtag_config(self, ir_pre: int = -1, dr_pre: int = -1) -> None:
@@ -410,6 +442,69 @@ class DllTransport(Transport):
         rc = self._write_apdp(c_uint8(index), c_uint8(AP_NOT_DP_AP), c_uint32(value & 0xFFFFFFFF))
         if rc < 0:
             raise DapError(f"CORESIGHT_WriteAPDPReg(AP,{index}) failed with {rc}")
+
+    # ------------------------------------------------- bulk memory / reset --
+
+    def configure_axi_memory_ap(self) -> str:
+        """Register the AXI-AP with the DLL and select it for memory access.
+
+        Guide §7.2: `JLINK_CORESIGHT_AddAP()` is deprecated for SoC-600; the
+        documented replacement is the command string, and
+        `CORESIGHT_SetIndexAHBAPToUse` "specifies which AP index to use for
+        memory access (ADIv6/SoC-600 support)". SEGGER documents these for
+        ConfigTargetSettings() -- issuing them mid-session is not documented
+        either way, which is why the WriteMem fast path proves the routing
+        with a full independent read-back of its first block rather than
+        trusting this call. Returns whatever the DLL printed, for the note.
+        """
+        out1 = self.exec_command("CORESIGHT_AddAP = Index=0 Type=AXI-AP Addr=0x01C20000")
+        out2 = self.exec_command("CORESIGHT_SetIndexAHBAPToUse = 0")
+        return (out1 + " " + out2).strip()
+
+    @property
+    def can_block_write(self) -> bool:  # type: ignore[override]
+        return self._lib is not None and self._write_mem is not None
+
+    def write_mem_block(self, addr: int, data: bytes) -> None:
+        """Push a byte block through the DLL's own memory machinery.
+
+        See the binding comment in _bind(): the signature is conventional but
+        unverified, so only `rc == 0` (older convention: success) or
+        `rc == len(data)` (newer: bytes written) counts as success -- anything
+        else, including a wrong-looking positive, is a TransportError the
+        caller's fallback catches. The DLL moves SELECT/CSW/TAR beneath the
+        Dap object here; callers must invalidate those caches afterwards.
+        """
+        if self._write_mem is None:
+            raise UnsupportedOperation(
+                "this J-Link DLL does not export JLINK_WriteMem"
+            )
+        buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+        rc = int(self._write_mem(c_uint32(addr), c_uint32(len(data)), ctypes.cast(buf, c_void_p)))
+        if rc not in (0, len(data)):
+            raise TransportError(
+                f"JLINK_WriteMem(0x{addr:08X}, {len(data)}) returned {rc} -- "
+                "not an unambiguous success under either return convention"
+            )
+
+    @property
+    def can_pin_reset(self) -> bool:  # type: ignore[override]
+        return (
+            self._lib is not None
+            and self._set_reset is not None
+            and self._clr_reset is not None
+        )
+
+    def set_reset_pin(self, asserted: bool) -> None:
+        if self._set_reset is None or self._clr_reset is None:
+            raise UnsupportedOperation(
+                "this J-Link DLL does not export SetRESET/ClrRESET"
+            )
+        # SEGGER naming: ClrRESET pulls the (active-low) line LOW = asserted.
+        if asserted:
+            self._clr_reset()
+        else:
+            self._set_reset()
 
 
 def _decode_hw_version(raw: int) -> str | None:

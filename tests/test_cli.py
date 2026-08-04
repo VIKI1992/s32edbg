@@ -558,3 +558,96 @@ def test_an_empty_device_is_refused_before_the_probe_is_touched(run, target) -> 
     code, out = run("--device", "", "core", "list")
     assert code == EXIT_REFUSED
     assert "power-cycled" in out
+
+
+# ---------------------------------------------------------------------------
+# Parse safety: bad input costs nothing and kills nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bp", "set", "32169874"],           # the reported killer: hex meant, no 0x
+        ["bp", "set", "321D2EE6"],           # hex letters, no 0x: was an uncaught ValueError
+        ["bp", "set", "zzz"],
+        ["wp", "set", "999"],
+        ["m33", "bp", "set", "999"],
+        ["m33", "wp", "set", "999"],
+        ["mem", "read", "123"],
+        ["mem", "dump", "123", "16"],
+        ["mem", "write", "123", "0x1", "--yes"],
+        ["romdump", "--rom", "123"],
+    ],
+    ids=lambda a: " ".join(a),
+)
+def test_a_bare_or_garbage_address_is_rejected_before_the_probe_opens(run, argv) -> None:
+    """Addresses require the 0x prefix. `32169874` could be hex or decimal:
+    base-0 silently armed a comparator at the decimal reading of a hex address,
+    and an unprefixed hex string raised a ValueError that no handler caught and
+    took the whole session down. No transport is patched here, so reaching one
+    would fail on discovery instead of exiting 1."""
+    code, out = run(*argv)
+    assert code == EXIT_USAGE
+    assert "0x-prefixed" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["mem", "write", "0x1000", "banana", "--yes"],
+        ["core", "reg", "r3", "banana"],
+        ["tap", "ir", "zz"],
+        ["tap", "dr", "zz", "8"],
+    ],
+    ids=lambda a: " ".join(a),
+)
+def test_a_garbage_value_is_rejected_before_the_probe_opens(run, argv) -> None:
+    """Data values keep int(x, 0) semantics -- decimal or 0x hex -- but a
+    non-number must exit 1 with a message, not escape as a ValueError."""
+    code, out = run(*argv)
+    assert code == EXIT_USAGE
+    assert "is not a number" in out
+
+
+def test_an_uppercase_0x_prefix_is_accepted(run, target, tmp_path) -> None:
+    out_file = tmp_path / "read.json"
+    code, _out = run("--json", str(out_file), "mem", "read", "0X00410FF0", "--ap", "apb")
+    assert code == EXIT_OK
+    assert read_json(out_file)["address"] == "0x00410FF0"
+
+
+def test_a_decimal_value_is_still_legal_for_mem_write(run, target) -> None:
+    """The 0x rule is for addresses. `mem write <addr> 57005` writes decimal
+    57005 exactly as it always has."""
+    code, out = run("mem", "write", "0x00410FF0", "57005", "--ap", "apb", "--yes")
+    assert code == EXIT_OK
+    assert "0x0000DEAD" in out
+
+
+def test_m33_bp_clear_still_takes_a_bare_decimal_index(run, target) -> None:
+    """`m33 bp clear 2` is a comparator index, not an address: bare decimal
+    stays legal there."""
+    code, out = run("m33", "bp", "clear", "2", "--core", "smu")
+    assert code == EXIT_OK
+    assert "cleared breakpoint 2" in out
+
+
+def test_m33_bp_clear_rejects_a_non_decimal_index(run) -> None:
+    code, out = run("m33", "bp", "clear", "x2")
+    assert code == EXIT_USAGE
+    assert "decimal index" in out
+
+
+def test_an_escaped_exception_is_an_internal_error_with_exit_2(run, target, monkeypatch) -> None:
+    """The exit-code contract has no traceback bucket. Anything that escapes a
+    command is a tool bug: reported as `internal error`, exit 2, no traceback."""
+    def boom(dap):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli.gates_mod, "status", boom)
+    code, out = run("gates", "status")
+    assert code == EXIT_TOOL_ERROR
+    assert "internal error" in out
+    assert "RuntimeError" in out
+    assert "Traceback" not in out

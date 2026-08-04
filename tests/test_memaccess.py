@@ -270,3 +270,84 @@ def test_a_raw_base_address_is_accepted_as_well_as_a_name() -> None:
 def test_an_unknown_ap_name_is_rejected_and_lists_the_valid_ones() -> None:
     with pytest.raises(ValueError, match="ahb-smu"):
         memaccess.resolve_ap("nonsense")
+
+
+def test_a_bare_number_is_rejected_as_an_ap_base() -> None:
+    """An AP base is an address: the 0x prefix is required, same rule as every
+    other address argument. 29491200 is 0x01C20000 in decimal -- accepting it
+    would bless exactly the hex/decimal guessing the rule exists to stop."""
+    with pytest.raises(ValueError, match="0x-prefixed"):
+        memaccess.resolve_ap("29491200")
+
+
+# ---------------------------------------------------------------------------
+# The write side of auto-increment -- mem_write_block / write_words
+# ---------------------------------------------------------------------------
+
+
+def test_a_block_write_inside_one_window_lands_consecutive_words() -> None:
+    t = MemApFake()
+    Dap(t).mem_write_block(AP_APB, 0x2000, [0xA000 + i for i in range(8)], size=32)
+    assert [t.mem[0x2000 + i * 4] for i in range(8)] == [0xA000 + i for i in range(8)]
+
+
+def test_a_block_write_straddling_a_1kb_boundary_lands_the_right_addresses() -> None:
+    """The write-side twin of the wrap test: an AP may wrap TAR inside its 1 KB
+    window, so a writer that does not rewrite TAR at the boundary stores the
+    tail of the block over the *start* of the window -- clobbering memory it was
+    never asked to touch, silently."""
+    t = MemApFake()
+    start = TAR_AUTOINC_BOUNDARY - 8  # two words below the boundary
+    t.mem[0x0000] = 0x5AFE
+    t.mem[0x0004] = 0x5AFE
+
+    Dap(t).mem_write_block(AP_APB, start, [0xB000 + i for i in range(4)], size=32)
+
+    assert [t.mem[start + i * 4] for i in range(4)] == [0xB000 + i for i in range(4)]
+    assert t.mem[0x0000] == 0x5AFE, "a wrapped write clobbered the window start"
+    assert t.mem[0x0004] == 0x5AFE
+
+
+def test_a_block_write_uses_the_auto_increment_csw_setting() -> None:
+    t = MemApFake()
+    Dap(t).mem_write_block(AP_APB, 0, [1, 2, 3, 4], size=32)
+    assert written(t, AP_APB, AP_CSW) & (0b11 << 4) == CSW_ADDRINC_SINGLE
+
+
+def test_a_block_write_falls_back_to_explicit_tar_when_autoinc_is_unsupported() -> None:
+    """With AddrInc RO 0b00 every word of the first chunk lands at its first
+    address (last one wins). The fallback must notice via the TAR read-back and
+    re-issue the chunk one TAR write per word, leaving the memory correct."""
+    t = MemApFake(autoinc_supported=False)
+    Dap(t).mem_write_block(AP_APB, 0x3000, [0xC000 + i for i in range(4)], size=32)
+    assert [t.mem[0x3000 + i * 4] for i in range(4)] == [0xC000 + i for i in range(4)]
+
+
+def test_a_block_write_reuses_select_instead_of_rewriting_it_per_word() -> None:
+    """CSW/TAR/DRW share one 16-byte SELECT granule by design, so a burst needs
+    one SELECT write, not one per word. On the DLL transport every SELECT write
+    is a USB round trip; for a 3.6 MiB image the difference is minutes."""
+    t = MemApFake()
+    dap = Dap(t)
+    dap.mem_write_block(AP_APB, 0x2000, [0] * 64, size=32)
+    select_writes = [e for e in t.log if e[0] == "dp_write" and e[1] == 2]
+    assert len(select_writes) <= 4, f"{len(select_writes)} SELECT writes for 64 words"
+
+
+def test_write_words_raises_when_any_word_in_the_block_faults() -> None:
+    """STICKYERR is latching: one check at the end covers the whole block."""
+    t = MemApFake()
+    t.faulting.add(0x2008)
+    with pytest.raises(Exception, match="faulted"):
+        memaccess.write_words(Dap(t), AP_APB, 0x2000, [1, 2, 3, 4], size=32)
+
+
+def test_write_words_with_an_empty_block_touches_nothing() -> None:
+    t = MemApFake()
+    memaccess.write_words(Dap(t), AP_APB, 0x2000, [], size=32)
+    assert t.mem == {}
+
+
+def test_write_words_still_refuses_the_sda_ap() -> None:
+    with pytest.raises(UnsafeOperation, match="SDA-AP"):
+        memaccess.write_words(Dap(MemApFake()), AP_SDA, 0x0, [1], size=32)
