@@ -410,6 +410,29 @@ class SegmentWriter:
                     note(f"could not register the AXI-AP with the DLL ({exc})")
                 self.dap.invalidate_select_cache()
                 self.dap.invalidate_csw_cache()
+            self._sync_dll_halt_state(reason="arming the fast path")
+
+    def _sync_dll_halt_state(self, *, reason: str) -> None:
+        """Move the DLL's internal target model to "halted" (which is true).
+
+        SEGGER's own doc (the kb page the DLL logs): on Cortex-R, WriteMem
+        wraps every call in stop-mode halt+access+go because the DLL believes
+        the target runs. That wrapper is the resume-behind-our-back side
+        effect AND the back-to-back-load wedge -- its open-loop state model
+        eventually diverges and every WriteMem fast-fails -1 in microseconds
+        with no wire traffic. Its own Halt() -- a wire no-op on our already
+        CTI-halted core -- resynchronises the model.
+        """
+        sync = getattr(self.transport, "cpu_halt_sync", None)
+        if sync is None:
+            return
+        verdict = sync()
+        self.dap.invalidate_select_cache()
+        self.dap.invalidate_csw_cache(AP_AXI)
+        self.note(
+            f"synced the DLL's target model ({reason}): DLL Halt issued"
+            + ("" if verdict is None else f", IsHalted={int(verdict)}")
+        )
 
     def write_block(self, addr: int, words: list[int]) -> str:
         """Write one block; returns the path that actually landed it.
@@ -448,7 +471,13 @@ class SegmentWriter:
         last: TransportError | None = None
         for attempt in range(FAST_ATTEMPTS):
             if attempt:
-                time.sleep(FAST_RETRY_PAUSE_S)  # let a contention window pass
+                # Let a contention window pass. Deliberately no DLL-state
+                # resync here: measured (Finding 9), once the DLL session's
+                # WriteMem budget is exhausted neither retries nor its own
+                # Halt() revive it -- only the fresh-connection-per-load the
+                # CLI performs. The retry earns its keep against the FETK
+                # bus-contention transients only.
+                time.sleep(FAST_RETRY_PAUSE_S)
             try:
                 self._write_fast(addr, words)
                 return

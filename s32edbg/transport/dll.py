@@ -254,6 +254,29 @@ class DllTransport(Transport):
         except TransportError:
             self._write_mem = None  # type: ignore[assignment]
 
+        # Halt/IsHalted: the fast path's state-sync with the DLL. SEGGER's kb
+        # (Memory_accesses, the URL the DLL itself logs) documents that on
+        # Cortex-R every WriteMem runs stop-mode -- halt + access + go --
+        # because the DLL believes the target is running; it never saw this
+        # tool's CTI halt (its connect-time core identification fails behind
+        # the closed gate). That open-loop wrapper is both the measured
+        # resume-behind-our-back side effect and the back-to-back-load wedge
+        # (its state model eventually diverges and WriteMem fast-fails -1 in
+        # microseconds with no wire traffic). Telling the DLL to halt -- a
+        # wire no-op on an already-halted core -- puts its model in "halted
+        # by me", after which WriteMem does plain access with no wrapper.
+        # void(void)-class bindings, same minimal ABI risk as SetRESET.
+        try:
+            self._halt = self._fn("JLINK_Halt", "JLINKARM_Halt")
+            self._halt.restype = c_int
+            self._halt.argtypes = []
+            self._is_halted = self._fn("JLINK_IsHalted", "JLINKARM_IsHalted")
+            self._is_halted.restype = c_int
+            self._is_halted.argtypes = []
+        except TransportError:
+            self._halt = None  # type: ignore[assignment]
+            self._is_halted = None  # type: ignore[assignment]
+
         # nRESET pin control for the `load --reset pin` variant. void(void),
         # so the ABI risk is as small as a hand binding gets. Board note: on
         # this board nRESET ties to SBC-PMIC_RSTb through R439 (defect D-2), so
@@ -486,6 +509,30 @@ class DllTransport(Transport):
                 f"JLINK_WriteMem(0x{addr:08X}, {len(data)}) returned {rc} -- "
                 "not an unambiguous success under either return convention"
             )
+
+    @property
+    def can_cpu_halt(self) -> bool:
+        return self._lib is not None and self._halt is not None
+
+    def cpu_halt_sync(self) -> bool | None:
+        """Ask the DLL to halt 'its' CPU, syncing its state model with reality.
+
+        On a core this tool has already CTI-halted this is a wire-level no-op
+        with one purpose: moving the DLL's internal target state to "halted",
+        so WriteMem stops wrapping every call in its stop-mode halt/go dance
+        (see the binding comment). Returns IsHalted's verdict when available,
+        None when the exports are absent. Never raises: the fast path's
+        read-back probe is the real gate.
+        """
+        if self._halt is None:
+            return None
+        try:
+            self._halt()
+            if self._is_halted is not None:
+                return bool(self._is_halted())
+        except Exception:
+            return None
+        return None
 
     @property
     def can_pin_reset(self) -> bool:  # type: ignore[override]

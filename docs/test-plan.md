@@ -1407,3 +1407,37 @@ it was designed for: a data mismatch (the DLL claimed success and the
 read-back disagrees) or a missing export. The old one-strike/three-strike
 policies turned three clustered transients into 85 s of word-writing for the
 rest of a segment.
+
+### Finding 9 — the DLL's WriteMem has a per-connection budget of ~4 MB (fixed 2026-08-04)
+
+Back-to-back `load`s in one session: the first is clean, then WriteMem starts
+returning -1 **in ~14 microseconds with zero wire traffic** (the DLL's own
+--log shows successes route into its internal `CPU_WriteMem`; failures log
+nothing at all). Onset is not address- or call-pattern-dependent: across five
+occurrences it always began once cumulative WriteMem traffic in one DLL
+connection reached roughly 3.4-5 MB (including once *within* a first load, at
+4 MHz). Neither per-block retries, nor pauses, nor the DLL's own `Halt()`
+revive it -- only a fresh DLL connection does. Root cause is inside the
+closed DLL (a per-connection resource that WriteMem exhausts); the
+observable contract is the budget.
+
+Fix: every in-session `load` reopens the DLL connection at P0 (close, open,
+TIF/speed/JTAGConf/Device/Connect, re-prepare + recalibrate). The reopen's
+connect pulse lands moments before the load's own commanded SoC reset, so it
+disturbs nothing of value, and each load starts with a full budget --
+3.6 MiB fits with margin at 16 MHz. Validated: three consecutive loads,
+32.16/32.16/32.14 s, fast path used throughout, app boots on both cores after
+`resume`.
+
+Two related updates riding along:
+
+- **Finding 6 addendum:** SEGGER's kb (Memory_accesses -- the URL the DLL
+  itself logs) documents that on Cortex-R WriteMem always runs stop-mode
+  (halt + access + go) when the DLL believes the target is running. Issuing
+  the DLL's own `Halt()` when the fast path arms (a wire no-op on the
+  already-CTI-halted core) moves its model to "halted by me": the wrapper --
+  and with it the resume-behind-our-back side effect -- disappears, loads
+  run ~1.5 s faster, and the P8 re-halt is now a dormant safety net.
+- The retry-time `Halt()` resync tried first was measured ineffective
+  against the budget wedge and removed; the block retry with a 25 ms pause
+  stays, for the Finding 8 contention transients only.

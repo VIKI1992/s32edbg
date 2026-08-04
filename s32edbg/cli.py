@@ -2470,14 +2470,35 @@ def load_cmd(
 
     with open_transport(ctx) as (t, dap):
         assert dap is not None
-        for note in _prepare_dap(dap, ctx=ctx):
-            console.print(f"[dim]note:[/dim] {note}")
-        report = gates_mod.apply_ladder1(dap)
-        for w in report.warnings:
-            console.print(f"[yellow]![/yellow] {w}")
 
         def note(text: str) -> None:
             console.print(f"[dim]load:[/dim] {text}")
+
+        session = ctx.session
+        if session is not None:
+            # Finding 9: the J-Link DLL's WriteMem wedges after roughly
+            # 3.5-5 MB of traffic in one DLL session -- every later call
+            # returns -1 in microseconds with no wire traffic, and neither
+            # retries nor the DLL's own Halt() cure it. Only a fresh DLL
+            # session does. A load is the one safe moment to pay for one:
+            # the reopen's connect pulse lands moments before this flow's
+            # own commanded SoC reset, so nothing of value is disturbed.
+            note("fresh probe connection for this load (Finding 9: the DLL's "
+                 "WriteMem wedges after ~4 MB per connection)")
+            t.close()
+            t.open()
+            t.select_interface(Tif.JTAG)
+            t.set_speed_khz(ctx.speed_khz)
+            _bring_up_link(t, ctx, Tif.JTAG)
+            dap.invalidate_select_cache()
+            dap.invalidate_csw_cache()
+            session.prepared = False
+
+        for prep_note in _prepare_dap(dap, ctx=ctx):
+            console.print(f"[dim]note:[/dim] {prep_note}")
+        report = gates_mod.apply_ladder1(dap)
+        for w in report.warnings:
+            console.print(f"[yellow]![/yellow] {w}")
 
         loader_mod.halt_m33s(dap, note)
 

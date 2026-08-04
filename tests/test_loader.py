@@ -501,3 +501,27 @@ def test_writemem_failing_every_block_never_costs_correctness() -> None:
     assert all(s.path == "adiv6" for s in report.segments)
     assert device.mem[0x3210_0020] == 0xEA00_0021
     assert device.mem[0x3178_0000] == 0x4433_2211
+
+
+class SyncableFastTarget(FastTarget):
+    """Tracks the DLL-model sync calls the fast path issues."""
+
+    can_cpu_halt = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.halt_syncs = 0
+
+    def cpu_halt_sync(self) -> bool | None:
+        self.halt_syncs += 1
+        return True
+
+
+def test_the_dll_model_is_synced_when_the_fast_path_arms() -> None:
+    """The arm-time Halt() sync is what removed the resume-behind-our-back
+    side effect on target (the DLL stops wrapping WriteMem in stop-mode
+    halt/go once its model says "halted by me")."""
+    _dap, device, report, notes = run_full_load(SyncableFastTarget())
+    assert device.halt_syncs >= 1
+    assert any("synced the DLL's target model (arming" in n for n in notes)
+    assert report.fast_path == "used"

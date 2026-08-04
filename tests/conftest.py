@@ -856,6 +856,10 @@ class SyntheticTarget(MemApFake):
 
     # -- transport surface the CLI reaches for with getattr -----------------
 
+    def open(self) -> None:
+        self.open_calls = getattr(self, "open_calls", 0) + 1
+        self.closed = False
+
     def close(self) -> None:
         self.closed = True
 

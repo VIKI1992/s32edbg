@@ -1164,6 +1164,11 @@ debugger pre-state is tolerated). `park`/`release` are the plugin-faithful fallb
 *next* connect pulses reset into the SBC/PMIC (D-2) and reboots away what was loaded. Inside a
 session, quitting resumes the parked core (the normal restore contract) unless `--keep-on-exit`.
 
+**Back-to-back loads are first-class.** Each in-session `load` reopens the probe connection
+first — the J-Link DLL's WriteMem has a ~4 MB budget per connection (test-plan Finding 9), and a
+fresh one per load keeps every load at full speed. The reopen's connect pulse lands moments
+before the load's own SoC reset, so it costs a couple of seconds and disturbs nothing.
+
 **This resets the whole SoC.** Everything running stops; every core reboots. The image must be
 linked for the RTU0 RAM windows (DataRAM `0x3178_0000`+, extended `0x3180_0000`+, CodeRAM
 `0x3210_0000`+); an ELF whose LMAs fall outside — a flash-linked image — is refused before a

@@ -361,3 +361,20 @@ def test_a_one_shot_load_warns_about_the_reconnect_reset(run, opened, tmp_path) 
     assert code == EXIT_OK
     assert "one-shot load" in out
     assert "D-2" in out
+
+
+def test_each_in_session_load_gets_a_fresh_probe_connection(run, opened, tmp_path) -> None:
+    """Finding 9: the J-Link DLL's WriteMem wedges after ~4 MB of traffic per
+    DLL connection -- instant -1s that neither retries nor the DLL's own
+    Halt() cure. Every in-session load therefore reopens the DLL connection
+    (its connect pulse lands moments before the load's own SoC reset), so
+    back-to-back loads each start with a full WriteMem budget."""
+    device, opens = opened
+    p = _write_load_elf(tmp_path)
+    code, out = run("debug", "-c", f'load "{p}"', "-c", f'load "{p}"')
+    assert code == EXIT_OK
+    assert out.count("fresh probe connection for this load") == 2
+    assert getattr(device, "open_calls", 0) >= 2, "the DLL session was never reopened"
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+    assert "rtu0.0 halted at the entry" in out
+    assert "session closed" in out
