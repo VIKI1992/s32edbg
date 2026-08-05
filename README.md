@@ -1338,6 +1338,14 @@ because erase-before-write is unconditional and all-`0xFF` 256-byte pages are sk
 NOR already reads `0xFF` (`--no-skip-blank` to program them anyway; the full verify covers the
 skipped pages either way).
 
+**Do not erase the whole device unless you have another way to reflash it.** Measured
+2026-08-05 (test-plan Finding 14): with nothing bootable in flash the BootROM fail cascade
+escalates to a destructive reset and the **SMU M33 reads as powered down** — and the SMU is the
+core that executes the flash applet, so every later `flash` command fails. `s32edbg` cannot put
+the bootloader back on a board it fully erased; recovery needs s32multitool/S32DS, the
+bootloader's UDS path, or the serial-boot strap (`docs/virgin-board.md`). RAM `load` keeps
+working throughout. Range erases that keep offset 0 carry no such trap.
+
 **Programming for normal boot needs more than the image.** The M33 bootloader starts the app
 only when the app-valid flag `0x55AA55AA` sits at flash `0x100000`, the app is laid out
 flash-`0x300000`-equals-RAM-`0x32100000`, and the BLOB is at 0 — the whole contract, the

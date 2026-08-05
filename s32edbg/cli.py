@@ -3344,8 +3344,14 @@ def flash_erase(
             raise click.ClickException("--all does not combine with --offset/--area/--length")
         _flash_confirm(
             "flash erase --all: erase the ENTIRE 32 MiB device, including the "
-            "bootloader and IVT at offset 0 (the board will not boot until "
-            "reflashed)",
+            "bootloader and IVT at offset 0. THIS TOOL CANNOT PUT THEM BACK "
+            "(Finding 14, measured 2026-08-05): with no bootable image the "
+            "BootROM fail cascade escalates to a destructive reset and the "
+            "SMU M33 subsystem -- the core that executes the flash applet -- "
+            "reads as powered down, so every later flash op fails. RAM `load` "
+            "still works; reflashing needs s32multitool/S32DS or the "
+            "serial-boot strap (docs/virgin-board.md). Erase a RANGE instead "
+            "if the bootloader must survive",
             yes,
         )
         off, nbytes, label = 0, qspiflash.DEVICE_SIZE, "the whole device"

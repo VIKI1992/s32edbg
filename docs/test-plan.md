@@ -1786,7 +1786,29 @@ ordering.
 
 ---
 
-## The flash-state × debugging matrix — scripted, first run pending
+## The flash-state × debugging matrix — S1 measured 2026-08-05, S2-S5 blocked
+
+**First-run status.** S1 (nothing in flash) ran and its record cells are
+measured (below). S2-S5 are blocked by **Finding 14**: their setup steps need
+`flash program`, which needs the SMU, which a blank board does not have. The
+matrix resumes once the bootloader is restored by one of Finding 14's routes —
+from S2 onward every state has a live SMU, so the remaining states should run
+as designed.
+
+Measured S1 cells (`bench-runs/flashmatrix-20260805/S1/`), now the pinned
+expectations for a cascade board:
+
+| step | S1 result |
+|---|---|
+| `connect` | pass — CTRL/STAT `0xF0000000` |
+| `gates apply` | pass — gate open, exact read-back |
+| `apmap` | pass — matches RM Table 957 exactly |
+| `core list` | **no R52 debug frames answer at all** (refusal naming `gates apply`) |
+| `m33 list` | all three M33 APs read zeros — powered down in DEST0 |
+| `flash jedec` | **fails** at the SMU halt (Finding 14) |
+| `load --verify` | passes — proven repeatedly today (32.4 s, 111 KB/s) |
+
+
 
 `tools/flash-state-matrix.ps1` proves "debugging works as it worked until
 now" in **every flash-content state** (user requirement, 2026-08-05). States
@@ -1824,4 +1846,45 @@ past 8 minutes. A full run ends with app-only flash (no bootloader) — restore
 per app-boot-contract §4. Failures and measured record-cells become findings
 numbered with Workstream A's.
 
-The next finding number is **14**.
+### Finding 14 — a fully erased board cannot be reflashed by this tool (the SMU is gone)
+
+Measured 2026-08-05 while starting the state matrix, on the board left blank by
+`flash erase --all`. Every M33 AP (SMU, CE0, CE1) reads **literal zeros** for
+CPUID and DHCSR — not a fault, an AP answering with nothing. That is the
+`docs/virgin-board.md` chain reaching its end state: blank flash → BootROM
+finds no image → functional reset (RM 62.12) → FREC escalation (RM 60.5.2.4) →
+**DEST0**, where RM 60.5.6 says the part *"remains there until a POR event"*.
+The M33 subsystems are unpowered there.
+
+That is fatal for the flash flow and only for it: **the QSPI applet executes on
+the SMU M33**, so with the SMU unreachable `flash jedec/program/erase` all die
+at their post-reset SMU halt. Three routes were tried, all failing identically:
+
+1. default quiesce (`--reset sda`) — the flow's own functional reset re-runs
+   the failed boot and takes the SMU down with it;
+2. `attach` (hold functional reset) first, then the flash op — same;
+3. `--reset none` fired within seconds of a POR — same, because **the J-Link
+   connect itself pulses reset through R439 (defect D-2)**: connecting *is* a
+   boot attempt, so the cascade always wins the race. There is no window in
+   which this probe can meet a live SMU on a blank board.
+
+Everything that does not need the SMU still works on the same blank board:
+`connect`, `gates apply`, `apmap` (exact RM Table 957 match), AXI-AP `mem`
+read/write, and the whole RAM `load` flow with dual-core `catch`/`sync` — the
+load path brings the RTU partitions up itself.
+
+**Recovery routes** (none implemented here): s32multitool / S32DS, the
+bootloader's own UDS reflash path (needs a running BL), or the hardware
+serial-boot strap (`docs/virgin-board.md`: let FREC reach 8, BOOTMOD via
+TP40/TP41). A fourth, unimplemented and **unsourced**, would be to bring the
+M33 subsystem up from the debugger the way `load` brings up RTU0 — the
+vendored tables carry only the M33 *clock mux* (`ACTIONS_M33_CLOCK`,
+MC_CGM2 MUX0, measured reading `0x0F000000` = no source selected on the dead
+board), not an MC_ME partition-0 core release. That sequence is not in any
+source this repo may use; **ask the user/NXP before inventing it**.
+
+Consequence applied: the `flash erase --all` confirmation now states plainly
+that the tool cannot put the bootloader back, and points at the recovery
+routes. Range erases (which keep offset 0) carry no such trap.
+
+The next finding number is **15**.
