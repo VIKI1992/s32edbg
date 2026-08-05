@@ -1744,6 +1744,10 @@ docs/
   virgin-board.md             getting a foothold on blank flash
   app-boot-contract.md        what must be in flash (app flag, layout, order) for the
                               M33 bootloader to boot the app; probe programming procedure
+  handover-virgin-board-flashing.md
+                              OPEN DEFECT: a fully erased board cannot be reflashed by
+                              this tool (the SMU that runs the applet is powered down);
+                              evidence, routes tried, and what to fix
 tools/
   bench-acceptance.ps1        runs the hardware sequence, keeps the artifacts
   flash-state-matrix.ps1      the flash-state × debugging matrix (S1..S5)

@@ -1887,4 +1887,8 @@ Consequence applied: the `flash erase --all` confirmation now states plainly
 that the tool cannot put the bootloader back, and points at the recovery
 routes. Range erases (which keep offset 0) carry no such trap.
 
+**The full account, and what to fix, is
+`docs/handover-virgin-board-flashing.md`** — the open-defect handover for
+whoever takes this on.
+
 The next finding number is **15**.
