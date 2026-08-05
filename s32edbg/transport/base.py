@@ -127,6 +127,17 @@ class Transport(abc.ABC):
             f"{self.name} transport cannot block-write target memory"
         )
 
+    #: Whether read_mem_block() can pull a byte block through the probe's own
+    #: memory machinery in one call. Same DLL-only, unverifiable-ABI story as
+    #: can_block_write: callers must cross-check the content against
+    #: independent ADIv6 reads before believing it.
+    can_block_read: bool = False
+
+    def read_mem_block(self, addr: int, count: int) -> bytes:
+        raise UnsupportedOperation(
+            f"{self.name} transport cannot block-read target memory"
+        )
+
     #: Whether set_reset_pin() can drive the probe's nRESET line.
     can_pin_reset: bool = False
 

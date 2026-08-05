@@ -17,6 +17,7 @@ from s32edbg.data import a32
 from s32edbg.data import coresight as cs
 from s32edbg.data import ladder1 as lad
 from s32edbg.data import m33debug as m33d
+from s32edbg.data import qspiflash as qflash
 from s32edbg.data import r52debug as r52
 from s32edbg.data import rtuboot
 from s32edbg.data.expected_apmap import (
@@ -426,6 +427,218 @@ class SyntheticTarget(MemApFake):
             if a.op in ("write32", "poll")
         }
 
+        # -- external QSPI NOR + controller + applet model -------------------
+        #
+        # The flash flow drives three address classes through one memory AP:
+        # the QuadSPI controller at 0x42320000, the applet RAM at 0x2500xxxx
+        # (both carried by the shared `mem` dict), and the memory-mapped flash
+        # window. The window is served at 0x08000000 -- a real value from the
+        # reference profile -- because 0x0 would shadow the core debug frames
+        # this fake maps low; flash tests pass --ahb-base 0x08000000.
+        #: Sparse NOR array: word-aligned byte offset -> word. Absent = erased
+        #: (0xFFFFFFFF). Programs AND into it (NOR can only clear bits), so a
+        #: missing erase-before-write shows up as corrupt verify data.
+        self.flash: dict[int, int] = {}
+        #: Which RDID answers with the real JEDEC: "spi" (default) or "opi" --
+        #: the knob behind the SPI-invalid-then-OPI detection fallback test.
+        self.flash_device_mode = "spi"
+        #: False models the bench board: BootROM booted from this flash, so the
+        #: controller answers before any init table runs (Finding 11 -- the
+        #: warm path). True models a dead controller that answers RDID only
+        #: after the full bring-up locked the DLL (the cold path).
+        self.qspi_cold = False
+        self.AHB_TEST_BASE = 0x0800_0000
+        self.qspi_luts: dict[int, list[int]] = {}
+        self._qspi_lut_key = 0
+        self.qspi_lut_locked = True
+        #: Writes to a locked LUT are discarded (LUTKEY/LCKCR guard), counted
+        #: so a flow that forgets the unlock fails loudly in its verify.
+        self.qspi_lut_discards = 0
+        self.qspi_wel = False
+        self._qspi_rbdr = 0
+        #: RDSR polls that still report WIP after a chip erase -- lets the
+        #: host's wait_ready loop actually loop.
+        self._qspi_wip_polls = 0
+        self.qspi_chip_erases = 0
+        #: Every applet invocation, as (op, offset, size).
+        self.applet_runs: list[tuple[int, int, int]] = []
+        #: First word of the vendored applet: how the fake recognises that the
+        #: real binary was staged before the SMU was aimed at it.
+        self._applet_word0 = int.from_bytes(qflash.applet_bytes()[:4], "little")
+        #: Finding 10 (measured 2026-08-05): after a functional reset releases,
+        #: the SMU AHB-AP answers all-zeros for a moment. This knob is how many
+        #: M33 debug-register reads answer zero after each reset release.
+        self.m33_dead_reads_after_reset = 0
+        self._m33_dead_reads = 0
+        # The PLL lock bit the bring-up table polls; everything else the
+        # tables poll already reads as its expected value from an empty dict.
+        self.mem[0x4022_0004] = 0x4
+
+    # -- QSPI controller model ----------------------------------------------
+
+    def _qspi_write(self, addr: int, value: int) -> bool:
+        base = qflash.QSPI_BASE
+        if not base <= addr < base + 0x1000:
+            return False
+        off = addr - base
+        if off == qflash.QSPI_MCR:
+            # The TX/RX clear bits self-clear; everything else is storage.
+            self.mem[addr] = value & ~qflash.QSPI_MCR_CLR_TXRX
+            return True
+        if off == qflash.QSPI_DLLCRA:
+            self.mem[addr] = value
+            if value & 0x1:  # slave update -> DLL lock
+                self.mem[base + qflash.QSPI_DLLSR] = (
+                    self.mem.get(base + qflash.QSPI_DLLSR, 0) | 0x4000
+                )
+            return True
+        if off == qflash.QSPI_SPTRCLR:
+            self.mem[addr] = 0  # both clear requests self-clear instantly
+            return True
+        if off == qflash.QSPI_LUTKEY:
+            self._qspi_lut_key = value
+            return True
+        if off == qflash.QSPI_LCKCR:
+            if self._qspi_lut_key == qflash.QSPI_LUTKEY_VALUE:
+                if value == qflash.QSPI_LCKCR_UNLOCK:
+                    self.qspi_lut_locked = False
+                elif value == qflash.QSPI_LCKCR_LOCK:
+                    self.qspi_lut_locked = True
+            return True
+        if qflash.QSPI_LUT_BASE <= off < qflash.QSPI_LUT_BASE + 16 * qflash.QSPI_LUT_STRIDE:
+            if self.qspi_lut_locked:
+                self.qspi_lut_discards += 1
+                return True
+            seq, reg = divmod(off - qflash.QSPI_LUT_BASE, qflash.QSPI_LUT_STRIDE)
+            self.qspi_luts.setdefault(seq, [0] * qflash.LUT_SEQUENCE_REGS)[reg // 4] = value
+            return True
+        if off == qflash.QSPI_IPCR:
+            self._qspi_ip_execute((value >> 24) & 0xF)
+            return True
+        return False  # SFAR/SFACR/FR/BUFxCR/... are plain storage
+
+    def _qspi_slot_opcode(self, seq: int) -> tuple[int, int]:
+        """(first command opcode, pads) of a physical LUT slot, 0 if empty."""
+        regs = self.qspi_luts.get(seq)
+        if not regs:
+            return 0, 0
+        first = regs[0] & 0xFFFF
+        return first & 0xFF, (first >> 8) & 0x3
+
+    def _qspi_ip_execute(self, seq: int) -> None:
+        opcode, pads = self._qspi_slot_opcode(seq)
+        if opcode == 0x9F:  # RDID -- answers only in the device's real mode
+            asked = "opi" if pads == 3 else "spi"
+            controller_up = not self.qspi_cold or bool(
+                self.mem.get(qflash.QSPI_BASE + qflash.QSPI_DLLSR, 0) & 0x4000
+            )
+            self._qspi_rbdr = (
+                qflash.EXPECTED_JEDEC_IDS[0]
+                if controller_up and asked == self.flash_device_mode
+                else 0xFFFF_FFFF
+            )
+        elif opcode == 0x05:  # RDSR
+            wip = 0
+            if self._qspi_wip_polls > 0:
+                self._qspi_wip_polls -= 1
+                wip = qflash.FLASH_WIP
+            self._qspi_rbdr = wip | (qflash.FLASH_WEL if self.qspi_wel else 0)
+        elif opcode == 0x06:  # WREN
+            self.qspi_wel = True
+        elif opcode == 0x04:  # WRDI
+            self.qspi_wel = False
+        elif opcode == 0x60:  # CHIP_ERASE
+            if self.qspi_wel:
+                self.flash.clear()
+                self.qspi_chip_erases += 1
+                self._qspi_wip_polls = 3
+                self.qspi_wel = False
+
+    # -- the M33 QSPI applet model -------------------------------------------
+
+    def _applet_resume(self) -> bool:
+        """Called when the SMU is resumed at the applet entry with the real
+        binary staged. Returns True when it modelled the run (core re-halts).
+
+        The one trap modelled with full fidelity: a still-latched M33 EDBGREQ
+        in MDM CONTROL[10:8] re-halts the core before the applet executes,
+        with DFSR reading "external debug request" -- the failure
+        gates.clear_m33_edbgreq exists to prevent.
+        """
+        state = self.m33
+        if state["pc"] != qflash.APPLET_BASE:
+            return False
+        if self.mem.get(qflash.APPLET_BASE, 0) != self._applet_word0:
+            return False
+        state["sticky"] |= m33d.DHCSR_S_RETIRE_ST
+        control = self.ap_space.get(AP_MDM + lad.MDM_CONTROL, 0)
+        if control & lad.MDM_CONTROL_M33_EDBGREQ_MASK:
+            self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_EXTERNAL
+            return True  # halted again before the first instruction
+        regs = state["regs"]
+        op = regs.get(0, 0)
+        offset = regs.get(1, 0)
+        size = regs.get(3, 0)
+        self.applet_runs.append((op, offset, size))
+        rc = self._applet_execute(op, offset, size)
+        regs[0] = rc
+        mailbox = [0] * len(qflash.MAILBOX_LABELS)
+        mailbox[0] = qflash.APPLET_STATUS_MAGIC
+        mailbox[1] = op
+        mailbox[2] = rc
+        mailbox[3] = 0xFF00  # PHASE_DONE
+        for i, word in enumerate(mailbox):
+            self.mem[qflash.APPLET_STATUS + i * 4] = word
+        self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_BKPT
+        return True
+
+    def _applet_execute(self, op: int, offset: int, size: int) -> int:
+        """The applet's flash-side contract, oracle-grade: LUT slots must hold
+        what the reference loads for each op, and programming ANDs into NOR."""
+        slot0, _ = self._qspi_slot_opcode(qflash.PHYS_COMMAND_LUT)
+        slot2, _ = self._qspi_slot_opcode(qflash.PHYS_WREN_LUT)
+        slot3, _ = self._qspi_slot_opcode(qflash.PHYS_RDSR_LUT)
+        if op == qflash.OP_PROGRAM_BUFFER:
+            if slot0 not in (0x02, 0x12):
+                return 0x1006  # slot 0 does not hold a page-program sequence
+            if slot2 != 0x06 or slot3 != 0x05:
+                return 0x1007  # no WREN/RDSR loaded: write-enable cannot latch
+            if offset % qflash.PAGE_SIZE or size == 0:
+                return 0x1002
+            for i in range(0, size, 4):
+                word = self.mem.get(qflash.APPLET_DATA + i, 0)
+                old = self.flash.get(offset + i, 0xFFFF_FFFF)
+                self.flash[offset + i] = old & word
+            return 0
+        if op in (qflash.OP_ERASE_4K_RANGE, qflash.OP_ERASE_64K_RANGE):
+            unit = (
+                qflash.SECTOR_SIZE
+                if op == qflash.OP_ERASE_4K_RANGE
+                else qflash.BLOCK_ERASE_SIZE
+            )
+            expected = (0x20, 0x21) if unit == qflash.SECTOR_SIZE else (0xDC,)
+            if slot0 not in expected:
+                return 0x1006  # slot 0 holds the wrong erase (or none at all)
+            if slot2 != 0x06 or slot3 != 0x05:
+                return 0x1007
+            if offset % unit or size % unit or size == 0:
+                return 0x1002
+            for k in range(offset, offset + size, 4):
+                self.flash.pop(k, None)
+            return 0
+        if op == qflash.OP_READ_BUFFER:
+            slot1, _ = self._qspi_slot_opcode(qflash.PHYS_AHB_LUT)
+            if slot1 not in (0x0B, 0xEC):
+                return 0x1006
+            if size == 0:
+                return 0x1002
+            for i in range(0, size, 4):
+                self.mem[qflash.APPLET_DATA + i] = self.flash.get(
+                    offset + i, 0xFFFF_FFFF
+                )
+            return 0
+        return 0x1001  # BAD_OP
+
     def _loadflow_write(self, addr: int, value: int) -> None:
         """MC_ME key commits, SRAMC INIT edges, RGM mirror + EDBGREQ halts."""
         if addr == rtuboot.MC_ME_CTL_KEY and value == 0xA50F:
@@ -451,7 +664,26 @@ class SyntheticTarget(MemApFake):
             self.mem[rtuboot.RGM_PSTAT0_1] = value
             control2 = self.ap_space.get(AP_MDM + lad.MDM_CONTROL2, 0)
             for debug_base, bit in ((CORE0_DEBUG, 0x2), (CORE1_DEBUG, 0x4)):
+                if not old & bit and value & bit:
+                    # Reset ASSERTED: a core-local cold reset (guide §3.6) --
+                    # every comparator field and EDECR wiped, the OS lock
+                    # re-set, EDSCR faulting until unlocked. This is the
+                    # app's own `BrsHwEarlyInitPowerOn` first move on core1.
+                    for n in range(8):
+                        self.mem[debug_base + r52.dbgbcr(n)] = 0
+                        self.mem[debug_base + r52.dbgwcr(n)] = 0
+                    self.mem[debug_base + r52.EDECR] = 0
+                    self._set_halted(debug_base, False)
+                    self.mem[debug_base + r52.EDPRSR] = (
+                        self.mem.get(debug_base + r52.EDPRSR, 0)
+                        | r52.EDPRSR_R
+                        | r52.EDPRSR_OSLK
+                    ) & ~r52.EDPRSR_HALTED
+                    self.faulting.add(debug_base + r52.EDSCR)
                 if old & bit and not value & bit:
+                    self.mem[debug_base + r52.EDPRSR] = (
+                        self.mem.get(debug_base + r52.EDPRSR, 0) & ~r52.EDPRSR_R
+                    )
                     core_idx = 0 if debug_base == CORE0_DEBUG else 1
                     if control2 & lad.edbgreq_bit(core_idx):
                         # Out of cold reset with EDBGREQ pending: halted at the
@@ -473,6 +705,8 @@ class SyntheticTarget(MemApFake):
         self._loadflow_write(addr, value)
         handled = self._m33_write(addr, value)
         if handled:
+            return True
+        if self._qspi_write(addr, value):
             return True
         for debug_base, cti_base in self.core_frames.items():
             # `cti_enabled` models a CTI whose pulses go nowhere -- a mis-wired
@@ -507,6 +741,12 @@ class SyntheticTarget(MemApFake):
                 addr == cti_base + r52.CTIINTACK
                 and value & (1 << r52.TRIGOUT_DEBUG_REQUEST)
                 and not self.cti_ack_broken
+                # A level source re-asserts straight through the acknowledge:
+                # while the armed cross-halt channel is still driven by a
+                # halted core, the trigger cannot deassert -- the interaction
+                # guide §5.9 never addresses, and the reason the group
+                # restart masks CTIINEN first.
+                and not self._cross_halt_drives(debug_base)
             ):
                 self.mem[cti_base + r52.CTITRIGOUTSTATUS] = self.mem.get(
                     cti_base + r52.CTITRIGOUTSTATUS, 0
@@ -541,11 +781,21 @@ class SyntheticTarget(MemApFake):
             if addr == debug_base + r52.EDPRSR:
                 self.mem[addr] = value & ~r52.EDPRSR_SDR
                 return value
+        if self._m33_dead_reads > 0 and addr in (
+            m33d.CPUID, m33d.DHCSR, m33d.DEMCR, m33d.FP_CTRL, m33d.DWT_CTRL, m33d.DFSR,
+        ):
+            # The Finding-10 post-reset dead window: the AP answers, but with
+            # nothing -- the signature m33.preflight refuses.
+            self._m33_dead_reads -= 1
+            return 0
         if addr == m33d.DHCSR:
             state = self.m33
-            status = state["sticky"] | m33d.DHCSR_S_REGRDY
+            status = state["sticky"]
             if state["halted"]:
-                status |= m33d.DHCSR_S_HALT
+                # S_REGRDY only while halted: DCRSR transfers need Debug
+                # state, which is how the Finding-6 resume-behind-our-back
+                # presents (S_REGRDY stays clear, measured 2026-08-05).
+                status |= m33d.DHCSR_S_HALT | m33d.DHCSR_S_REGRDY
             state["sticky"] = 0  # S_RETIRE/S_RESET/S_RESTART are clear-on-read
             return state["control"] | status
         for n in range(4):
@@ -555,6 +805,16 @@ class SyntheticTarget(MemApFake):
                 # mask it fails against real hardware, so the fake fails it
                 # the same way.
                 return value | (0b01011 << 27)
+        if self.AHB_TEST_BASE <= addr < self.AHB_TEST_BASE + qflash.DEVICE_SIZE:
+            # The memory-mapped flash window answers only once the AHB LUT
+            # slot holds a READ sequence -- a flow that forgot install_luts
+            # sees zeros here and fails its verify, as it should.
+            slot1, _ = self._qspi_slot_opcode(qflash.PHYS_AHB_LUT)
+            if slot1 in (0x0B, 0xEC):
+                return self.flash.get(addr - self.AHB_TEST_BASE, 0xFFFF_FFFF)
+            return 0
+        if addr == qflash.QSPI_BASE + qflash.QSPI_RBDR:
+            return self._qspi_rbdr
         return value
 
     def _armed_breakpoint(self, debug_base: int) -> int | None:
@@ -566,6 +826,64 @@ class SyntheticTarget(MemApFake):
                 decoded = r52.decode_breakpoint(value, control)
                 return int(str(decoded["address"]), 16)
         return None
+
+    def _cross_halt_sources(self) -> tuple[dict[int, bool], bool]:
+        """(internal ch2 per core, matrix ch2): who drives the cross-halt
+        channel right now. A halted core whose CTIINEN0 routes DBGTRIGGER onto
+        channel 2 drives its internal channel; CTIGATE gates that out to the
+        CTM (guide §5.9)."""
+        internal: dict[int, bool] = {}
+        matrix = False
+        mask = 1 << r52.CHANNEL_CROSS_HALT
+        for debug_base, cti_base in self.core_frames.items():
+            halted = bool(self.mem.get(debug_base + r52.EDPRSR, 0) & r52.EDPRSR_HALTED)
+            drives = halted and bool(
+                self.mem.get(cti_base + r52.ctiinen(r52.TRIGIN_CROSS_HALT), 0) & mask
+            )
+            internal[debug_base] = drives
+            if drives and self.mem.get(cti_base + r52.CTIGATE, 0) & mask:
+                matrix = True
+        return internal, matrix
+
+    def _cross_halt_drives(self, debug_base: int) -> bool:
+        """Whether channel 2 currently drives this core's debug request.
+
+        The self-loop (a core's own internal channel reaching its own trigger
+        output) is modelled gate-independent -- the conservative CoreSight
+        reading, and the one that forces the CTIINEN-mask teardown the
+        restart path implements to be the thing the tests prove.
+        """
+        mask = 1 << r52.CHANNEL_CROSS_HALT
+        cti_base = self.core_frames[debug_base]
+        listens = self.mem.get(
+            cti_base + r52.ctiouten(r52.TRIGOUT_DEBUG_REQUEST), 0
+        ) & mask
+        if not listens:
+            return False
+        internal, matrix = self._cross_halt_sources()
+        if internal[debug_base]:
+            return True
+        return matrix and bool(self.mem.get(cti_base + r52.CTIGATE, 0) & mask)
+
+    def _propagate_cross_halt(self) -> None:
+        """The §5.9 halt group in action: any running, released core whose
+        debug request is driven through channel 2 enters Debug state with the
+        external-debug-request status and its trigger output asserted. Fixed
+        point -- the halted set only grows."""
+        changed = True
+        while changed:
+            changed = False
+            for debug_base, cti_base in self.core_frames.items():
+                edprsr = self.mem.get(debug_base + r52.EDPRSR, 0)
+                if edprsr & (r52.EDPRSR_HALTED | r52.EDPRSR_R):
+                    continue  # already halted, or held in reset: cannot halt
+                if self._cross_halt_drives(debug_base):
+                    self._set_halted(debug_base, True)
+                    self.mem[cti_base + r52.CTITRIGOUTSTATUS] = (
+                        self.mem.get(cti_base + r52.CTITRIGOUTSTATUS, 0)
+                        | (1 << r52.TRIGOUT_DEBUG_REQUEST)
+                    )
+                    changed = True
 
     def _restart(self, debug_base: int) -> None:
         """What happens when the restart channel is pulsed.
@@ -579,7 +897,24 @@ class SyntheticTarget(MemApFake):
         * an armed breakpoint -- run and halt on it, with the breakpoint status.
           This is what makes step-over's temporary breakpoint testable.
         * otherwise -- run.
+
+        A fourth outcome guards them all: a restart while the core's debug
+        request is still asserted -- a latched MDM EDBGREQ, an unacknowledged
+        trigger, or the armed cross-halt channel still driven by a halted
+        partner -- is **swallowed** (guide §5.5): the core stays in Debug
+        state and SDR stays clear.
         """
+        core_idx = 0 if debug_base == CORE0_DEBUG else 1
+        control2 = self.ap_space.get(AP_MDM + lad.MDM_CONTROL2, 0)
+        trigout = self.mem.get(
+            self.core_frames[debug_base] + r52.CTITRIGOUTSTATUS, 0
+        ) & (1 << r52.TRIGOUT_DEBUG_REQUEST)
+        if (
+            control2 & lad.edbgreq_bit(core_idx)
+            or trigout
+            or self._cross_halt_drives(debug_base)
+        ):
+            return
         # Whatever the outcome, the PE left Debug state: EDPRSR.SDR (Sticky
         # Debug Restart) latches until read -- the guide §5.5 confirmation.
         self.mem[debug_base + r52.EDPRSR] = (
@@ -729,6 +1064,8 @@ class SyntheticTarget(MemApFake):
                     self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_HALTED
             elif state["halted"]:
                 state["sticky"] |= m33d.DHCSR_S_RESTART_ST
+                if not bits & m33d.DHCSR_C_STEP and self._applet_resume():
+                    return True  # the QSPI applet ran and re-halted at bkpt
                 if bits & m33d.DHCSR_C_STEP:
                     if self._m33_armed_fp():
                         # Re-trigger before the instruction executes: PC does
@@ -818,8 +1155,13 @@ class SyntheticTarget(MemApFake):
                         self._core_released(debug_base)
             return
         super().ap_reg_write(index, value)
+        if (addr & 0xFFF) == adiv6.AP_DRW:
+            # The memory write just landed (halt state, CTI routing, RGM --
+            # anything): let the armed cross-halt channel do its level work.
+            self._propagate_cross_halt()
 
     def _functional_reset_released(self) -> None:
+        self._m33_dead_reads = self.m33_dead_reads_after_reset  # Finding 10
         rstctrl = self.ap_space.get(
             AP_SDA + lad.SDA_RSTCTRL, lad.SDA_RSTCTRL_RESET_VALUE
         )
@@ -865,6 +1207,13 @@ class SyntheticTarget(MemApFake):
 
     def read_idcode(self) -> int:
         return IDCODE_S32E277
+
+    def configure_memory_ap(self, ap_addr: int, ap_type: str = "AXI-AP", index: int = 0) -> str:
+        """DLL AddAP/SetIndex stub: recorded so fast-path tests can assert the
+        routing, inert otherwise (this fake has no WriteMem to route)."""
+        self.memory_ap_configs = getattr(self, "memory_ap_configs", [])
+        self.memory_ap_configs.append((ap_addr, ap_type, index))
+        return ""
 
     def probe_info(self) -> ProbeInfo:
         return ProbeInfo(

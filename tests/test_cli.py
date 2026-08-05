@@ -470,6 +470,70 @@ def test_a_write_whose_readback_differs_says_so_rather_than_reporting_success(
     assert "read-back differs" in out
 
 
+def test_bp_set_on_a_held_core_says_held_in_reset(run, target) -> None:
+    """A core that never left reset reads OS-locked too, and 'clear OSLAR' is
+    the wrong advice -- unlock refuses with the reset story and points at the
+    catch mechanism instead."""
+    from conftest import CORE1_DEBUG
+    from s32edbg.data import r52debug as r52
+
+    target.mem[CORE1_DEBUG + r52.EDPRSR] = (
+        r52.EDPRSR_PU | r52.EDPRSR_R | r52.EDPRSR_OSLK
+    )
+    # Measured silicon behaviour: core-domain registers fault while held.
+    target.faulting.add(CORE1_DEBUG + r52.EDSCR)
+    code, out = run("bp", "set", "0x00400120", "--core", "rtu0.1")
+    assert code == EXIT_TOOL_ERROR
+    assert "held in reset" in out
+    assert "core catch" in out
+
+
+def test_status_notes_a_core_held_in_reset(run, target) -> None:
+    from conftest import CORE1_DEBUG
+    from s32edbg.data import r52debug as r52
+
+    target.mem[CORE1_DEBUG + r52.EDPRSR] = (
+        r52.EDPRSR_PU | r52.EDPRSR_R | r52.EDPRSR_OSLK
+    )
+    target.faulting.add(CORE1_DEBUG + r52.EDSCR)
+    code, out = run("core", "status", "--core", "rtu0.1")
+    assert code == EXIT_OK
+    assert "held in reset" in out
+
+
+def test_bp_list_on_a_locked_core_names_unlock(run, target) -> None:
+    """Listing is read-only and must not unlock (that changes target state);
+    the per-slot 'did not read' rows get a stated reason and the fix."""
+    from conftest import CORE0_DEBUG
+
+    target.lock_core(CORE0_DEBUG)
+    code, out = run("bp", "list", "--core", "rtu0.0")
+    assert code == EXIT_OK
+    assert "comparator registers will not read" in out
+    assert "Run `unlock`" in out
+
+
+def test_arming_a_comparator_on_a_running_core_warns_but_arms(run, target) -> None:
+    """Guide §5.7/§5.8: program comparators while the core is halted -- the
+    change needs a context synchronization event to be guaranteed visible.
+    A warning and not a refusal: arming-while-running has fired on this
+    silicon, so refusing would remove a working workflow."""
+    code, out = run("bp", "set", "0x00400120", "--core", "rtu0.0")
+    assert code == EXIT_OK
+    assert "is not halted" in out
+    code, out = run("wp", "set", "0x00410FF0", "--core", "rtu0.0")
+    assert code == EXIT_OK
+    assert "is not halted" in out
+
+
+def test_arming_on_a_halted_core_does_not_warn(run, target) -> None:
+    code, out = run(
+        "debug", "--core", "rtu0.0", "-c", "halt", "-c", "bp set 0x00400120"
+    )
+    assert code == EXIT_OK
+    assert "is not halted" not in out
+
+
 def test_core_list_finds_the_cores_and_reports_their_identity(run, target, tmp_path) -> None:
     out_file = tmp_path / "cores.json"
     code, out = run("--json", str(out_file), "core", "list")
@@ -651,3 +715,295 @@ def test_an_escaped_exception_is_an_internal_error_with_exit_2(run, target, monk
     assert "internal error" in out
     assert "RuntimeError" in out
     assert "Traceback" not in out
+
+
+# ---------------------------------------------------------------------------
+# flash: argument surface, --yes gating, and the end-to-end flows.
+#
+# The SyntheticTarget serves the memory-mapped flash window at 0x08000000
+# (base 0x0 would shadow its core debug frames), so every command that reads
+# flash back passes --ahb-base 0x08000000 -- on silicon that base is a bench
+# question (u-f1) and the default 0x0 fails over by itself.
+# ---------------------------------------------------------------------------
+
+
+def write_image(tmp_path, data: bytes, name: str = "image.bin"):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return p
+
+
+def test_flash_needs_exactly_one_destination(run, tmp_path) -> None:
+    """No implicit offset, ever (user decision 2026-08-04): a flash write with
+    a guessed destination is how a bootloader gets overwritten by accident. No
+    transport is patched here -- the refusal must precede the probe."""
+    p = write_image(tmp_path, b"\x11" * 4)
+    code, out = run("flash", "program", str(p))
+    assert code == EXIT_USAGE
+    assert "exactly one of --offset" in out
+    code, out = run("flash", "program", str(p), "--offset", "0x0", "--area", "app")
+    assert code == EXIT_USAGE
+    assert "exactly one of --offset" in out
+
+
+def test_flash_rejects_an_unknown_area_and_names_the_real_ones(run, tmp_path) -> None:
+    p = write_image(tmp_path, b"\x11" * 4)
+    code, out = run("flash", "program", str(p), "--area", "bootloader")
+    assert code == EXIT_USAGE
+    assert "selftestbck" in out
+
+
+def test_flash_program_requires_a_page_aligned_offset(run, tmp_path) -> None:
+    p = write_image(tmp_path, b"\x11" * 4)
+    code, out = run("flash", "program", str(p), "--offset", "0x300080")
+    assert code == EXIT_USAGE
+    assert "not 256-byte aligned" in out
+
+
+def test_flash_program_refuses_an_image_too_big_for_its_area(run, tmp_path) -> None:
+    p = write_image(tmp_path, b"\x00" * 0x6000)
+    code, out = run("flash", "program", str(p), "--area", "cert")  # cert holds 0x5000
+    assert code == EXIT_USAGE
+    assert "refusing to spill past the region" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["flash", "program", "IMAGE", "--offset", "0x300000"],
+        ["flash", "erase", "--offset", "0x300000", "--length", "0x1000"],
+        ["flash", "erase", "--all"],
+    ],
+    ids=lambda a: " ".join(a[:2] + a[3:4]) if isinstance(a, list) else "",
+)
+def test_flash_destructive_ops_require_yes_when_stdin_is_not_a_terminal(
+    run, tmp_path, argv
+) -> None:
+    """--yes gates every destructive flash op. No transport is patched, so the
+    refusal provably happens before the probe -- and before the JEDEC gate,
+    the reset, or anything else that touches the board."""
+    argv = [str(write_image(tmp_path, b"\x11" * 4)) if a == "IMAGE" else a for a in argv]
+    code, out = run(*argv)
+    assert code == EXIT_USAGE
+    assert "--yes" in out
+
+
+def test_flash_erase_all_does_not_combine_with_a_range(run) -> None:
+    code, out = run("flash", "erase", "--all", "--offset", "0x0", "--yes")
+    assert code == EXIT_USAGE
+    assert "--all does not combine" in out
+
+
+def test_flash_read_with_an_offset_needs_a_length(run, tmp_path) -> None:
+    code, out = run("flash", "read", "--offset", "0x0", "--out", str(tmp_path / "d.bin"))
+    assert code == EXIT_USAGE
+    assert "--length is required" in out
+
+
+def test_flash_jedec_reports_mode_and_identity(run, target, tmp_path) -> None:
+    """The smoke test command, end to end: quiesce-reset, controller bring-up,
+    mode detection, and the identity verdict -- plus the JSON contract."""
+    out_file = tmp_path / "jedec.json"
+    code, out = run("--json", str(out_file), "flash", "jedec")
+    assert code == EXIT_OK
+    assert "JEDEC 0xC23989C2" in out
+    assert "matches the expected MX25UW25A45G" in out
+    payload = read_json(out_file)
+    assert payload["op"] == "jedec"
+    assert payload["mode"] == "spi"
+    assert payload["jedec"] == "0xC23989C2"
+
+
+def test_flash_bringup_waits_out_the_post_reset_m33_dead_window(run, target) -> None:
+    """Finding 10, measured 2026-08-05: right after the quiesce reset
+    releases, the SMU AHB-AP answers all-zeros for a moment (identity reads
+    zero; correct shortly after, with the EDBGREQ latch having caught the
+    core). The bring-up polls identity until the AP is back instead of
+    failing on the first read."""
+    target.m33_dead_reads_after_reset = 12  # two full identity passes read dead
+    code, out = run("flash", "jedec")
+    assert code == EXIT_OK
+    assert "JEDEC 0xC23989C2" in out
+
+
+def test_flash_bringup_survives_a_blank_flash_board_dead_at_attach(run, target) -> None:
+    """The virgin-board case, measured 2026-08-05 right after the first chip
+    erase: with no bootloader the SoC sits in the BootROM fail cascade and
+    the SMU AP answers nothing at attach. The pre-reset quiesce is then
+    best-effort -- the reset with EDBGREQ latched is what catches the SMU."""
+    target._m33_dead_reads = 10**6  # dead from attach...
+    target.m33_dead_reads_after_reset = 0  # ...until the quiesce reset runs
+    code, out = run("flash", "jedec")
+    assert code == EXIT_OK
+    assert "could not quiesce before the reset" in out
+    assert "JEDEC 0xC23989C2" in out
+
+
+def test_flash_reset_none_still_requires_a_live_smu(run, target) -> None:
+    """--reset none has no stronger mechanism coming: a dead SMU at attach is
+    fatal there, not best-effort."""
+    target._m33_dead_reads = 10**6
+    code, out = run("flash", "jedec", "--reset", "none")
+    assert code == EXIT_TOOL_ERROR
+    assert "could not halt the SMU M33" in out
+
+
+def test_flash_program_end_to_end_erases_writes_verifies_and_reports(
+    run, target, tmp_path
+) -> None:
+    """The whole CLI program flow on the synthetic NOR: erase lands before the
+    writes (the model's AND-semantics would corrupt the verify otherwise), the
+    blank page is skipped, the verify is full, and the JSON says all of it."""
+    image = write_image(tmp_path, b"\x11" * 0x100 + b"\xff" * 0x100 + bytes(range(256)))
+    out_file = tmp_path / "program.json"
+    code, out = run(
+        "--json", str(out_file), "flash", "program", str(image),
+        "--offset", "0x300000", "--ahb-base", "0x08000000", "--yes",
+    )
+    assert code == EXIT_OK
+    assert "programmed" in out
+    assert "power-cycle the board" in out
+    assert target.flash[0x0030_0000] == 0x1111_1111
+    assert 0x0030_0100 not in target.flash, "the blank page stayed unprogrammed"
+    assert target.applet_runs[0][0] == 5, "the sector erase must precede the writes"
+    payload = read_json(out_file)
+    assert payload["op"] == "program"
+    assert payload["program"]["runs"] == 2
+    assert payload["program"]["skipped_pages"] == 1
+    assert payload["erase"]["bytes"] == 0x1000
+    assert payload["verify"] == "full"
+    assert payload["applet_calls"] == 3
+    assert payload["mode"] == "spi"
+
+
+def test_flash_program_flattens_an_elf_and_writes_it_verbatim(run, target, tmp_path) -> None:
+    """An ELF input is packed LMA-relative with 0xFF gaps and written like any
+    .bin (user decision 2026-08-04) -- the gap page never gets programmed
+    because it is indistinguishable from erased flash."""
+    import struct
+    from s32edbg import elf as elf_mod
+
+    segments = [(0x3210_0000, b"\xaa" * 4), (0x3210_0200, b"\xbb" * 4)]
+    phoff, phnum = 52, len(segments)
+    data_off = phoff + phnum * elf_mod.PHDR_SIZE
+    ident = elf_mod.ELF_MAGIC + bytes([1, 1, 1, 0]) + b"\x00" * 8
+    ehdr = struct.pack(
+        "<HHIIIIIHHHHHH", 2, elf_mod.EM_ARM, 1, 0x3210_0001, phoff, 0, 0, 52,
+        elf_mod.PHDR_SIZE, phnum, 0, 0, 0,
+    )
+    phdrs, blobs, off = b"", b"", data_off
+    for paddr, data in segments:
+        phdrs += struct.pack(
+            "<IIIIIIII", elf_mod.PT_LOAD, off, paddr, paddr, len(data), len(data), 5, 4
+        )
+        blobs += data
+        off += len(data)
+    image = write_image(tmp_path, ident + ehdr + phdrs + blobs, "app.elf")
+
+    code, out = run(
+        "flash", "program", str(image),
+        "--area", "app", "--ahb-base", "0x08000000", "--yes",
+    )
+    assert code == EXIT_OK
+    assert "flattened LMA-relative: base 0x32100000" in out
+    app_offset = 0x0030_0000
+    assert target.flash[app_offset] == 0xAAAA_AAAA
+    assert app_offset + 0x100 not in target.flash, "the 0xFF gap page was skipped"
+    assert target.flash[app_offset + 0x200] == 0xBBBB_BBBB
+
+
+def test_flash_erase_all_is_the_host_driven_chip_erase(run, target, tmp_path) -> None:
+    target.flash[0x0100_0000] = 0
+    out_file = tmp_path / "erase.json"
+    code, out = run(
+        "--json", str(out_file), "flash", "erase", "--all",
+        "--ahb-base", "0x08000000", "--yes",
+    )
+    assert code == EXIT_OK
+    assert target.qspi_chip_erases == 1
+    assert not target.flash
+    assert target.applet_runs == [], "chip erase has no applet op"
+    payload = read_json(out_file)
+    assert payload["op"] == "erase --all"
+    assert payload["erase"]["bytes"] == 32 * 1024 * 1024
+    assert payload["verify"] == "blank-sampled"
+
+
+def test_flash_erase_range_blank_checks_afterwards(run, target, tmp_path) -> None:
+    target.flash[0x0030_0000] = 0
+    out_file = tmp_path / "erase.json"
+    code, out = run(
+        "--json", str(out_file), "flash", "erase",
+        "--offset", "0x300000", "--length", "0x11000",
+        "--ahb-base", "0x08000000", "--yes",
+    )
+    assert code == EXIT_OK
+    assert "erased" in out
+    assert [op for op, _o, _s in target.applet_runs] == [6, 5], "64K middle + 4K tail"
+    payload = read_json(out_file)
+    assert payload["erase"]["spans_64k"] == 1
+    assert payload["erase"]["spans_4k"] == 1
+    assert payload["verify"] == "blank-full"
+
+
+def test_flash_program_at_offset_zero_warns_without_the_ivt_tag(run, target, tmp_path) -> None:
+    """Offset 0 is where the BootROM looks for the 0xD1 IVT tag; an image
+    without one still programs (as instructed) but the operator is told the
+    board will not boot from it."""
+    image = write_image(tmp_path, b"\x00" * 0x100, "no_ivt.bin")
+    code, out = run(
+        "flash", "program", str(image),
+        "--offset", "0x0", "--ahb-base", "0x08000000", "--yes",
+    )
+    assert code == EXIT_OK
+    assert "0xD1" in out
+    assert "Programming anyway" in out
+
+
+def test_flash_program_at_offset_zero_reports_the_ivt_in_place(run, target, tmp_path) -> None:
+    image = write_image(tmp_path, b"\xd1\x01\x00\x60" + b"\x00" * 0xFC, "blob.bin")
+    code, out = run(
+        "flash", "program", str(image),
+        "--offset", "0x0", "--ahb-base", "0x08000000", "--yes",
+    )
+    assert code == EXIT_OK
+    assert "boot IVT in place" in out
+
+
+def test_flash_read_dumps_the_window_into_a_file(run, target, tmp_path) -> None:
+    for i in range(4):
+        target.flash[0x0030_0000 + i * 4] = 0x1122_3344 + i
+    dump = tmp_path / "dump.bin"
+    code, out = run(
+        "flash", "read", "--offset", "0x300000", "--length", "0x20",
+        "--out", str(dump), "--ahb-base", "0x08000000",
+    )
+    assert code == EXIT_OK
+    data = dump.read_bytes()
+    assert len(data) == 0x20
+    assert data[:4] == (0x1122_3344).to_bytes(4, "little")
+    assert data[0x10:] == b"\xff" * 0x10, "unprogrammed flash reads erased"
+
+
+def test_flash_verify_passes_on_matching_content_and_exits_2_on_a_mismatch(
+    run, target, tmp_path
+) -> None:
+    content = bytes(range(64))
+    for i in range(0, 64, 4):
+        target.flash[0x0030_0000 + i] = int.from_bytes(content[i : i + 4], "little")
+    match = write_image(tmp_path, content, "match.bin")
+    code, out = run(
+        "flash", "verify", str(match),
+        "--offset", "0x300000", "--ahb-base", "0x08000000",
+    )
+    assert code == EXIT_OK
+    assert "verify passed" in out
+
+    mismatch = write_image(tmp_path, b"\x00" * 16, "mismatch.bin")
+    code, out = run(
+        "flash", "verify", str(mismatch),
+        "--offset", "0x300000", "--ahb-base", "0x08000000",
+    )
+    assert code == EXIT_TOOL_ERROR
+    # Byte 0 matches (both are 0x00); the first real difference is byte 1.
+    assert "verify mismatched at flash offset 0x00300001" in out

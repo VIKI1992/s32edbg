@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .dap import gates
 from .dap import m33 as m33_mod
 from .dap import runcontrol
 from .errors import S32EError
@@ -59,6 +60,15 @@ class DebugSession:
     #: Cores whose comparators were sanitised already (guide §5.7) -- once per
     #: core per session. M33 cores are prefixed "m33:".
     sanitized: set[str] = field(default_factory=set)
+    #: R52 cores with a `core catch` MDM EDBGREQ latch armed and not yet
+    #: converted. A latch that outlives the session breaks the application's
+    #: own core release (Finding 7), so restore() drops these first.
+    edbgreq_armed: set[str] = field(default_factory=set)
+    #: Stop-the-world mode (`sync on`): the guide-§5.9 cross-halt group is
+    #: armed across the usable cores, bare halt/continue act on the whole
+    #: group, and restore() disarms it -- a session must not leave the chip
+    #: in a mode where any halt stops the application everywhere.
+    sync: bool = False
 
     # -- recording helpers, called from the CLI command bodies ---------------
 
@@ -104,6 +114,18 @@ class DebugSession:
     def note_m33_wp_cleared(self, core: str, index: int) -> None:
         self.m33_wp_set.discard((core, index))
 
+    def note_core_reset(self, name: str) -> None:
+        """One R52 core was reset under this session -- the application cycling
+        a core's RGM reset (core0's firmware releasing core1, or a `catch`
+        converting). A core-local cold reset wipes that core's comparators and
+        re-sets its OS lock (guide §3.6), so every session record about it now
+        describes state the reset already destroyed: forget them, and let the
+        next touch re-unlock and re-sanitise (guide §5.7)."""
+        self.halted_r52.discard(name)
+        self.bp_set = {(c, n) for c, n in self.bp_set if c != name}
+        self.wp_set = {(c, n) for c, n in self.wp_set if c != name}
+        self.sanitized.discard(name)
+
     def note_system_reset(self) -> None:
         """A flow (`load`) reset the whole SoC under this session.
 
@@ -123,6 +145,9 @@ class DebugSession:
         self.m33_bp_set.clear()
         self.m33_wp_set.clear()
         self.sanitized.clear()
+        # `load` arms and clears every R52 latch itself (loader P1/P5), so any
+        # catch bookkeeping now describes latches the flow already dropped.
+        self.edbgreq_armed.clear()
 
     # -- restore-on-close ----------------------------------------------------
 
@@ -174,6 +199,38 @@ class DebugSession:
                 notes.append(f"cleared watchpoint {index} on {name}")
             except S32EError as exc:
                 notes.append(f"could not clear watchpoint {index} on {name}: {exc}")
+
+        # Sync before the resumes: with the cross-halt group armed, a halted
+        # core's DBGTRIGGER level would swallow every single-core restart
+        # attempted below.
+        if self.sync:
+            usable = [
+                c for c in (self.cores or []) if not runcontrol.identity_problems(c)
+            ]
+            try:
+                runcontrol.set_cross_trigger(self.dap, usable, False)
+                notes.append("disarmed the cross-trigger sync group")
+            except S32EError as exc:
+                notes.append(f"could not disarm the sync group: {exc}")
+            self.sync = False
+
+        # Armed catch latches next, still before any resume: a latch that
+        # outlives the session halts the core the moment the application (or
+        # this restore) releases or resumes it -- the Finding 7 failure.
+        for name in sorted(self.edbgreq_armed):
+            core = core_by_name.get(name)
+            if core is None:
+                notes.append(f"could not drop the catch latch for {name}: never discovered")
+                continue
+            try:
+                rtu, index = runcontrol.core_rtu_index(core)
+                gates.clear_r52_edbgreq(self.dap, rtu, index)
+                notes.append(
+                    f"dropped the armed catch latch for {name} (a stale latch "
+                    "breaks the application's own core release -- Finding 7)"
+                )
+            except S32EError as exc:
+                notes.append(f"could not drop the catch latch for {name}: {exc}")
 
         for name in sorted(self.halted_r52):
             core = core_by_name.get(name)

@@ -867,6 +867,52 @@ core's debug request, so one core stopping stops them all — a coherent multico
 **off by default and single-core halts deliberately do not propagate**; `CTIGATE` is cleared for the
 single-core channels so an ordinary halt cannot disturb anything else.
 
+Inside a `debug` session, prefer the stateful form: **`sync on`** arms the same group *and*
+teaches the session about it — bare `halt` waits for the partners to stop with the group, bare
+`continue` restarts the whole group on one pulse (with the beyond-guide teardown that masks the
+halted cores' level requests for the restart window — §5.9 never says how to restart under an
+armed group), `step` steps one core while the others stay halted, and `quit` disarms. A raw
+`xtrigger on` gives the session none of that and survives the session's close.
+
+### `core catch` — halt a core at its first instruction when the *application* releases it
+
+`reset-halt` (below) owns a core across a **debugger-driven** reset. `catch` is its counterpart
+for the release the debugger does not perform: on this application core0's firmware releases
+rtu0.1 at runtime (`BrsHwEarlyInitPowerOn` — it asserts core-1 reset first, then releases), and
+`catch` stops core1 at instruction 0 of that release. The whole dual-core wiped-flash session:
+
+```bat
+s32edbg --speed 16000 debug
+s32edbg[-]> load C:\br1_rear_ecu\build\bin\br1_rear.elf
+s32edbg[rtu0.0]> catch --core rtu0.1
+s32edbg[rtu0.0]> continue                      :: core0 boots; its firmware releases core1
+s32edbg[rtu0.0]> catch --core rtu0.1 --wait    :: core1 caught at its first instruction
+s32edbg[rtu0.0]> use rtu0.1
+s32edbg[rtu0.1]> regs
+s32edbg[rtu0.1]> bp set 0x...
+s32edbg[rtu0.1]> continue
+s32edbg[rtu0.1]> quit
+```
+
+**Mechanism.** The catch arms the core's **MDM EDBGREQ latch** — a level debug request in the
+MDM-AP, which survives the core's own cold reset. That property is the whole choice: the
+application asserts core-1's reset before releasing it, and a core-local cold reset wipes
+`EDECR` — so the architected `EDECR.RCE` reset catch cannot survive an application-driven
+release (the guide's §5.10 covers only debugger-driven releases; gap surfaced in the test
+plan). The latch halting a core on the application's own release is measured silicon behaviour:
+test-plan Finding 7, discovered as a bug, used here as the feature.
+
+**The hold is not yet Debug state.** An EDBGREQ-held core reads `EDPRSR.HALTED` without being
+architecturally halted — registers refuse, and dropping the latch would resume it. `catch
+--wait` converts: unlock (the cold reset re-set the OS lock), a real acknowledged CTI halt, drop
+the latch, re-sanitise the comparators the reset wiped. Any write command (`bp set`, `halt`)
+against a fired catch converts automatically first.
+
+**Safety contract.** Arming without `--wait` needs a `debug` session, because `quit` drops every
+unfired latch — a latch left behind halts core1 on the next boot's release with nobody attached,
+which is exactly Finding 7. Standalone `catch --wait` drops the latch itself on timeout;
+`catch --disarm` drops it on demand.
+
 ### `core reset-halt` — own a core from its first instruction
 
 ```bat
@@ -971,9 +1017,18 @@ Four things handled for you, each of which silently produces a comparator that n
   watched address.
 - **Every write is verified by read-back.** Comparator writes that read back as zero are the classic
   sign that invasive debug is not actually authorised.
+- **Halting debug (`EDSCR.HDE`) is enabled by both `bp set` and `wp set`.** With HDE clear the
+  event routes to self-hosted handling: the comparator arms, reads back perfectly, and never
+  halts anything (guide §5.2 item 3 — measured for breakpoints; watchpoints carry the same fix).
+
+Arming while the core is running prints an advisory (guide §5.7/§5.8): comparator changes are
+only guaranteed visible after a context synchronization event, so halt first when it matters —
+though arming-while-running has fired on this silicon.
 
 Free slots are shown as well as used ones, because *"how many are left"* is the question that
-matters when a breakpoint cannot be inserted.
+matters when a breakpoint cannot be inserted. On a core that is OS-locked or still held in
+reset, `bp/wp list` names the reason (and the fix) instead of leaving per-slot read errors
+unexplained.
 
 ---
 
@@ -1074,7 +1129,14 @@ session closed
 Inside the prompt every normal command works, minus the global options — `bp set …`, `wp list`,
 `mem read 0x00410FF0`, `m33 halt --core smu`, `gates status`. The focused core (set with
 `--core` or `use <name>`) is the default target, and the bare aliases `halt`, `resume`
-(`continue`), `step`, `regs`, `reg`, `status`, `unlock`, `sample` and `reset-halt` act on it.
+(`continue`), `step`, `regs`, `reg`, `status`, `unlock`, `sample`, `reset-halt` and `catch`
+act on it.
+
+**`sync on|off|status`** is the stop-the-world switch for software-coupled cores (this
+application's pair deadlocks when one core halts alone — see the `core` section). Armed: any
+halt, manual or a breakpoint hit on either core, stops both; bare `continue` restarts both on
+one pulse; a breakpoint hit noticed later is taken into the session's ownership so close
+resumes everything. `quit` always disarms.
 
 **Closing restores the target.** On `quit`, end of piped input, or Ctrl-C at the prompt, the
 breakpoints and watchpoints the session set are cleared *first*, then the cores the session
@@ -1169,10 +1231,121 @@ first — the J-Link DLL's WriteMem has a ~4 MB budget per connection (test-plan
 fresh one per load keeps every load at full speed. The reopen's connect pulse lands moments
 before the load's own SoC reset, so it costs a couple of seconds and disturbs nothing.
 
+**On a blank-flash board, `attach` first.** With nothing bootable the BootROM fail cascade
+escalates the longer it runs, and its resets race the load's bring-up — measured as partition
+polls dying with every later read displaced, and once as WriteMem wedging on a fresh connection
+(test-plan Finding 13). `s32edbg attach` stops the cascade under a held functional reset; the
+load's own quiesce then starts from a quiet SoC. Starting within seconds of a power cycle works
+too; starting minutes into the cascade is the failure mode.
+
 **This resets the whole SoC.** Everything running stops; every core reboots. The image must be
 linked for the RTU0 RAM windows (DataRAM `0x3178_0000`+, extended `0x3180_0000`+, CodeRAM
 `0x3210_0000`+); an ELF whose LMAs fall outside — a flash-linked image — is refused before a
 single write.
+
+---
+
+## `flash` — the external QSPI NOR
+
+Program, erase, verify, read back and identify the 32 MiB Macronix MX25UW25A45G the SoC boots
+from. This is the s32multitool raw-QSPI route ported onto this tool's transport stack — same
+registers, same values, same applet, different plumbing. `s32edbg/data/qspiflash.py` carries
+every number with its citation into the reference sources.
+
+```bat
+s32edbg flash jedec
+s32edbg flash program s32e2xx_bootloader_M33_BLOB.bin --offset 0x0 --yes
+s32edbg flash program C:\br1_rear_ecu\build\bin\br1_rear.elf --area app --yes
+s32edbg flash verify s32e2xx_bootloader_M33_BLOB.bin --offset 0x0
+s32edbg flash read --offset 0x300000 --length 0x10000 --out dump.bin
+s32edbg flash erase --area app --yes
+s32edbg flash erase --all --yes
+```
+
+**How it works.** The QuadSPI_0 controller at `0x42320000` is driven by direct register writes
+(PLL, MC_CGM muxes, 19 SIUL2_4 pads, then the NXP controller sequence with its DLL-lock poll),
+followed by the raw-ops touch-up that **forces `SFACR = 0`** — S32DS leaves `0x00010803` there,
+which silently rewrites the flash offset the controller emits and aliased multi-page programs on
+the reference bench (NXP AN13563). Every program/erase/buffered-read then runs inside a vendored
+2 KiB Cortex-M33 RAM applet on the SMU (`bootcfg_raw_qspi_m33_applet.bin`, SHA-256-pinned,
+toolchain-locked, never rebuilt): arguments in r0–r3, terminates in `bkpt #0`, rc in r0, and on
+failure a 28-word status mailbox is decoded into the error. Chip erase (`--all`) alone is
+host-driven — WREN, the slot-0 `CHIP_ERASE` command, then an RDSR WIP poll that may legitimately
+run minutes. Reads and verify go through the memory-mapped AHB window; verify is byte-exact —
+no CRC anywhere in the chain, same as the reference.
+
+Every subcommand first quiesces the SoC the same way `load` does — fresh probe connection
+(Finding 9), LADDER-1, a functional reset with every debug request latched, every reachable M33
+pinned by its own DHCSR — then clears the M33 EDBGREQ latches (`MDM CONTROL[10:8]`; left set,
+the SMU re-halts the instant it is resumed into the applet) and proves the memory AP actually
+serves the controller and the applet RAM before anything destructive. Destructive commands also
+gate on the JEDEC identity first: anything but `0xC23989C2` is refused unless `--force-jedec`.
+
+**Destinations are always explicit** — `--offset 0x...` or a named `--area` from the reference
+project's `flash_address_sets.json`; there is no default:
+
+| `--area` | offset | size | |
+|---|---|---|---|
+| `blob` | `0x000000` | 2 MiB | the bootloader BLOB with its IVT at offset 0 |
+| `bl` | `0x002000` | ~1 MiB | BL Area |
+| `shared` | `0x100000` | 8 KiB | Shared Flash |
+| `selftest` | `0x1DC000` | 16 KiB | SelfTest Area |
+| `sysimg` | `0x1E0000` | 128 KiB | SysImg Area |
+| `selftestbck` | `0x1FC000` | 16 KiB | SelfTestBck Area |
+| `app` | `0x300000` | 6 MiB | Application Area |
+| `cert` | `0xA00000` | 20 KiB | Cert Area |
+
+**Inputs.** A `.bin` is written verbatim at the offset — the s32multitool contract: the image
+already carries whatever IVT/headers it needs, and this tool invents none. An ELF (detected by
+magic, `--format bin` overrides) is **flattened LMA-relative** first: one contiguous image from
+its lowest LMA, gaps filled `0xFF`, then written verbatim like any `.bin`. `br1_rear.elf`
+flattens to a ~5.8 MiB span that fits `--area app`, but only ~3.5 MiB of it actually programs,
+because erase-before-write is unconditional and all-`0xFF` 256-byte pages are skipped — erased
+NOR already reads `0xFF` (`--no-skip-blank` to program them anyway; the full verify covers the
+skipped pages either way).
+
+**Programming for normal boot needs more than the image.** The M33 bootloader starts the app
+only when the app-valid flag `0x55AA55AA` sits at flash `0x100000`, the app is laid out
+flash-`0x300000`-equals-RAM-`0x32100000`, and the BLOB is at 0 — the whole contract, the
+ordering discipline (flag last), and the exact commands are in **`docs/app-boot-contract.md`**.
+
+**Programming at offset 0** is how a board gets its bootloader: byte 0 must be the BootROM IVT
+tag `0xD1`, and the tool warns before writing an image that lacks it, and confirms it in place
+after the verify. If a program at offset 0 *fails partway*, do not power-cycle: the flash is now
+half-written, and a blank/corrupt boot flash escalates the BootROM failure cascade. Keep the
+session, re-run `flash program`, and see `docs/virgin-board.md` for the `attach` foothold if the
+board does reboot into the cascade.
+
+**Try the scratch offset first on a new setup.** Everything Tier-2 here is unproven at the bench
+(test-plan u-f1..u-f9: which AP reaches what, the real AHB window base, ReadMem's rc convention
+and budget…). The acceptance sequence exercises `0x300000` (the app area — no bootloader there)
+before anything touches offset 0, and so should a first manual run.
+
+**Flags** (all subcommands): `--ap smu|axi|0x...` picks the memory AP for the whole flow
+(default: the SMU's AHB-AP — every address involved is an M33-view address); `--ahb-base 0x...`
+overrides the read-window base (default `0x0`, automatic one-time failover to `0x08000000` —
+the reference profile carries both); `--no-fast` disables the WriteMem/ReadMem fast paths (pure
+ADIv6, ~4 KB/s — the fast paths carry the same first-block-proof + sampled-cross-check + demote
+discipline as `load`); `--reset sda|pin|none` picks the quiesce mechanism (`none` attaches
+as-is — unproven while firmware may own the controller). `program`: `--verify full|sampled|none`
+(default full), `--no-skip-blank`. `erase`: `--length`, `--all`, `--no-verify` (skip the blank
+check). Destructive ops prompt unless `--yes`.
+
+**Power-cycle to boot what you flashed.** No flash subcommand resets into the new image on
+purpose: the reference project documents that a debug reset is not equivalent to the cold boot
+the BootROM needs. The SoC is left quiesced and halted; unplug/replug power when you want it to
+boot.
+
+**Inside `debug`** the whole group works as-is and each op reopens the probe connection first,
+exactly like `load` (Finding 9 — the applet plus a multi-megabyte payload rides the same ~4 MB
+WriteMem budget):
+
+```bat
+s32edbg debug
+s32edbg[-]> flash jedec
+s32edbg[-]> flash program br1_rear.elf --area app --yes
+s32edbg[-]> quit
+```
 
 ---
 
@@ -1384,9 +1557,11 @@ This is the right thing to attach to a bug report.
 been proven on silicon, what has only run against test doubles, and what has never been executed.
 
 ```
-pytest                              524 tests, no probe and no SEGGER install needed
+pytest                              713 tests, no probe and no SEGGER install needed
 pytest -m hardware -v -x            21 bench gates, in dependency order
 .\tools\bench-acceptance.ps1        the same sequence, with per-step JSON and wire-level logs
+.\tools\flash-state-matrix.ps1      debugging proven in every flash state (nothing / BL only /
+                                    BL+app / BL+app+flag / app only) -- see the test plan
 ```
 
 Run-control was built in five phases, each ending at a hardware checkpoint before the next began.
@@ -1495,24 +1670,31 @@ those. The CLI never calls `Dap.mem_*` directly.
 ```
 s32edbg/
   cli.py              click command groups
-  elf.py              minimal ELF32 reader for `load` (stdlib struct, PT_LOAD + entry only)
+  elf.py              minimal ELF32 reader for `load`/`flash` (stdlib struct; parse, flatten)
   transport/          base ABC, ctypes DLL, Commander subprocess, SVF/JTAGLoad, install discovery
   dap/                adiv6 (SELECT, power-up, MEM-AP), apmap, romtable, gates,
                       memaccess (bus policy), iface (protocol detection),
                       runcontrol (Cortex-R52), m33 (Cortex-M33),
-                      loader (the RAM-load flow: bring-up, SRAMC, segment writer)
+                      loader (the RAM-load flow: bring-up, SRAMC, segment writer),
+                      flasher (external QSPI NOR: controller bring-up, M33 applet ops)
   jtag/               tapseq (pure TMS/TDI vectors), tap, bscan
   data/               RM / ADIv6 / SoC-600 / TRM tables, each citing its source:
                       known_ids, expected_apmap, ladder1, bscan, swj,
                       coresight (shared component offsets), r52debug, m33debug,
                       a32 (just enough decode to step over a call),
-                      rtuboot (the verbatim MC_ME/RGM/SRAMC bring-up tables for `load`)
+                      rtuboot (the verbatim MC_ME/RGM/SRAMC bring-up tables for `load`),
+                      qspiflash (the verbatim QuadSPI/LUT/applet tables for `flash`)
+                      + the vendored, SHA-pinned M33 flash applet binary
   report/             rich + JSON rendering
 docs/
   system-debug-interface.md   how the interface is built, the switching sequences, the preamble
   test-plan.md                evidence table, bench procedure, open defects, handover
   virgin-board.md             getting a foothold on blank flash
+  app-boot-contract.md        what must be in flash (app flag, layout, order) for the
+                              M33 bootloader to boot the app; probe programming procedure
 tools/
   bench-acceptance.ps1        runs the hardware sequence, keeps the artifacts
-tests/                598 hardware-free tests, plus 21 bench gates behind `-m hardware`
+  flash-state-matrix.ps1      the flash-state × debugging matrix (S1..S5)
+  bench-lib.ps1               Invoke-Step/Hex, shared by both bench scripts
+tests/                713 hardware-free tests, plus 21 bench gates behind `-m hardware`
 ```

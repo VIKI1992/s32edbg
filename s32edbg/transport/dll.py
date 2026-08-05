@@ -254,6 +254,27 @@ class DllTransport(Transport):
         except TransportError:
             self._write_mem = None  # type: ignore[assignment]
 
+        # ReadMem: the flash flow's fast verify/read path. Same unverifiable-
+        # ABI caveat as WriteMem above, with a sharper return-convention
+        # hazard: the legacy JLINKARM_ReadMem convention returns the number of
+        # bytes NOT read (0 = complete), while other vintages return a status
+        # -- so a positive rc is ambiguous between "read n bytes" and "failed
+        # to read n bytes". Measured 2026-08-05 on this bench (V9.62 DLL, V13
+        # probe): every 4096-byte flash-window read returned exactly 1,
+        # consistently. Whether that rc accompanies a filled buffer is not
+        # knowable from the rc alone, so rc 0 and rc 1 are both accepted as
+        # success *candidates* only: the content is proven by the caller
+        # against independent ADIv6 reads (BulkReader's first-block-proof +
+        # sampling discipline), and a stale buffer under rc 1 fails that
+        # proof and demotes the fast path permanently -- the fail-safe is
+        # content-based either way.
+        try:
+            self._read_mem = self._fn("JLINK_ReadMem", "JLINKARM_ReadMem")
+            self._read_mem.restype = c_int
+            self._read_mem.argtypes = [c_uint32, c_uint32, c_void_p]
+        except TransportError:
+            self._read_mem = None  # type: ignore[assignment]
+
         # Halt/IsHalted: the fast path's state-sync with the DLL. SEGGER's kb
         # (Memory_accesses, the URL the DLL itself logs) documents that on
         # Cortex-R every WriteMem runs stop-mode -- halt + access + go --
@@ -468,21 +489,29 @@ class DllTransport(Transport):
 
     # ------------------------------------------------- bulk memory / reset --
 
-    def configure_axi_memory_ap(self) -> str:
-        """Register the AXI-AP with the DLL and select it for memory access.
+    def configure_memory_ap(self, ap_addr: int, ap_type: str = "AXI-AP", index: int = 0) -> str:
+        """Register a memory AP with the DLL and select it for WriteMem/ReadMem.
 
         Guide §7.2: `JLINK_CORESIGHT_AddAP()` is deprecated for SoC-600; the
         documented replacement is the command string, and
         `CORESIGHT_SetIndexAHBAPToUse` "specifies which AP index to use for
         memory access (ADIv6/SoC-600 support)". SEGGER documents these for
         ConfigTargetSettings() -- issuing them mid-session is not documented
-        either way, which is why the WriteMem fast path proves the routing
-        with a full independent read-back of its first block rather than
-        trusting this call. Returns whatever the DLL printed, for the note.
+        either way, and routing WriteMem through a *non-AXI* AP this way is
+        documented nowhere at all -- which is why every fast path proves the
+        routing with a full independent read-back of its first block rather
+        than trusting this call. Returns whatever the DLL printed, for the
+        note.
         """
-        out1 = self.exec_command("CORESIGHT_AddAP = Index=0 Type=AXI-AP Addr=0x01C20000")
-        out2 = self.exec_command("CORESIGHT_SetIndexAHBAPToUse = 0")
+        out1 = self.exec_command(
+            f"CORESIGHT_AddAP = Index={index} Type={ap_type} Addr=0x{ap_addr:08X}"
+        )
+        out2 = self.exec_command(f"CORESIGHT_SetIndexAHBAPToUse = {index}")
         return (out1 + " " + out2).strip()
+
+    def configure_axi_memory_ap(self) -> str:
+        """The `load` fast path's AP: the system AXI-AP at 0x01C20000."""
+        return self.configure_memory_ap(0x01C2_0000, "AXI-AP", 0)
 
     @property
     def can_block_write(self) -> bool:  # type: ignore[override]
@@ -509,6 +538,34 @@ class DllTransport(Transport):
                 f"JLINK_WriteMem(0x{addr:08X}, {len(data)}) returned {rc} -- "
                 "not an unambiguous success under either return convention"
             )
+
+    @property
+    def can_block_read(self) -> bool:  # type: ignore[override]
+        return self._lib is not None and self._read_mem is not None
+
+    def read_mem_block(self, addr: int, count: int) -> bytes:
+        """Pull a byte block through the DLL's own memory machinery.
+
+        ``rc`` 0 and 1 are success candidates (this bench's DLL answers 1 for
+        every flash-window read -- see the binding comment); anything else is
+        a TransportError the caller's fallback catches. The content is NOT
+        trusted here under either rc: the caller proves it against
+        independent ADIv6 reads, and that proof is what a stale buffer
+        fails. The DLL moves SELECT/CSW/TAR beneath the Dap object; callers
+        must invalidate those caches afterwards.
+        """
+        if self._read_mem is None:
+            raise UnsupportedOperation(
+                "this J-Link DLL does not export JLINK_ReadMem"
+            )
+        buf = (ctypes.c_uint8 * count)()
+        rc = int(self._read_mem(c_uint32(addr), c_uint32(count), ctypes.cast(buf, c_void_p)))
+        if rc not in (0, 1):
+            raise TransportError(
+                f"JLINK_ReadMem(0x{addr:08X}, {count}) returned {rc} -- not a "
+                "success under any known return convention"
+            )
+        return bytes(buf)
 
     @property
     def can_cpu_halt(self) -> bool:

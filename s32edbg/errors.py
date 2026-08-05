@@ -66,3 +66,14 @@ class LoadError(S32EError):
     read non-zero, the core never halted in the park loop, or the post-load
     verify mismatched.
     """
+
+
+class FlashError(S32EError):
+    """A step of the external-flash flow failed on the target.
+
+    The flash sibling of LoadError: the DAP access itself worked but the
+    flow's oracle failed -- a QSPI controller wait timed out, the JEDEC
+    identity was wrong or unreadable, the M33 applet returned a nonzero rc
+    (the decoded status mailbox travels in the message), or a verify read
+    back something other than what was programmed.
+    """

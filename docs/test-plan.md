@@ -48,6 +48,8 @@ proves the model was right. Neither substitutes for the other.
 | `core reg pc` / `dspsr` (write) | `test_doc_alignment.py` | round-tripped on a halted rtu0.1 | proven |
 | `m33 wp` | `test_doc_alignment.py` | programs and read-back verifies (RO ID masked); never seen to *fire* — SMU makes no stores near SP | partial |
 | `m33 reset-halt` | `test_doc_alignment.py` | **SYSRESETREQ takes no effect on this silicon** — no reset, core keeps running, command fails cleanly | **blocked** |
+| `load` | `test_loader.py`, `test_session.py`, `test_elf.py` | 3.6 MiB in 33.6 s at 16 MHz, fast path proven, app boots — see "The `load` flow" | proven (2026-08-04) |
+| `flash` (all subcommands) | `test_flash.py`, `test_cli.py`, `test_session.py` | never run on silicon — see "The `flash` flow" for the u-f1..u-f9 uncertainties and the bench procedure | **offline only** |
 
 **Three facts settled on silicon**, recorded here because they will otherwise be
 re-discovered the hard way:
@@ -177,15 +179,17 @@ Not stylistic. Each one has a consequence.
 pytest -q
 ```
 
-**292 tests, no probe required, no SEGGER install required.** The CLI tests
+**684 tests, no probe required, no SEGGER install required.** The CLI tests
 patch transport discovery precisely so they run on a machine that has never seen
 a J-Link.
 
 What it covers: ROM-table decoding, AP discovery and the RM Table 957 diff,
 ADIv6 DP/AP composition, MEM-AP byte lanes and the 1 KB auto-increment rule,
 the SVF emitter, the SWJ switching sequences, the diagnosis ranking, the
-Commander output parsers, and the whole CLI surface including the exit-code
-contract.
+Commander output parsers, the whole CLI surface including the exit-code
+contract, the `load` flow against the SyntheticTarget's MC_ME/SRAMC/EDBGREQ
+model, and the `flash` flow against its QSPI-controller + NOR + M33-applet
+model (see "The `flash` flow" for what that model enforces).
 
 What it cannot cover: anything about whether the *model* is right. The fakes
 answer the way the RM says silicon should. Every case where silicon disagreed —
@@ -265,6 +269,7 @@ pytest -m hardware -v -x
 | 8 | `attach` | held, `SYSFUNCREQ` set | See §9 on virgin boards. |
 | 9 | `release` | `SYSFUNCREQ` clear, board runs | If the DAP is unreachable, a power cycle clears the hold unconditionally. |
 | 9b | `load <app.elf> --verify` (with `-ElfPath`) | SRAMC witnesses read 0; every segment written and full-verified; rtu0.0 halted with PC = entry | See "The `load` flow" section below for the phase order and what each abort means. Resets the whole SoC by design. |
+| 9c | `flash jedec` → read → erase/program/verify at `-FlashScratch` (default `0x300000`, never offset 0 first) | JEDEC `0xC23989C2`; applet halts at bkpt with rc 0; pattern byte-exact after power-loss-free round trip | See "The `flash` flow" section below — u-f1..u-f9 are the uncertainties this step exists to settle; failures become Findings 10+. |
 | 10 | `bscan preamble --run-svf` | "Download successful. SVF ok" | A parser complaint usually means the 208-bit operand; the SVF path exists because the raw path cannot carry it. |
 | 11 | `bscan sample --bsr-length 64` | two captures agree | Disagreement means the target is not quiescent, or the capture is not stable. |
 | 12 | `report` | every section present | A section reporting an error is acceptable and by design — see below. |
@@ -1045,7 +1050,7 @@ stopped, and it did **not** come back when the core was resumed and the
 comparators cleared — both cores read "running (non-debug state)" while the
 application stayed stuck.
 
-The breakpoints guide §7.3 describes the mechanism: the other cores keep running
+The breakpoints guide §5.9 describes the mechanism: the other cores keep running
 and corrupt shared state, or spin on a lock the halted core holds. A functional
 reset (`attach` then `release`) restarted the application and CAN returned.
 
@@ -1441,3 +1446,382 @@ Two related updates riding along:
 - The retry-time `Halt()` resync tried first was measured ineffective
   against the budget wedge and removed; the block retry with a 25 ms pause
   stays, for the Finding 8 contention transients only.
+
+---
+
+## The `flash` (external QSPI NOR) flow — implemented 2026-08-05, offline-proven, bench pending
+
+`flash program / erase / verify / read / jedec` work the 32 MiB MX25UW25A45G
+on QuadSPI_0 — the boot flash. **Nothing in this section has run on silicon
+yet.** The offline suite proves the ported logic against an oracle model; the
+bench procedure below is what promotes it. Failures there become Findings 10+.
+
+### Sources
+
+The user-designated references (exclusive): the s32multitool project
+(`C:/s32multitool`) — its supported raw-QSPI route, i.e. the NXP flash-profile
+init script plus the `RawQspiMx25uw25a45g` driver and the vendored M33 applet —
+the example bootloader BLOB (`s32e2xx_bootloader_M33_v3.1.0_BLOB 1.bin`,
+same 1,907,168-byte format as the in-repo v3.2.0 golden fixture), and
+`br1_rear.elf`. Every register value, LUT halfword, timeout and region offset
+in `s32edbg/data/qspiflash.py` carries its citation into those sources; the
+applet binary is vendored byte-identical and SHA-256-pinned (toolchain-locked —
+S32DS 3.6.1 GCC 9.2 — never rebuilt).
+
+User decisions (2026-08-04): full command set; ELF inputs flattened
+LMA-relative with 0xFF gaps and written verbatim (no container/IVT invention);
+destinations always explicit (`--offset` or `--area` from
+`flash_address_sets.json`, no default). One deliberate divergence from the
+reference's *ordering*: the raw touch-up (MTO off, **SFACR=0** — the AN13563
+address-aliasing fix) runs before the first JEDEC read rather than after,
+because no S32DS `flash()` prepare runs underneath this tool and a cold
+controller needs MTO disarmed before its first IP command can be trusted. One
+divergence in *defaults*: blank-page skip is ON (the reference GUI defaults it
+off) — erase-before-write is unconditional, so a skipped all-0xFF page is
+indistinguishable from a programmed one, the full verify covers it either way,
+and the ~45% saving on br1_rear is what keeps staging inside the Finding-9
+WriteMem budget.
+
+### Phase order (the load-bearing constraints)
+
+F0 fresh DLL connection (Finding 9 — the applet plus payload ride the same
+budget as `load`) → LADDER-1 + halt every reachable M33 by DHCSR →
+reset-quiesce (assert functional reset, `arm_edbgreq`, release, wait deassert,
+re-halt the M33s) → **clear the M33 EDBGREQ latches** (`MDM CONTROL[10:8]`)
+*after* the DHCSR pin-down and verify the SMU stayed halted → AP preflight
+(controller MCR answers; applet RAM holds a written word) → controller init
+(PLL, MC_CGM, pads, QuadSPI + DLL-lock poll) → raw touch-up (SFACR=0) → mode
+detect (SPI RDID, OPI on an invalid answer) → slot-1 READ LUT (AHB window
+live) → JEDEC gate for destructive ops → per-op applet LUT loads + calls →
+byte-exact verify. No reset afterwards: power-cycle boots the image.
+
+**The EDBGREQ-clear ordering is a trap with a name.** `arm_edbgreq` latches
+the three M33 debug requests in MDM CONTROL[10:8]; resumed into the applet
+with any of them still set, the SMU re-halts before the first instruction
+with DFSR = "external debug request". The clear must come after the M33s are
+pinned by their own DHCSR (the latch is what was holding them), and the error
+path names `gates.clear_m33_edbgreq` when it sees that DFSR. Offline-proven
+both ways in `test_flash.py`.
+
+**Register discipline.** Every applet call saves r0-r3/lr/sp/msp/psp/xpsr/pc
+plus the packed CONTROL word (DCRSR selector 20) and restores them in a
+`finally` — a failed flash op leaves the SMU exactly as the session found it.
+The pc is written through DCRSR without bit 0 and EPSR.T is forced via the
+xpsr write (the reference sets `$pc = base|1` through GDB, which owns that
+convention — same end state; u-f4 confirms on silicon).
+
+### What the offline oracle enforces (tests/test_flash.py, conftest model)
+
+The SyntheticTarget's QSPI model is an oracle, not a recorder: programming
+ANDs words into a sparse NOR array (a missing erase corrupts the verify), the
+applet model refuses to run unless the physical LUT slots hold the opcodes the
+reference loads for each op (slot 0 = command, 2 = WREN, 3 = RDSR; erase rides
+slot 0), the AHB window answers only while slot 1 holds a READ sequence, LUT
+writes are discarded while LUTKEY/LCKCR is locked, chip erase requires WEL and
+answers WIP for three polls, and a latched EDBGREQ re-halts with DFSR=external
+instead of executing. 49 tests ride it, plus the CLI/session/elf additions and
+the golden BLOB/br1_rear pins (`S32EDBG_FLASH_BLOB` points the golden test at
+another BLOB of the same format).
+
+### Uncertainties u-f1..u-f9 — what only the bench can settle
+
+- **u-f1 AP reachability and the window base.** The reference reaches all
+  three address classes (controller `0x42320000`, applet RAM `0x2500xxxx`,
+  flash window) through its gta stack; this tool defaults everything to the
+  SMU AHB-AP `0x01C80000` with AXI `0x01C20000` as the alternative (`--ap`),
+  and probes before anything destructive. The window base is `0x0` in the
+  reference's raw path and `0x08000000` in its legacy service path — the tool
+  starts at `0x0` and fails over once, loudly. **Record the working map.**
+- **u-f2 WriteMem routed through an AHB-AP.** The fast write path issues
+  `CORESIGHT_AddAP Index=0 Type=AHB-AP` + `SetIndexAHBAPToUse` — undocumented
+  for this DLL vintage. The first-block full read-back proof plus sampled
+  cross-checks is the net; a lie demotes permanently (same discipline as
+  `load`, mirrored for reads).
+- **u-f3 ReadMem.** Newly bound export, no SDK header: rc convention unknown
+  (only rc==0 is accepted), and whether reads draw on the Finding-9 ~4 MB
+  budget is unmeasured — both directions currently count against a shared
+  3 MiB proactive ceiling, after which the flow continues on pure ADIv6.
+- **u-f4 the applet entry convention.** DCRSR pc write without bit 0 +
+  xpsr.T force, stacks at 0x25034000, CONTROL zeroed. Wrong-by-one here reads
+  as an instant HardFault/lockup instead of the bkpt halt — the DFSR check
+  will name it.
+- **u-f5 applet op timing.** Host-side deadlines are sized from datasheet
+  worst cases (60 s program / 120 s erase per call); the reference bench
+  measured ~9.5 s erase + ~35 s program + ~5.7 s read per MiB on its
+  transport. Compare, and re-size if this transport is slower.
+- **u-f6 a board left in OPI mode.** The SPI→OPI detection fallback is
+  offline-proven against the model; a real board whose firmware switched the
+  device to octal is the confirming case.
+- **u-f7 chip-erase duration.** The RDSR WIP poll allows 900 s (the
+  reference's own deadline). Record the real figure for this part.
+- **u-f8 images past the budget ceiling.** br1_rear stages ~3.5 MiB — right
+  at the 3 MiB proactive demotion line, so its tail may run at ADIv6 speed
+  (~4 KB/s). If bench shows that tail costing minutes, the designed follow-up
+  is an opt-in mid-flow reconnect between applet calls (risky with a
+  half-written offset 0, hence opt-in and bench-gated).
+- **u-f9 `--reset none` (attach mode).** Unproven while firmware may own the
+  QSPI controller — the reset-quiesce default exists precisely so nothing
+  else touches QSPI during the flow.
+
+### Tier-2 bench procedure (at `--speed 16000`, scratch first — never offset 0 first)
+
+1. `flash jedec` → mode + `0xC23989C2` (u-f1 partially: controller reachable).
+2. Preflight AP report — record which AP serves controller/RAM/window (u-f1).
+3. `flash read --offset 0x300000 --length 0x10000 --out dump.bin` (u-f3: rc
+   convention, budget effect; window base failover if any).
+4. `flash erase --offset 0x300000 --length 0x10000` → rc 0, DFSR = bkpt not
+   external, blank check passes (u-f4, the EDBGREQ clear).
+5. Scratch programs of 123 / 333 / 0x1234 bytes at `0x300000` → byte-exact
+   verify (padding, ragged tails; u-f7 timeouts).
+6. Fast-path proof block through the AHB-AP routing (u-f2) — demotion is the
+   acceptable failure mode, not corruption.
+7. 1 MiB program + verify, timed against the reference baseline (u-f5).
+8. OPI-state board, if one exists: detection fallback (u-f6).
+9. `flash erase --all` on a sacrificial board < 900 s (u-f7).
+10. BLOB at offset 0 → byte 0 reads 0xD1 → power cycle → the board boots.
+11. `flash program br1_rear.elf --area app` — the full-size image (u-f8).
+12. `--reset none` against a running application (u-f9) — expect trouble;
+    that is the point of the default.
+
+`tools/bench-acceptance.ps1` carries steps 1-5 as its `-FlashScratch` block
+(default `0x300000`; `-FlashBlobPath` adds the BLOB program as a gated step).
+
+### Bench results 2026-08-05 — first silicon run (V13 probe, V9.62 DLL, 16 MHz)
+
+Steps 1-4 of the procedure passed on target, after three findings, each fixed
+with an offline regression the same day. Artifacts in
+`bench-runs/20260805-flash/`.
+
+- `flash jedec` → **JEDEC 0xC23989C2, SPI mode**, 8.35 s end to end.
+- `flash read` 64 KiB at 0x300000 → real content (the programmed application:
+  Thumb-2 code) through **AHB window base 0x0 on the SMU AHB-AP** — u-f1's
+  window question answered; both the SMU AHB-AP and the AXI-AP reach the
+  controller and the applet RAM (preflight proven on both).
+- `flash erase --offset 0x300000 --length 0x10000` → **the applet ran**:
+  64 KiB erased in 2.93 s, terminating bkpt (DFSR = breakpoint), registers
+  restored, full blank check read 0xFF throughout — u-f4's entry convention
+  (DCRSR pc without bit 0 + xpsr.T force) proven.
+
+### Finding 10 — the SMU AHB-AP answers dead for ~0.5 s after the reset release (fixed 2026-08-05)
+
+The first `flash jedec` died re-halting the M33s right after the quiesce
+reset: every SMU identity register read zero — the AP answers, with nothing —
+then read perfectly on the next connect. Measured settle: **0.50 s** on every
+subsequent run. Fix: the bring-up polls SMU identity (up to 10 s) before the
+loud one-shot `halt_m33s`; the EDBGREQ latch has always already caught the
+core by the time the AP wakes. The CE APs stay dead after the reset (nothing
+brings their subsystems up any more) — best-effort by design. Offline: the
+`m33_dead_reads_after_reset` knob + a CLI regression.
+
+### Finding 11 — BootROM leaves the QSPI tree configured; the cold tables race the peripheral wake-up (fixed 2026-08-05)
+
+Three facts that changed `controller_init` into probe-first:
+
+1. **Warm is the common case.** BootROM boots from this flash, so after the
+   quiesce reset the controller usually answers RDID immediately (MCR read
+   0x010F004C). The init now probes with just the raw touch-up applied and
+   skips the PLL/pad/controller tables when a valid JEDEC answers.
+2. **The halt races BootROM.** One run in three caught the SoC before BootROM
+   configured QSPI (MCR 0x000F004C, RDID dead) — and the **full cold tables
+   then ran clean on silicon**, PLL writes included, and RDID answered. Both
+   paths are now silicon-proven.
+3. **Too-early PLL access faults; attached PLL access faults.** Immediately
+   after the reset release the PLL block at 0x40220000 faults for the
+   debugger on *both* APs (the same staggered-wake-up family as Finding 10 —
+   the cold path that ran clean had ~4 s of probe timeouts in front of it);
+   and with the application *running* (no quiesce, `mem read`), the block
+   faults too — the app's own XRDC configuration denies the debugger. Neither
+   affects the reset-first flow; recorded because both look like "XRDC denies
+   the PLL, full stop" and are not.
+
+### Finding 12 — this DLL's ReadMem: rc 1 always, and the answer depends on the registered AP routing (fixed 2026-08-05)
+
+`JLINK_ReadMem` returns **1** for every 4096-byte window read, on both
+routings. With the **SMU AHB-AP registered**, the buffer comes back filled
+with SEGGER's 0xAA poison — the first-block ADIv6 proof caught it
+(`DLL 0xAAAAAAAA, ADIv6 0xFFFFFFFF`) and demoted permanently, exactly the
+designed containment. With the **AXI-AP registered** (`--ap axi`), the same
+rc 1 accompanies *correct data* — the full first-block proof passed. So rc 1
+is accepted as a success candidate (rc ∉ {0, 1} stays a TransportError) and
+the content proof is the real gate, in both directions. Consequence for
+operators: **`--ap axi` is the fast configuration** for reads; the SMU-AP
+routing works but reads at ADIv6 speed (~1.3 KB/s through the window).
+
+### Finding 6, flash edition — the DLL resumes the SMU after fast-path bursts (fixed 2026-08-05)
+
+The first applet call died with S_REGRDY stuck clear: after the WriteMem
+staging burst the SMU was *running* again, despite the arm-time model sync
+that cured this for the R52 during `load`. The same resume was later caught
+after a fast **ReadMem** burst too. Fix: `m33.ensure_halted` — a single
+`C_DEBUGEN|C_HALT` DHCSR write, because `halt()`'s two-write §6.2 sequence
+would itself resume an already-halted core for the gap between its writes —
+re-pins the SMU after every fast burst (stage, window read, applet-buffer
+read), with a loud note when it actually caught the core running. Offline:
+the fake now asserts S_REGRDY only while halted, and a resuming-WriteMem
+target regression covers the flow.
+
+---
+
+## Dual-core RTU0: `catch` and `sync` — implemented 2026-08-05, offline-proven, bench pending
+
+The wiped-flash RAM-load workflow debugs rtu0.0; this pass makes rtu0.1 a
+first-class target too. Requirements set by the user (2026-08-05): per-core
+bp/halt/step/regs and watchpoints; catching rtu0.1 at its **first
+instruction** on the application's own release; opt-in stop-the-world
+(`sync`); the app-driven release kept as the default core-start policy.
+
+### What changed
+
+- **`core catch`** (+ session alias `catch`): arms the core's **MDM EDBGREQ
+  latch** and leaves it armed; the application's own release halts the core at
+  instruction 0 (Finding 7, measured as a bug, redeployed as the feature).
+  `--wait` converts the hold — an EDBGREQ hold is not architecturally Debug
+  state — via unlock → real acknowledged CTI halt
+  (`runcontrol.pin_down_edbgreq_hold`, hoisted from the loader) → latch drop →
+  re-sanitise. Write commands convert a fired catch automatically. Arm-only
+  requires a session; `restore()` drops unfired latches before any resume.
+  **EDECR.RCE was rejected by design**: the app asserts core-1 reset before
+  releasing it, and the cold reset wipes EDECR (measured class, §3.6).
+- **Session `sync on|off`**: arms the guide-§5.9 cross-halt group across the
+  usable cores and teaches the session: bare `halt` waits for the partners,
+  bare `continue` group-restarts with the **beyond-guide teardown**
+  (`suspend_cross_halt` masks each halted member's `CTIINEN0` channel-2 bit
+  for the restart window, then re-arms — chosen over gate-closing because it
+  kills both the CTM drive and the internal self-loop whichever the silicon
+  implements), `step` steps one core while the partners stay halted, a
+  breakpoint hit is detected on the next refresh and owned for restore, and
+  close disarms. `_acknowledge_halt` recognises the armed-group level source
+  and skips its deassert poll (it would time out by construction).
+- **`wp set` enables `EDSCR.HDE`** like `bp set` (guide §5.2 item 3 — without
+  it a watchpoint arms, reads back, never fires), and both warn when arming
+  against a running core (§5.7:610/§5.8:662).
+- **Held-in-reset is a stated reason** (`EDPRSR.R` in
+  `debug_registers_reachable`/`unlock`/`preflight_notes`); `bp/wp list` on a
+  locked core names `unlock`; a core the app cold-reset mid-session gets its
+  session records dropped and is re-unlocked/re-sanitised on next touch
+  (`DebugSession.note_core_reset`).
+- **SyntheticTarget** now models: the RGM assert edge as a core-local cold
+  reset (comparators + EDECR wiped, OS lock + R set, EDSCR faulting), MDM
+  EDBGREQ as a *level* that swallows restarts, and channel-2 cross-halt
+  propagation with the gate/self-loop semantics — 13 new offline tests ride
+  it (catch end-to-end, sync propagation/teardown/restore, the swallowed
+  naive restart).
+
+### Guide gaps surfaced (the guide file itself is not edited)
+
+1. **No coverage of application-driven core release.** §5.10 only describes
+   SDA-AP (debugger-driven) releases; whether any catch mechanism survives an
+   RGM release by another core is unstated. Resolved here empirically: the
+   MDM latch does (Finding 7), EDECR cannot (the app's own reset-assert wipes
+   it).
+2. **§5.9 gives no group-teardown-for-restart sequence.** With the halt group
+   armed, a halted member's DBGTRIGGER is a level that re-drives the channel
+   straight through CTIINTACK; the restart recipe never mentions it. The
+   CTIINEN-mask teardown implemented here is beyond-guide, with the rationale
+   recorded in `runcontrol.suspend_cross_halt`.
+3. **§3.6:297 cross-references §5.10.4, which does not exist** (the guide has
+   only 5.10.1-5.10.3).
+4. **§5.10.1/§3.6's SDARSTMASK claim is contradicted by this silicon**
+   (Finding 1: the mask lands, the debug state is wiped anyway, and a reset
+   taken with the mask set wedged the boot).
+5. **Nothing warns about halting one core of a *software*-coupled pair**
+   (spinlocks, the OS boot barrier) — only the hardware lockstep note
+   (§5.11). The measured deadlock (2026-08-01) is repo-only knowledge.
+
+Also fixed: nine stale guide citations in repo comments (§7.x/§6.1/§5.5/§5.6
+references re-pointed at the sections that actually carry the content —
+§5.2/§5.5/§5.7/§3.5/§3.3/§5.9).
+
+### Bench results 2026-08-05 — all items passed (V13 probe, wiped-flash board)
+
+Artifacts `bench-runs/20260805-flash/20-25*.txt`. The passing run (22) started
+seconds after a power cycle; runs 20/21/23 hit Finding 13 below first.
+
+1. **`bp set --core rtu0.1` while held** → the designed refusal with real
+   values: "held in reset (EDPRSR 0x000002AD) ... `core catch` arms a halt at
+   its first instruction". The preflight note printed too.
+2. **The catch, against the real application release**: armed → `continue` →
+   `catch --wait` converted instantly — **"rtu0.1 caught at its first
+   instruction -- halted: external debug request, PC 0x32100020"**, registers
+   all zero, mode Hyp/Thumb, OS lock cleared by the conversion. `continue`
+   released it and the app completed boot.
+3. **First-ever ch2 firing**: `sync on` → `halt` → "sync: rtu0.1 stopped with
+   the group", EDSCR external-debug-request on the partner. The old
+   "deliberately without letting it fire" line is retired.
+4. **Step under sync**: 0x321D5B98 → 0x321D5B9A, halting-step-normal, the
+   partner stayed halted. **Group restart under the armed channel**: "one
+   pulse released 2 core(s)" — the beyond-guide CTIINEN teardown works on
+   silicon.
+5. **`wp set` on the running core**: armed with the §5.7/§5.8 advisory, HDE
+   set by the wp path itself. A *fire* was not observed in the brief window
+   (0x32101300 not stored to at that moment) — partial, same class as the
+   M33 wp cell.
+6. **Finding-7 regression**: a fresh `load` + `continue` with catch never
+   armed → rtu0.1 released by core0's firmware and RUNNING (EDPRSR
+   0x000002A9, OS-locked as an untouched core should be). No stale latch.
+
+### Finding 13 — the blank-flash boot cascade races the debugger (rule: attach first)
+
+On a board with nothing bootable, the BootROM fail cascade escalates the
+longer it runs, and two distinct failures were measured against it:
+
+- **DP-state displacement mid-bring-up** (runs 20, 23): the load died at the
+  P3 `PRTN1_STAT.PCS` poll and *every subsequent AP read returned the same
+  displaced word* (EDPRSR reading EDSCR-shaped values, 0x4205xxxx
+  everywhere) — a cascade reset yanked the DP under the flow between the
+  connect and the load's own quiesce, and the displaced read alignment
+  persisted for the rest of the connection.
+- **WriteMem wedged on a fresh connection** (run 21): every block -1 in
+  microseconds from the first write — the Finding-9 *symptom* with none of
+  its budget *cause* — after the board had cascaded for hours. Probe-side
+  state, cured by the board power cycle (run 22 hit 111 KB/s again).
+
+**The rule**: on a blank-flash board, stop the cascade before debugging —
+`s32edbg attach` (holds functional reset; the load's own quiesce then starts
+from a quiet SoC — run 25 proven clean this way), or begin within seconds of
+a power cycle (run 22). The flash flows are naturally protected: their
+quiesce runs first thing. In the state-matrix battery, `load` runs after
+`flash jedec`, which leaves the SoC quiesced-halted — the same protection by
+ordering.
+
+---
+
+## The flash-state × debugging matrix — scripted, first run pending
+
+`tools/flash-state-matrix.ps1` proves "debugging works as it worked until
+now" in **every flash-content state** (user requirement, 2026-08-05). States
+per docs/app-boot-contract.md; transitions use the tool's own flash commands
+(incremental, S1→S5 in order; every transition is followed by a power-cycle
+prompt because a debug reset is not the cold boot the BootROM re-evaluates
+flash on):
+
+| state | flash content | setup transition | boot behaviour |
+|---|---|---|---|
+| S1 | nothing | `flash erase --all` | BootROM fail cascade; SMU AP dead at attach |
+| S2 | BL only | + BLOB at `0x0` | BL superloop on the SMU; R52s never released; **powers off after 10 idle minutes** |
+| S3 | BL + app, no flag | + ELF `--area app` | same as S2 — the flag gates the app start |
+| S4 | BL + app + flag | + `AA 55 AA 55` at `0x100000` | normal boot; app on rtu0.0 + rtu0.1 |
+| S5 | app only | erase `0x0..0x200000` (BL + flag; app survives) | same as S1 |
+
+Battery per state, observation before perturbation (`flash jedec` and `load`
+quiesce-reset the SoC and replace the state's runtime, so they run last):
+entry (`connect`, or `attach` as the cascade foothold on S1/S5) → `gates
+apply` + `apmap` (asserted) → `core list` / `m33 list` (**record cells**: the
+per-state core states are measured by the first run and pinned into the
+script's `-Check` blocks by a follow-up commit — record-then-pin) → one
+`debug` batch session sized to the state (S4: halt/regs/bp/wp/step/continue
+on **both** R52 cores, breakpoint at the RAM entry `0x32100020`; S2/S3:
+held-in-reset status wording recorded + the full SMU M33 battery, safe
+because the BL disabled the SBC watchdog; S1/S5: clean refusals only) →
+`flash jedec` (JEDEC `0xC23989C2` asserted in every state) → `load --verify`
+(asserted in every state — on S1/S5 it exercises the blank-flash tolerances,
+`smu_fatal=False` and the Finding-10 settle).
+
+Artifacts: `bench-runs\flashmatrix-<stamp>\<state>\NN-*.json/.log` plus
+per-state and top-level `summary.json` and a console transcript. The S2/S3
+observation phase is timestamped against the 10-minute window with a warning
+past 8 minutes. A full run ends with app-only flash (no bootloader) — restore
+per app-boot-contract §4. Failures and measured record-cells become findings
+numbered with Workstream A's.
+
+The next finding number is **14**.

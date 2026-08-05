@@ -170,3 +170,42 @@ def load(path: str | Path) -> tuple[Image, bytes]:
     except OSError as exc:
         raise ElfError(f"cannot read {p}: {exc}") from None
     return parse(blob, name=p.name), blob
+
+
+#: Refuse to flatten spans past this. No flat destination this tool serves is
+#: anywhere near it (the external flash is 32 MiB), and a stray LMA would
+#: otherwise turn into a multi-gigabyte allocation before anyone checks fit.
+FLATTEN_SPAN_LIMIT = 0x2000_0000
+
+
+def flatten(image: Image, blob: bytes, *, fill: int = 0xFF) -> tuple[int, bytes]:
+    """Pack every segment into one contiguous LMA-relative byte image.
+
+    Returns ``(base_lma, data)`` where ``data[addr - base_lma]`` is the byte
+    the ELF places at LMA ``addr`` and every gap between segments carries
+    ``fill``. This is what turns a RAM-linked ELF into the flat image the
+    external-flash flow writes verbatim at an offset. The 0xFF default is the
+    erased state of NOR flash: gap pages are skippable during programming and
+    indistinguishable from untouched flash afterwards.
+
+    The span (last end minus first LMA) can far exceed ``total_filesz`` when
+    the LMAs spread across memory windows; whether the span fits the
+    destination is the caller's check. ``parse`` already guarantees the
+    segments are paddr-sorted and non-overlapping, so the last segment ends
+    the span.
+    """
+    base = image.segments[0].paddr
+    span = image.segments[-1].end - base
+    if span > FLATTEN_SPAN_LIMIT:
+        raise ElfError(
+            f"{image.name}: the flattened span is 0x{span:X} bytes (LMA "
+            f"0x{base:08X}..0x{image.segments[-1].end:08X}), past the "
+            f"0x{FLATTEN_SPAN_LIMIT:X} sanity limit -- these LMAs do not "
+            "describe one flat destination"
+        )
+    data = bytearray([fill & 0xFF]) * span
+    for s in image.segments:
+        data[s.paddr - base : s.paddr - base + s.filesz] = blob[
+            s.offset : s.offset + s.filesz
+        ]
+    return base, bytes(data)

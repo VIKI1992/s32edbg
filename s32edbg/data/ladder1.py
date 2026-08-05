@@ -70,6 +70,14 @@ MDM_CONTROL_MSK_DBG_FAULT = 1 << 23  # mask debug faults to the FCCU
 #: CONTROL value the plugin asserts during its RAM-load reset: MSK_DBG_FAULT
 #: (bit 23), the three M33 EDBGREQ bits (10:8), plus bits 30:29.
 MDM_CONTROL_LOAD_ASSERT = 0x6080_0700
+
+#: CONTROL bits 10:8 -- the three M33 EDBGREQ latches (SMU + CE0/CE1) that
+#: MDM_CONTROL_LOAD_ASSERT raises. Which bit maps to which core is not
+#: documented in this repo's sources; the flash flow clears all three together,
+#: after every reachable M33 is pinned by its own DHCSR.C_HALT -- an EDBGREQ
+#: left latched re-halts the SMU the instant it is resumed into the flash
+#: applet (DFSR then reads "external debug request", not "breakpoint").
+MDM_CONTROL_M33_EDBGREQ_MASK = 0x0000_0700
 MDM_CONTROL2_EDBGREQ_RTU0_ALL = 0x000F_0000
 MDM_CONTROL3_EDBGREQ_RTU1_ALL = 0x000F_0000
 

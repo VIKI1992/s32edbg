@@ -53,6 +53,7 @@ from ..data.ladder1 import (
     MDM_CONTROL2_EDBGREQ_RTU0_ALL,
     MDM_CONTROL3_EDBGREQ_RTU1_ALL,
     MDM_CONTROL_LOAD_ASSERT,
+    MDM_CONTROL_M33_EDBGREQ_MASK,
     MDM_DEVARCH,
     MDM_DEVARCH_EXPECTED,
     MDM_IDR,
@@ -297,9 +298,31 @@ def clear_core_edbgreq(dap: Dap, core: int = 0, ap_base: int = AP_MDM) -> None:
     Debug state the request has served its purpose, and leaving it asserted
     would fight every later resume. RMW so the other cores' still-pending
     requests -- and the M33 bits in CONTROL -- stay as the flow left them.
+    The RTU0 shorthand of `clear_r52_edbgreq`.
     """
-    current = dap.ap_read(ap_base, MDM_CONTROL2)
-    dap.ap_write(ap_base, MDM_CONTROL2, current & ~edbgreq_bit(core))
+    clear_r52_edbgreq(dap, 0, core, ap_base)
+
+
+def arm_r52_edbgreq(dap: Dap, rtu: int, core: int, ap_base: int = AP_MDM) -> None:
+    """Latch one R52 core's external debug request (RMW), either RTU.
+
+    The `core catch` mechanism: armed ahead of time, the latch halts the core
+    the moment something releases it from reset -- measured 2026-08-04 firing
+    on the application's own core-1 release (Finding 7: there as the bug,
+    here as the feature). It lives in the MDM-AP, so unlike EDECR.RCE it
+    survives the core's own cold reset (guide §3.6; the app asserts core-1
+    reset first, which wipes EDECR). RMW keeps every other request bit.
+    """
+    reg = MDM_CONTROL2 if rtu == 0 else MDM_CONTROL3
+    current = dap.ap_read(ap_base, reg)
+    dap.ap_write(ap_base, reg, current | edbgreq_bit(core))
+
+
+def clear_r52_edbgreq(dap: Dap, rtu: int, core: int, ap_base: int = AP_MDM) -> None:
+    """De-assert one R52 core's external debug request (RMW), either RTU."""
+    reg = MDM_CONTROL2 if rtu == 0 else MDM_CONTROL3
+    current = dap.ap_read(ap_base, reg)
+    dap.ap_write(ap_base, reg, current & ~edbgreq_bit(core))
 
 
 def clear_all_r52_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
@@ -319,6 +342,23 @@ def clear_all_r52_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
     ):
         current = dap.ap_read(ap_base, reg)
         dap.ap_write(ap_base, reg, current & ~mask)
+
+
+def clear_m33_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
+    """Drop the three latched M33 debug requests (CONTROL[10:8], RMW).
+
+    `arm_edbgreq` raises them as part of MDM_CONTROL_LOAD_ASSERT, and unlike
+    the R52 nibbles they live in CONTROL itself, so `clear_all_r52_edbgreq`
+    deliberately leaves them alone. The flash flow must not: an EDBGREQ left
+    latched re-halts the SMU the instant it is resumed into the QSPI applet
+    (DFSR then reads "external debug request" instead of "breakpoint").
+    Which of bits 10:8 belongs to which core is not documented in this repo's
+    sources, so all three are cleared together -- callers pin every reachable
+    M33 with its own DHCSR.C_HALT first, and an unreachable CE is unclocked
+    and cannot run anyway. MSK_DBG_FAULT and the rest of CONTROL are kept.
+    """
+    current = dap.ap_read(ap_base, MDM_CONTROL)
+    dap.ap_write(ap_base, MDM_CONTROL, current & ~MDM_CONTROL_M33_EDBGREQ_MASK)
 
 
 def assert_axi_safe(report: GateReport) -> None:

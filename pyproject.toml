@@ -15,6 +15,9 @@ s32edbg = "s32edbg.cli:entry"
 [tool.setuptools.packages.find]
 include = ["s32edbg*"]
 
+[tool.setuptools.package-data]
+"s32edbg.data" = ["*.bin"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["hardware: requires a J-Link probe attached to a powered S32E target"]

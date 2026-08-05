@@ -589,6 +589,13 @@ def preflight_notes(core: Core) -> list[str]:
             "EDSCR.STATUS and EDPRSR.HALTED disagree about whether this core is halted."
         )
 
+    if core.state.edprsr is not None and core.state.edprsr & r52.EDPRSR_R:
+        notes.append(
+            "the core is held in reset (EDPRSR.R) -- it has never been released, so "
+            "run-control and comparators cannot reach it yet. `core catch` arms a "
+            "halt at its first instruction for when something releases it."
+        )
+
     if _lock_note(ident.lsr) == "locked":
         notes.append(
             "the debug frame's software lock is engaged; writes will be ignored until "
@@ -610,7 +617,7 @@ class RunControlError(DapError):
 def unlock(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> list[str]:
     """Clear the locks that stop external debug reaching the core registers.
 
-    Two independent locks, in the order the breakpoints guide §5.5 gives:
+    Two independent locks, in the order the breakpoints guide §5.2 gives:
 
     * **The software lock** on the debug frame (``EDLAR``/``EDLSR``), which gates
       writes through this memory-mapped interface. Only touched when ``EDLSR``
@@ -655,6 +662,14 @@ def unlock(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> list[str]:
             "target's own software can clear that one; an external debugger cannot."
         )
 
+    if edprsr & r52.EDPRSR_R:
+        raise RunControlError(
+            f"{core.name}: the core is held in reset (EDPRSR 0x{edprsr:08X}) -- it has "
+            "never been released, so unlocking and comparator writes cannot reach it. "
+            "On this application core0's firmware performs the release; `core catch` "
+            "arms a halt at its first instruction."
+        )
+
     if edprsr & r52.EDPRSR_OSLK:
         # Writing 0 releases it. The write goes to OSLAR, which is writable even
         # while the lock it controls is set -- unlike everything the lock gates.
@@ -687,9 +702,9 @@ def unlock(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> list[str]:
 def enable_halting_debug(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> bool:
     """Set ``EDSCR.HDE`` so a debug event enters Debug state.
 
-    Guide §5.6: with halting debug disabled the event is routed to self-hosted
-    debug handling instead, so the core never stops and the debugger sees a halt
-    request that simply does nothing.
+    Guide §5.2 item 3: with halting debug disabled the event is routed to
+    self-hosted debug handling instead, so the core never stops and the debugger
+    sees a halt request that simply does nothing.
 
     Read-modify-write: EDSCR carries live status in the same word, so writing
     the bit alone would clobber it.
@@ -789,11 +804,28 @@ def _acknowledge_halt(
     the trigger matrix, the core was released and re-halted repeatedly, the PC
     moved between CLI commands, and the register-transfer path failed until the
     request was dropped.
+
+    One case legitimately never deasserts: with the cross-halt group armed
+    (``xtrigger``/``sync``), this halted core's own DBGTRIGGER is a **level**
+    driving channel 2 back into its debug request, straight through the
+    acknowledge -- an interaction guide §5.9 never addresses. Polling would
+    time out by construction, so the poll is skipped with the group-restart's
+    CTIINEN teardown (`suspend_cross_halt`) as the documented owner of
+    lowering it.
     """
     _write_checked(
         dap, ap_base, core.cti_base, r52.CTIINTACK, 1 << r52.TRIGOUT_DEBUG_REQUEST
     )
     _write_checked(dap, ap_base, core.cti_base, r52.CTIAPPCLEAR, 1 << r52.CHANNEL_HALT)
+    ch2 = 1 << r52.CHANNEL_CROSS_HALT
+    inen = _read_checked(
+        dap, ap_base, core.cti_base, r52.ctiinen(r52.TRIGIN_CROSS_HALT)
+    )
+    outen = _read_checked(
+        dap, ap_base, core.cti_base, r52.ctiouten(r52.TRIGOUT_DEBUG_REQUEST)
+    )
+    if inen is not None and outen is not None and inen & ch2 and outen & ch2:
+        return  # level-held by the armed group; the restart teardown lowers it
     deadline = time.monotonic() + timeout_s
     while True:
         status = _read_checked(dap, ap_base, core.cti_base, r52.CTITRIGOUTSTATUS)
@@ -818,7 +850,7 @@ def halt(
     **This stops the application running on that core**, and on this part the
     core's lockstep partner stops with it in hardware. Peripherals may or may not
     freeze with it -- the MDM-AP IP_DBG controls decide, and this tool does not
-    touch them, so a watchdog may keep counting and reset the board (guide §7.4).
+    touch them, so a watchdog may keep counting and reset the board (guide §3.5).
     """
     _prepare_cti(dap, core, ap_base=ap_base)
     enable_halting_debug(dap, core, ap_base=ap_base)
@@ -882,8 +914,8 @@ def _confirm_restart(
     running -- measured: resuming onto a breakpoint in an idle loop came back
     halted with EDSCR.STATUS changed from external-debug-request to breakpoint.
     Treating that as a failed resume reported a working breakpoint as a broken
-    resume, which is the guide's §7.5 case. SDR settles it either way: set
-    means the core left Debug state, whatever state it is in now.
+    resume -- the guide's §5.5 resume-past-a-breakpoint case. SDR settles it
+    either way: set means the core left Debug state, whatever state it is in now.
     """
     sdr_seen = False
     deadline = time.monotonic() + timeout_s
@@ -934,8 +966,58 @@ def resume(
     )
 
 
+def suspend_cross_halt(
+    dap: Dap, cores: list[Core], *, ap_base: int = AP_APB
+) -> list[tuple[int, int]]:
+    """Mask the §5.9 halt group's input on these cores; returns what to restore.
+
+    With the group armed, a halted core's DBGTRIGGER is a **level** driving
+    channel 2 -- straight through any acknowledge -- so its own restart would
+    be swallowed and the ack poll could never see the trigger deassert. The
+    guide's §5.9 restart recipe never addresses this; the sequence here is
+    beyond-guide, chosen as follows: masking ``CTIINEN0``'s channel-2 bit
+    kills both the internal self-loop and the CTM drive whichever of the two
+    the silicon implements, which is strictly stronger than closing the gate
+    (a gate only stops matrix propagation). Each (cti_base, previous CTIINEN0)
+    is returned for ``restore_cross_halt``.
+    """
+    saved: list[tuple[int, int]] = []
+    mask = 1 << r52.CHANNEL_CROSS_HALT
+    for c in cores:
+        inen = _read_checked(
+            dap, ap_base, c.cti_base, r52.ctiinen(r52.TRIGIN_CROSS_HALT)
+        )
+        if inen is None:
+            continue
+        saved.append((c.cti_base, inen))
+        if inen & mask:
+            _write_checked(
+                dap,
+                ap_base,
+                c.cti_base,
+                r52.ctiinen(r52.TRIGIN_CROSS_HALT),
+                inen & ~mask,
+            )
+    return saved
+
+
+def restore_cross_halt(
+    dap: Dap, saved: list[tuple[int, int]], *, ap_base: int = AP_APB
+) -> None:
+    """Re-arm exactly what ``suspend_cross_halt`` masked."""
+    for cti_base, inen in saved:
+        _write_checked(
+            dap, ap_base, cti_base, r52.ctiinen(r52.TRIGIN_CROSS_HALT), inen
+        )
+
+
 def resume_group(
-    dap: Dap, cores: list[Core], *, ap_base: int = AP_APB, timeout_s: float = 2.0
+    dap: Dap,
+    cores: list[Core],
+    *,
+    ap_base: int = AP_APB,
+    timeout_s: float = 2.0,
+    unarm_cross_halt: bool = False,
 ) -> dict[str, CoreState]:
     """Restart every halted core in ``cores`` on a single pulse (guide §5.9).
 
@@ -945,6 +1027,14 @@ def resume_group(
     restarts the whole group. The gate bits are closed again afterwards --
     whatever happens -- so a later single-core resume stays local, which is the
     tool's default posture.
+
+    ``unarm_cross_halt`` is the armed-group (``sync``) teardown: the halted
+    members' DBGTRIGGER levels are masked out of channel 2 first (see
+    ``suspend_cross_halt`` -- without this the group would swallow its own
+    restart) and re-armed in the ``finally``, after the restart gates close.
+    A member that instantly re-halts on a hot breakpoint then re-drives the
+    channel and stops the group again -- which is exactly what an armed group
+    is for.
     """
     halted = [
         c
@@ -957,7 +1047,10 @@ def resume_group(
     before: dict[int, int | None] = {}
     mask = 1 << r52.CHANNEL_RESTART
     results: dict[str, CoreState] = {}
+    saved_inen: list[tuple[int, int]] = []
     try:
+        if unarm_cross_halt:
+            saved_inen = suspend_cross_halt(dap, halted, ap_base=ap_base)
         for c in halted:
             state = read_state(dap, c.debug_base, ap_base=ap_base)
             before[c.debug_base] = (
@@ -988,7 +1081,48 @@ def resume_group(
         for c in halted:
             gate = _read_checked(dap, ap_base, c.cti_base, r52.CTIGATE) or 0
             _write_checked(dap, ap_base, c.cti_base, r52.CTIGATE, gate & ~mask)
+        restore_cross_halt(dap, saved_inen, ap_base=ap_base)
     return results
+
+
+def core_rtu_index(core: Core) -> tuple[int, int]:
+    """(rtu, core index) from DEVAFF0 -- the identity the latch registers use."""
+    aff = core.identity.affinity
+    if aff is None:
+        raise RunControlError(
+            f"{core.name}: DEVAFF0 did not read, so its RTU/core index cannot "
+            "be identified for the MDM latch registers."
+        )
+    return aff[1], aff[2]
+
+
+def pin_down_edbgreq_hold(
+    dap: Dap, core: Core, *, ap_base: int = AP_APB
+) -> CoreState:
+    """Convert an MDM-EDBGREQ hold into a stable, acknowledged CTI halt.
+
+    Measured 2026-08-04 (the load flow's Finding 6/7 companion): a core held
+    only by the MDM EDBGREQ reads EDPRSR.HALTED **without being architecturally
+    in Debug state** -- EDSCR.HDE is still clear from cold reset, the EDITR
+    register path refuses, and the moment the request is cleared the core
+    resumes. The caller must have unlocked the core first (the halt path
+    reads EDSCR, which faults under the OS lock -- guide §5.2); this then
+    issues the bench-validated CTI ``halt()`` (HDE, Debug-state confirm,
+    acknowledge), drops only *this core's* latch, and re-verifies the halt
+    survived the drop.
+    """
+    halt(dap, core, ap_base=ap_base)
+    rtu, index = core_rtu_index(core)
+    gates.clear_r52_edbgreq(dap, rtu, index)
+    state = read_state(dap, core.debug_base, ap_base=ap_base)
+    if state.halted is not True:
+        raise RunControlError(
+            f"{core.name} did not stay halted after the MDM EDBGREQ was "
+            f"cleared (EDSCR 0x{state.edscr or 0:08X}, EDPRSR "
+            f"0x{state.edprsr or 0:08X})"
+        )
+    core.state = state
+    return state
 
 
 def reset_halt(
@@ -1425,10 +1559,10 @@ def set_breakpoint(
 
     # **Arming a comparator does nothing unless halting debug is enabled.**
     # With EDSCR.HDE clear the debug event is routed to self-hosted handling
-    # instead, so the breakpoint reads back perfectly and simply never fires --
-    # the breakpoints guide lists exactly this under §7.2, "breakpoint is
-    # accepted but never hits". Measured: a comparator armed on a freshly
-    # unlocked core never fired, because only `halt()` had been setting HDE.
+    # instead, so the breakpoint reads back perfectly and simply never fires
+    # (guide §5.2 item 3: HDE is a prerequisite for breakpoint/watchpoint
+    # halting). Measured: a comparator armed on a freshly unlocked core never
+    # fired, because only `halt()` had been setting HDE.
     enable_halting_debug(dap, core, ap_base=ap_base)
 
     value, control = r52.encode_breakpoint(address, thumb=thumb)
@@ -1445,7 +1579,8 @@ def set_breakpoint(
             f"{core.name}: breakpoint {index} did not take. Wrote DBGBVR 0x{value:08X} / "
             f"DBGBCR 0x{control:08X}, read back 0x{back_value or 0:08X} / "
             f"0x{back_control or 0:08X}. Comparator writes reading back as zero is the "
-            "classic sign that invasive debug is not actually authorised (guide §6.1)."
+            "classic sign that invasive debug is not actually authorised "
+            "(guide §3.3, §9 pitfall 4)."
         )
     return {"index": index, **r52.decode_breakpoint(value, control)}
 
@@ -1453,7 +1588,7 @@ def set_breakpoint(
 def clear_breakpoint(dap: Dap, core: Core, index: int, *, ap_base: int = AP_APB) -> None:
     """Disable a comparator and blank it.
 
-    The guide §5.9 recommends clearing the value too, not just the enable bit,
+    The guide §5.7 recommends clearing the value too, not just the enable bit,
     before handing the target back -- a disabled comparator still holding an
     address is confusing to whoever looks next.
     """
@@ -1479,6 +1614,13 @@ def set_watchpoint(
             f"{core.name} implements {total} watchpoint comparators, so {index} is not "
             "one of them."
         )
+
+    # Same prerequisite as set_breakpoint (guide §5.2 item 3): with EDSCR.HDE
+    # clear the watchpoint event routes to self-hosted handling -- the
+    # comparator arms, reads back, and never halts anything. The breakpoint
+    # path learned this the measured way; the watchpoint path gets it here
+    # rather than at the bench.
+    enable_halting_debug(dap, core, ap_base=ap_base)
 
     value, control = r52.encode_watchpoint(address, size=size, on=on)
     ok = _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(index), 0)
@@ -1637,7 +1779,7 @@ def step(
     # restarted, before any instruction executes: the core comes back halted
     # with a breakpoint status and the PC unmoved. Measured exactly that --
     # `step` reported 0x321D2EE6 -> 0x321D2EE6. The breakpoints guide describes
-    # the remedy in §5.8: disable the comparator, step, re-enable it.
+    # the remedy in §5.5: disable the comparator, step, re-enable it.
     #
     # All of them are suspended rather than just the one matching the PC,
     # because finding the match needs the PC, which needs the register path,
@@ -1852,7 +1994,7 @@ def set_cross_trigger(
     single-core operation so an ordinary halt does not disturb anything else.
     Enabling cross-trigger is opting into the opposite.
 
-    Without this, the guide §7.3 case applies -- the other cores keep running and
+    Without this, the guide §5.9 case applies -- the other cores keep running and
     corrupt the state you stopped to inspect.
     """
     notes: list[str] = []
@@ -2019,9 +2161,10 @@ def preflight(core: Core, *, write: bool) -> list[str]:
     * **Identity anchors disagree.** A wrong base address does not fault -- it
       reads some other component. Writing a comparator into it would land
       somewhere unintended.
-    * **Invasive debug not granted**, for writes. The breakpoints guide §6.1
-      lists the symptom: "comparator writes fail or read back as zero". The
-      writes are accepted and do nothing, which is worse than being refused.
+    * **Invasive debug not granted**, for writes. The breakpoints guide (§3.3,
+      §9 pitfall 4) lists the symptom: "comparator writes fail or read back as
+      zero". The writes are accepted and do nothing, which is worse than being
+      refused.
 
     Everything else comes back as advisory notes.
     """
@@ -2048,8 +2191,8 @@ def preflight(core: Core, *, write: bool) -> list[str]:
             f"invasive debug is not granted on {core.name} (DBGAUTHSTATUS "
             f"0x{ident.authstatus or 0:08X}). Halting and comparator writes would be "
             "accepted and do nothing. This is the HSE/lifecycle authorisation the "
-            "breakpoints guide describes in section 6.1, not something this tool can "
-            "work around."
+            "breakpoints guide describes in §3.3 and §9 pitfall 4, not something "
+            "this tool can work around."
         )
 
     return preflight_notes(core)

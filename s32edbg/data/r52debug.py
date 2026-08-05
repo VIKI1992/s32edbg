@@ -258,6 +258,11 @@ def debug_registers_reachable(edprsr: int) -> tuple[bool, str | None]:
     """
     if edprsr & EDPRSR_DLK:
         return False, "the OS double lock is set"
+    if edprsr & EDPRSR_R:
+        # Before the OS-lock branch: a held core usually reads OSLK too, and
+        # "clear OSLAR" is the wrong advice while the core has never left
+        # reset -- nothing core-domain answers until something releases it.
+        return False, "the core is held in reset (never released)"
     if edprsr & EDPRSR_OSLK:
         return False, "the OS lock is set (clear OSLAR to release it)"
     if edprsr & EDPRSR_EDAD:

@@ -974,7 +974,7 @@ def test_the_halt_is_still_reported_as_halted_after_acknowledging() -> None:
 
 
 def test_arming_a_breakpoint_enables_halting_debug() -> None:
-    """The guide's §7.2 "breakpoint is accepted but never hits".
+    """The "breakpoint is accepted but never hits" failure (guide §5.2 item 3).
 
     With EDSCR.HDE clear the debug event goes to self-hosted handling instead,
     so the comparator reads back perfectly and simply never fires. Measured: a
@@ -987,6 +987,62 @@ def test_arming_a_breakpoint_enables_halting_debug() -> None:
     core = runcontrol.discover(dap)[0]
 
     runcontrol.set_breakpoint(dap, core, 0x3210_4A80)
+    assert target.mem[CORE0_DEBUG + r52.EDSCR] & r52.EDSCR_HDE
+
+
+def test_a_group_restart_under_an_armed_group_needs_the_teardown() -> None:
+    """The guide gap made executable: with the §5.9 group armed, the halted
+    members' DBGTRIGGER levels re-drive the halt channel straight through the
+    acknowledge, so a naive group restart is swallowed. `unarm_cross_halt`
+    (mask CTIINEN ch2 -> restart -> re-arm) is the beyond-guide teardown that
+    makes it work -- and the group is armed again afterwards."""
+    target = SyntheticTarget()
+    dap = Dap(target)
+    cores = runcontrol.discover(dap)
+    runcontrol.set_cross_trigger(dap, cores, True)
+    runcontrol.halt(dap, cores[0])  # the group stops both
+
+    with pytest.raises(runcontrol.RunControlError):
+        runcontrol.resume_group(dap, cores, timeout_s=0.2)  # naive: swallowed
+
+    results = runcontrol.resume_group(
+        dap, cores, timeout_s=0.5, unarm_cross_halt=True
+    )
+    assert set(results) == {"rtu0.0", "rtu0.1"}
+    ch2 = 1 << r52.CHANNEL_CROSS_HALT
+    assert target.mem[CORE0_CTI + r52.ctiinen(r52.TRIGIN_CROSS_HALT)] & ch2
+    assert runcontrol.read_state(dap, cores[0].debug_base).halted is False
+    assert runcontrol.read_state(dap, cores[1].debug_base).halted is False
+
+
+def test_an_armed_cross_halt_group_propagates_a_halt_in_the_model() -> None:
+    """The §5.9 input direction, modelled: with the group armed on both cores,
+    halting one drives channel 2 and the other enters Debug state with the
+    external-debug-request status -- the propagation that has never yet fired
+    on silicon, now pinned offline ahead of the bench."""
+    target = SyntheticTarget()
+    dap = Dap(target)
+    cores = runcontrol.discover(dap)
+    runcontrol.set_cross_trigger(dap, cores, True)
+
+    runcontrol.halt(dap, cores[0])
+
+    assert runcontrol.read_state(dap, cores[0].debug_base).halted is True
+    assert runcontrol.read_state(dap, cores[1].debug_base).halted is True
+    assert target.mem[CORE1_CTI + r52.CTITRIGOUTSTATUS] & (1 << r52.TRIGOUT_DEBUG_REQUEST)
+
+
+def test_arming_a_watchpoint_enables_halting_debug() -> None:
+    """Watchpoint parity with the breakpoint fix above (guide §5.2 item 3):
+    with HDE clear the comparator arms, reads back, and never halts anything.
+    The breakpoint path learned this at the bench; the watchpoint path gets
+    the same call here rather than the same bench day."""
+    target = SyntheticTarget()
+    target.mem[CORE0_DEBUG + r52.EDSCR] = r52.EDSCR_STATUS_RUNNING  # HDE clear
+    dap = Dap(target)
+    core = runcontrol.discover(dap)[0]
+
+    runcontrol.set_watchpoint(dap, core, 0x3178_0040)
     assert target.mem[CORE0_DEBUG + r52.EDSCR] & r52.EDSCR_HDE
 
 

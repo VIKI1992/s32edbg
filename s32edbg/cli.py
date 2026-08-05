@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from . import __version__
 from . import elf as elf_mod
 from .dap import adiv6
 from .dap import apmap as apmap_mod
+from .dap import flasher as flasher_mod
 from .dap import gates as gates_mod
 from .dap import iface as iface_mod
 from .dap import loader as loader_mod
@@ -26,6 +28,7 @@ from .dap import romtable
 from .dap import m33 as m33_mod
 from .dap import runcontrol
 from .dap.adiv6 import Dap
+from .data import qspiflash
 from .data import r52debug
 from .data import swj
 from .data.bscan import BSCAN_DEFAULT_IRLEN, BSCAN_PROBE_BITS
@@ -254,7 +257,9 @@ def main(ctx: click.Context, transport_kind: str, serial: str | None, speed_khz:
     reset-and-halt), and `debug`, a persistent session that holds one probe
     connection for a whole halt/step/resume workflow and restores the target
     when it closes. `load` writes a build's ELF straight into RTU0 RAM and
-    parks rtu0.0 halted at its entry -- the fast build/debug loop.
+    parks rtu0.0 halted at its entry -- the fast build/debug loop. `flash`
+    programs, erases, verifies and reads the external QSPI NOR through the
+    s32multitool-derived SMU-M33 applet route.
 
     First command on a freshly power-cycled board: `gates apply` -- the debug
     clocks are off by default (RM 135.11) and the enables are lost on power
@@ -1072,6 +1077,36 @@ def _discover_cores(ctx: Ctx, dap: Dap) -> list[runcontrol.Core]:
         # running that the previous session command had halted.
         for c in session.cores:
             c.state = runcontrol.read_state(dap, c.debug_base)
+            # A core this session already unlocked cannot legitimately read
+            # OS-locked or in-reset again except through a core-local cold
+            # reset (the application cycling its RGM reset -- guide §3.6:
+            # comparators wiped, OS lock back). The session's records about it
+            # describe a machine that no longer exists; drop them so the next
+            # touch re-unlocks and re-sanitises (§5.7).
+            if (
+                c.name in session.sanitized
+                and c.state.edprsr is not None
+                and c.state.edprsr & (r52debug.EDPRSR_R | r52debug.EDPRSR_OSLK)
+            ):
+                session.note_core_reset(c.name)
+                console.print(
+                    f"[yellow]![/yellow] {c.name} was reset since this session "
+                    "last touched it (identity cache kept; frame addresses are "
+                    "stable). Its session breakpoint/halt records were dropped; "
+                    "it will be re-unlocked and re-sanitised on next touch."
+                )
+            if (
+                session.sync
+                and c.state.halted is True
+                and c.name not in session.halted_r52
+            ):
+                # A hardware-initiated stop (a breakpoint hit propagated by
+                # the armed group) with nobody watching: take ownership so
+                # restore-on-close resumes everything sync stopped.
+                session.note_halted(c.name)
+                console.print(
+                    f"[dim]sync:[/dim] {c.name} halted by the cross-trigger group"
+                )
         return session.cores
 
     for note in _prepare_dap(dap, ctx=ctx):
@@ -1310,6 +1345,42 @@ def core_halt(ctx: Ctx, core_spec: str | None, all_cores: bool) -> None:
                 f"(EDSCR 0x{state.edscr or 0:08X}, EDPRSR 0x{state.edprsr or 0:08X})"
             )
             payload.append({"core": c.name, **state.as_dict()})
+
+        session = ctx.session
+        if session is not None and session.sync:
+            # The armed group propagates the halt in hardware; observe the
+            # partners into Debug state and take session ownership so the
+            # restore-on-close resumes everything sync stopped. Deliberately
+            # NOT acknowledged here: the requests are level-held by the armed
+            # group and only the group resume's teardown can lower them.
+            others = [
+                c
+                for c in cores
+                if c not in chosen and not runcontrol.identity_problems(c)
+            ]
+            stopped: list[str] = []
+            last: dict[str, runcontrol.CoreState] = {}
+            pending = {c.name: c for c in others}
+            deadline = time.monotonic() + 1.0
+            while pending and time.monotonic() < deadline:
+                for name, c in list(pending.items()):
+                    st = runcontrol.read_state(dap, c.debug_base)
+                    last[name] = st
+                    if st.halted is True:
+                        session.note_halted(name)
+                        stopped.append(name)
+                        del pending[name]
+                if pending:
+                    time.sleep(0.02)
+            if stopped:
+                console.print(
+                    f"[dim]sync: {', '.join(sorted(stopped))} stopped with the group[/dim]"
+                )
+            for name in pending:
+                if last.get(name) is not None and last[name].halted is False:
+                    console.print(
+                        f"[yellow]![/yellow] sync: {name} did not stop with the group"
+                    )
         if ctx.json_out:
             _emit_json(ctx.json_out, {"halt": payload})
 
@@ -1362,10 +1433,29 @@ def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool, sync: bool) ->
                 )
             payload.append({"core": name, **state.as_dict()})
 
-        if sync:
+        session = ctx.session
+        session_sync = session is not None and session.sync
+        if session_sync and core_spec is None and not all_cores:
+            # sync mode: a bare `continue` releases the whole stopped group,
+            # not just the focused core -- that is the mode's contract.
+            halted_usable = [
+                c
+                for c in cores
+                if not runcontrol.identity_problems(c)
+                and runcontrol.read_state(dap, c.debug_base).halted is True
+            ]
+            if halted_usable:
+                chosen = halted_usable
+
+        if sync or session_sync:
             for c in chosen:
                 runcontrol.preflight(c, write=True)
-            results = runcontrol.resume_group(dap, chosen)
+            # Under an armed group the halted members' DBGTRIGGER levels
+            # would swallow the restart; unarm_cross_halt is the teardown
+            # (mask CTIINEN ch2, restart, re-arm).
+            results = runcontrol.resume_group(
+                dap, chosen, unarm_cross_halt=session_sync
+            )
             console.print(
                 f"[dim]synchronized restart: one pulse released "
                 f"{len(results)} core(s)[/dim]"
@@ -1399,26 +1489,194 @@ def core_step(ctx: Ctx, core_spec: str | None, over: bool, count: int,
     lets the call run, so you do not step through the whole callee.
     """
     with _one_core(ctx, core_spec) as (dap, c):
-        if ctx.session is not None:
+        session = ctx.session
+        if session is not None:
             # The session now owns this core's run state: it is halted at the
             # end of every step, and restore-on-close should resume it.
-            ctx.session.note_halted(c.name)
-        for n in range(count):
-            before = runcontrol.read_pc(dap, c)
-            if over:
-                state, info = runcontrol.step_over(dap, c, mask_interrupts=mask_interrupts)
-                console.print(
-                    f"0x{before:08X}  {info['mnemonic']}  -> {info['action']}"
-                )
-            else:
-                state = runcontrol.step(dap, c, mask_interrupts=mask_interrupts)
-            after = runcontrol.read_pc(dap, c)
+            session.note_halted(c.name)
+        saved_sync: list[tuple[int, int]] = []
+        if session is not None and session.sync:
+            # A step is per-core by design; masking the armed group's inputs
+            # keeps the stepped core's restart from being swallowed by its
+            # halted partners' levels (and its own), and the partners stay
+            # halted through it.
+            usable = [
+                x for x in (session.cores or []) if not runcontrol.identity_problems(x)
+            ]
+            saved_sync = runcontrol.suspend_cross_halt(dap, usable)
             console.print(
-                f"[green]step {n + 1}[/green]  0x{before:08X} -> 0x{after:08X}  "
-                f"({r52debug.edscr_status_name(state.edscr or 0)})"
+                "[dim]sync: cross-halt masked for the step; the other cores "
+                "stay halted[/dim]"
             )
+        try:
+            for n in range(count):
+                before = runcontrol.read_pc(dap, c)
+                if over:
+                    state, info = runcontrol.step_over(dap, c, mask_interrupts=mask_interrupts)
+                    console.print(
+                        f"0x{before:08X}  {info['mnemonic']}  -> {info['action']}"
+                    )
+                else:
+                    state = runcontrol.step(dap, c, mask_interrupts=mask_interrupts)
+                after = runcontrol.read_pc(dap, c)
+                console.print(
+                    f"[green]step {n + 1}[/green]  0x{before:08X} -> 0x{after:08X}  "
+                    f"({r52debug.edscr_status_name(state.edscr or 0)})"
+                )
+        finally:
+            if saved_sync:
+                runcontrol.restore_cross_halt(dap, saved_sync)
         if ctx.json_out:
             _emit_json(ctx.json_out, {"core": c.name, "pc": f"0x{after:08X}"})
+
+
+@core.command("catch")
+@_core_option
+@click.option("--wait", is_flag=True,
+              help="Wait for the catch to fire, then convert the hold into a "
+                   "real acknowledged halt (arms first if needed).")
+@click.option("--timeout", "timeout_s", type=float, default=30.0, show_default=True,
+              help="How long --wait polls for the halt.")
+@click.option("--disarm", is_flag=True, help="Drop this core's armed latch instead.")
+@click.pass_obj
+def core_catch(
+    ctx: Ctx, core_spec: str | None, wait: bool, timeout_s: float, disarm: bool
+) -> None:
+    """Halt a core at its first instruction when something else releases it.
+
+    Arms the core's MDM EDBGREQ latch -- a level debug request that lives in
+    the MDM-AP and therefore survives the core's own cold reset. That is the
+    property EDECR.RCE lacks here: the application asserts core-1's reset
+    before releasing it (BrsHwEarlyInitPowerOn), which wipes EDECR (guide
+    §3.6; §5.10 covers only debugger-driven releases). The latch halting a
+    core on the application's own release is measured silicon behaviour --
+    Finding 7, there as the bug, here as the feature.
+
+    An EDBGREQ hold is NOT architecturally Debug state (registers refuse, and
+    dropping the latch would resume the core), so `--wait` polls for the halt
+    and CONVERTS it: unlock (the cold reset re-set the OS lock), a real
+    acknowledged CTI halt, drop the latch, re-sanitise (the reset wiped this
+    core's comparators). The typical wiped-flash session:
+
+    \b
+        load app.elf
+        catch --core rtu0.1
+        continue                     (core0 boots; its firmware releases core1)
+        catch --core rtu0.1 --wait   (core1 halted at its first instruction)
+    """
+    if wait and disarm:
+        raise click.ClickException("--wait and --disarm do not combine")
+    with open_transport(ctx) as (_t, dap):
+        assert dap is not None
+        cores = _discover_cores(ctx, dap)
+        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
+        runcontrol.preflight(c, write=True)
+        rtu, index = runcontrol.core_rtu_index(c)
+        session = ctx.session
+
+        if disarm:
+            gates_mod.clear_r52_edbgreq(dap, rtu, index)
+            if session is not None:
+                session.edbgreq_armed.discard(c.name)
+            console.print(f"[green]dropped[/green] the catch latch for {c.name}")
+            return
+
+        if session is None and not wait:
+            raise click.ClickException(
+                "arming a catch without waiting needs a debug session: an armed "
+                "latch left behind halts the core on the application's own "
+                "release with nobody there to convert it, and a stale latch is "
+                "exactly the Finding-7 failure. Open `s32edbg debug` and run "
+                "`catch` there, or use --wait."
+            )
+
+        armed_now = session is None or c.name not in session.edbgreq_armed
+        if armed_now:
+            doomed = sorted(
+                i for name, i in (session.bp_set | session.wp_set) if name == c.name
+            ) if session is not None else []
+            if doomed:
+                console.print(
+                    f"[yellow]![/yellow] {c.name} has session comparator(s) "
+                    f"{doomed} armed -- the application's cold reset of this "
+                    "core will wipe them before the catch fires."
+                )
+            gates_mod.arm_r52_edbgreq(dap, rtu, index)
+            if session is not None:
+                session.edbgreq_armed.add(c.name)
+            console.print(
+                f"[green]catch armed[/green] on {c.name} (MDM EDBGREQ latched)."
+            )
+            if not wait:
+                console.print(
+                    f"[dim]now `continue` the boot core; when the application "
+                    f"releases {c.name} it halts at its first instruction -- "
+                    f"then `catch --core {c.name} --wait` converts the hold.[/dim]"
+                )
+
+        if not wait:
+            return
+
+        fired = False
+        try:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                state = runcontrol.read_state(dap, c.debug_base)
+                if (
+                    state.edprsr is not None
+                    and state.edprsr & r52debug.EDPRSR_HALTED
+                    and not state.edprsr & r52debug.EDPRSR_R
+                ):
+                    fired = True
+                    break
+                time.sleep(0.02)
+        finally:
+            if not fired and session is None:
+                # Standalone invocation: nothing owns the latch after this
+                # process exits, so it must not outlive the wait.
+                gates_mod.clear_r52_edbgreq(dap, rtu, index)
+        if not fired:
+            hint = (
+                "the latch was dropped (no session to own it)"
+                if session is None
+                else "the latch stays armed -- the session close drops it, or "
+                     "`catch --disarm`"
+            )
+            raise click.ClickException(
+                f"{c.name} did not halt within {timeout_s:.0f}s; {hint}"
+            )
+
+        # Conversion. The core just came through its cold reset: the session's
+        # records for it describe wiped state, the OS lock is back, and the
+        # hold is not Debug state until the real halt lands.
+        if session is not None:
+            session.note_core_reset(c.name)
+        for note in runcontrol.unlock(dap, c):
+            console.print(f"[dim]{c.name}:[/dim] {note}")
+        state = runcontrol.pin_down_edbgreq_hold(dap, c)
+        if session is not None:
+            session.edbgreq_armed.discard(c.name)
+            session.note_halted(c.name)
+        _session_touch(ctx, dap, c)
+        try:
+            pc = runcontrol.read_pc(dap, c)
+            where = f"  PC 0x{pc:08X}"
+        except S32EError as exc:
+            pc = None
+            where = f"  (PC unreadable: {exc})"
+        console.print(
+            f"[green]{c.name} caught[/green] at its first instruction -- "
+            f"{r52debug.edscr_status_name(state.edscr or 0)}{where}"
+        )
+        if ctx.json_out:
+            _emit_json(
+                ctx.json_out,
+                {
+                    "core": c.name,
+                    "pc": f"0x{pc:08X}" if pc is not None else None,
+                    **state.as_dict(),
+                },
+            )
 
 
 @core.command("reset-halt")
@@ -1482,7 +1740,7 @@ def core_xtrigger(ctx: Ctx, state: str) -> None:
     With cross-trigger on, one core entering Debug state pulls the others in
     through the CTI matrix, so you get a coherent multicore snapshot. Without it
     the other cores keep running and can corrupt the state you stopped to look
-    at -- the breakpoints guide covers this in section 7.3.
+    at -- the breakpoints guide covers this in section 5.9.
 
     It is off by default and single-core halts deliberately do not propagate.
     """
@@ -1969,6 +2227,29 @@ def _attach_core(ctx: Ctx, dap: Dap, c: runcontrol.Core, *, write: bool = True) 
     """
     for note in runcontrol.preflight(c, write=write):
         console.print(f"[yellow]![/yellow] {c.name}: {note}")
+    session = ctx.session
+    if (
+        write
+        and session is not None
+        and c.name in session.edbgreq_armed
+        and c.state.edprsr is not None
+        and c.state.edprsr & r52debug.EDPRSR_HALTED
+        and not c.state.edprsr & r52debug.EDPRSR_R
+    ):
+        # A fired, unconverted `catch`: the EDBGREQ hold is not Debug state,
+        # registers refuse, and a resume against it would be swallowed --
+        # convert exactly as `catch --wait` would before the write proceeds.
+        console.print(
+            f"[dim]{c.name}:[/dim] a fired catch is holding this core; "
+            "converting it into a real acknowledged halt first"
+        )
+        session.note_core_reset(c.name)
+        for note in runcontrol.unlock(dap, c):
+            console.print(f"[dim]{c.name}:[/dim] {note}")
+        runcontrol.pin_down_edbgreq_hold(dap, c)
+        session.edbgreq_armed.discard(c.name)
+        session.note_halted(c.name)
+        c.state = runcontrol.read_state(dap, c.debug_base)
     if write and c.state.unreachable_reason:
         for note in runcontrol.unlock(dap, c):
             console.print(f"[dim]{c.name}:[/dim] {note}")
@@ -2004,10 +2285,43 @@ def bp() -> None:
 def bp_list(ctx: Ctx, core_spec: str | None) -> None:
     """Show every breakpoint comparator, programmed or not."""
     with _one_core(ctx, core_spec, write=False) as (dap, c):
+        _note_unreadable_comparators(c)
         entries = runcontrol.list_breakpoints(dap, c)
         emit.print_comparators(f"{c.name} breakpoints", entries, console)
         if ctx.json_out:
             _emit_json(ctx.json_out, {"core": c.name, "breakpoints": entries})
+
+
+def _note_unreadable_comparators(c: runcontrol.Core) -> None:
+    """Listing is read-only, so it never unlocks (that changes target state);
+    on a locked or held core the per-slot "did not read" rows below are
+    expected -- this note is what turns them into a stated reason."""
+    reason = c.state.unreachable_reason
+    if not reason:
+        return
+    hint = (
+        " Run `unlock` (or any write command, e.g. `bp set`) first."
+        if "lock" in reason
+        else ""
+    )
+    console.print(
+        f"[yellow]![/yellow] {c.name}: comparator registers will not read -- "
+        f"{reason}.{hint}"
+    )
+
+
+def _warn_comparator_arm_state(c: runcontrol.Core) -> None:
+    """Guide §5.7 (and §5.8 for watchpoints): program comparators while the
+    core is halted whenever possible -- the update needs a context
+    synchronization event to be guaranteed visible. Arming against a running
+    core has fired on this silicon, so this is a warning, not a refusal."""
+    if c.state.halted is not True:
+        console.print(
+            f"[yellow]![/yellow] {c.name} is not halted. The guide (§5.7/§5.8) "
+            "recommends programming comparators while the core is halted -- "
+            "the change needs a context synchronization event to be guaranteed "
+            "to take effect. It is armed; halt-first is the supported order."
+        )
 
 
 @bp.command("set")
@@ -2028,6 +2342,7 @@ def bp_set(ctx: Ctx, address: str, core_spec: str | None, index: int | None, arm
         entry = runcontrol.set_breakpoint(
             dap, c, target, index=index, thumb=not arm_state
         )
+        _warn_comparator_arm_state(c)
         if ctx.session is not None:
             ctx.session.note_bp(c.name, int(entry["index"]))
         console.print(
@@ -2074,6 +2389,7 @@ def wp() -> None:
 @click.pass_obj
 def wp_list(ctx: Ctx, core_spec: str | None) -> None:
     with _one_core(ctx, core_spec, write=False) as (dap, c):
+        _note_unreadable_comparators(c)
         entries = runcontrol.list_watchpoints(dap, c)
         emit.print_comparators(f"{c.name} watchpoints", entries, console)
         if ctx.json_out:
@@ -2097,6 +2413,7 @@ def wp_set(ctx: Ctx, address: str, core_spec: str | None, size: str, access: str
             )
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+        _warn_comparator_arm_state(c)
         if ctx.session is not None:
             ctx.session.note_wp(c.name, int(entry["index"]))
         console.print(
@@ -2141,6 +2458,7 @@ SESSION_ALIASES: dict[str, tuple[str, ...]] = {
     "unlock": ("core", "unlock"),
     "sample": ("core", "sample"),
     "reset-halt": ("core", "reset-halt"),
+    "catch": ("core", "catch"),
 }
 
 #: Commands that cannot run inside a session, and why the refusal is safety
@@ -2168,11 +2486,22 @@ def _print_session_help() -> None:
         "like `32169874` is rejected rather than guessed at.\n"
         "\n"
         "Aliases for the focused core: halt, resume/continue, step, regs,\n"
-        "reg, status, unlock, sample, reset-halt.\n"
+        "reg, status, unlock, sample, reset-halt, catch.\n"
+        "\n"
+        "`catch --core rtu0.1` arms a halt at that core's FIRST instruction\n"
+        "for when the application releases it; `catch --core rtu0.1 --wait`\n"
+        "converts the hold once it fires. `sync on` makes any halt stop all\n"
+        "cores together and bare `continue` restart them together; `sync off`\n"
+        "(or quitting) puts run-control back to per-core.\n"
         "\n"
         "`load <app.elf>` writes a build straight into RAM and parks rtu0.0\n"
         "halted at its entry (resets the whole SoC first) -- the fast\n"
         "build/debug loop. Then `bp set 0x...` and `continue`.\n"
+        "\n"
+        "`flash program <img> --offset 0x0|--area app`, `flash erase`,\n"
+        "`flash verify`, `flash read`, `flash jedec` work the external QSPI\n"
+        "NOR (each quiesces the SoC with a reset first; power-cycle to boot\n"
+        "the flashed image).\n"
         "\n"
         "Session builtins:\n"
         "  use <core>   focus a core (rtu0.0, rtu0.1, ... or smu/ce0/ce1)\n"
@@ -2215,6 +2544,51 @@ def _session_use(ctx: Ctx, args: list[str]) -> None:
     console.print(f"focus: {c.name}")
 
 
+def _session_sync(ctx: Ctx, args: list[str]) -> None:
+    """The `sync on|off|status` session builtin -- stop-the-world mode.
+
+    Armed, the guide-§5.9 cross-halt group makes ANY halt (manual or a
+    breakpoint hit) stop every usable core together, and a bare `continue`
+    releases the whole group on one pulse -- the mode for an application
+    whose cores are software-coupled (the measured pair-deadlock). Session
+    close disarms it whatever happens.
+    """
+    session = ctx.session
+    assert session is not None
+    if not args or args[0] not in ("on", "off", "status"):
+        console.print("usage: sync on|off|status")
+        return
+    if args[0] == "status":
+        console.print(f"sync: {'on' if session.sync else 'off'}")
+        return
+    want = args[0] == "on"
+    try:
+        cores = _discover_cores(ctx, session.dap)
+    except S32EError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        return
+    usable = [c for c in cores if not runcontrol.identity_problems(c)]
+    if want and not usable:
+        console.print("[red]error:[/red] no usable cores to arm")
+        return
+    try:
+        notes = runcontrol.set_cross_trigger(session.dap, usable, want)
+    except S32EError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        return
+    for note in notes:
+        console.print(f"[dim]{note}[/dim]")
+    session.sync = want
+    if want:
+        console.print(
+            "[green]sync on[/green]: any halt -- manual or a breakpoint hit -- "
+            "now stops all cores together; bare `continue` restarts the whole "
+            "group; `quit` disarms."
+        )
+    else:
+        console.print("[green]sync off[/green]")
+
+
 def _session_tokens(line: str) -> list[str] | None:
     """Split a session line into argv tokens. None on a lexing error."""
     try:
@@ -2243,6 +2617,9 @@ def _session_dispatch(ctx: Ctx, line: str) -> bool:
         return True
     if name == "use":
         _session_use(ctx, tokens[1:])
+        return True
+    if name == "sync":
+        _session_sync(ctx, tokens[1:])
         return True
     if name in SESSION_ALIASES:
         tokens = [*SESSION_ALIASES[name], *tokens[1:]]
@@ -2500,7 +2877,10 @@ def load_cmd(
         for w in report.warnings:
             console.print(f"[yellow]![/yellow] {w}")
 
-        loader_mod.halt_m33s(dap, note)
+        # Best-effort: the load's own reset (P1/P2, EDBGREQ latched) is the
+        # quiesce that persists, and on a blank-flash board the SMU AP answers
+        # nothing at attach (BootROM fail cascade) until that reset runs.
+        loader_mod.halt_m33s(dap, note, smu_fatal=False)
 
         if reset_via == "pin":
             if not getattr(t, "can_pin_reset", False):
@@ -2551,6 +2931,542 @@ def load_cmd(
             )
         if ctx.json_out:
             _emit_json(ctx.json_out, load_report.as_dict())
+
+
+# ---------------------------------------------------------------------------
+# flash -- external QSPI NOR (s32multitool raw-QSPI route, SMU M33 applet)
+# ---------------------------------------------------------------------------
+
+
+def _flash_note(text: str) -> None:
+    console.print(f"[dim]flash:[/dim] {text}")
+
+
+def _flash_resolve_target(offset: str | None, area: str | None) -> tuple[int, int | None, str]:
+    """Resolve (--offset | --area) into (flash offset, capacity or None, label)."""
+    if (offset is None) == (area is None):
+        raise click.ClickException(
+            "pick a destination: exactly one of --offset 0x... or --area "
+            f"{{{'|'.join(qspiflash.REGIONS)}}}"
+        )
+    if offset is not None:
+        value = _parse_address(offset, what="--offset")
+        if value >= qspiflash.DEVICE_SIZE:
+            raise click.ClickException(
+                f"--offset 0x{value:08X} is past the end of the "
+                f"{qspiflash.DEVICE_SIZE // (1024 * 1024)} MiB device"
+            )
+        return value, None, f"0x{value:08X}"
+    key = area.strip().lower()
+    if key not in qspiflash.REGIONS:
+        raise click.ClickException(
+            f"unknown --area {area!r}. Known: {', '.join(qspiflash.REGIONS)}"
+        )
+    off, size, label = qspiflash.REGIONS[key]
+    return off, size, f"--area {key} ({label}, 0x{off:08X}+0x{size:X})"
+
+
+def _flash_read_input(path: str, *, force_bin: bool) -> tuple[bytes, str]:
+    """The program/verify input layer: .bin verbatim, ELF flattened.
+
+    ELF detection is by magic, not extension -- the user decision (2026-08-04)
+    is that a RAM-linked ELF is packed LMA-relative into one flat image with
+    0xFF gaps and written verbatim like any .bin. --format bin forces raw
+    treatment for the pathological file that starts with the ELF magic.
+    """
+    p = Path(path)
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        raise click.ClickException(f"cannot read {p}: {exc}") from None
+    if not raw:
+        raise click.ClickException(f"{p} is empty; nothing to do")
+    if force_bin or raw[:4] != elf_mod.ELF_MAGIC:
+        return raw, p.name
+    try:
+        image = elf_mod.parse(raw, name=p.name)
+        base, flat = elf_mod.flatten(image, raw)
+    except S32EError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _flash_note(
+        f"{p.name} is an ELF -- flattened LMA-relative: base 0x{base:08X}, "
+        f"span {len(flat):,} bytes ({image.total_filesz:,} bytes of file "
+        "content, gaps filled 0xFF)"
+    )
+    return flat, f"{p.name} (ELF, flattened from LMA 0x{base:08X})"
+
+
+def _flash_check_fit(data_len: int, offset: int, capacity: int | None, label: str) -> None:
+    if capacity is not None and data_len > capacity:
+        raise click.ClickException(
+            f"the image is {data_len:,} bytes but {label} holds only "
+            f"{capacity:,} -- refusing to spill past the region"
+        )
+    if offset + data_len > qspiflash.DEVICE_SIZE:
+        raise click.ClickException(
+            f"{data_len:,} bytes at 0x{offset:08X} runs past the end of the "
+            f"{qspiflash.DEVICE_SIZE // (1024 * 1024)} MiB device"
+        )
+
+
+def _flash_confirm(what: str, yes: bool) -> None:
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise click.ClickException(
+            f"{what} is destructive; pass --yes to run it without a prompt "
+            "(stdin is not a terminal, so there is nobody to ask)"
+        )
+    if not click.confirm(f"{what} -- proceed?", default=False):
+        raise click.ClickException("aborted")
+
+
+def _flash_options(fn):
+    """Options every flash subcommand shares (connection + AP routing)."""
+    fn = click.option(
+        "--ahb-base", "ahb_base", default=None,
+        help="Memory-mapped flash window base for reads/verify. Default 0x0 "
+             "with automatic one-time failover to 0x08000000 -- both appear "
+             "in the reference profile (bench item u-f1).",
+    )(fn)
+    fn = click.option(
+        "--ap", "ap_spec", default=None,
+        help="Memory AP for the whole flash flow: 'smu' (default -- every "
+             "address involved is an M33-view address), 'axi', or a "
+             "0x-prefixed AP base.",
+    )(fn)
+    fn = click.option(
+        "--no-fast", is_flag=True,
+        help="Never use the J-Link WriteMem/ReadMem fast paths; pure ADIv6 "
+             "word traffic only (slow: ~4 KB/s).",
+    )(fn)
+    fn = click.option(
+        "--reset", "reset_via", type=click.Choice(["sda", "pin", "none"]),
+        default="sda", show_default=True,
+        help="Quiesce mechanism before touching QSPI. 'sda' = chip-internal "
+             "functional reset (default), 'pin' = probe nRESET (reaches the "
+             "SBC/PMIC through R439, defect D-2), 'none' = attach to the SoC "
+             "as-is -- unproven while firmware may own the controller "
+             "(bench item u-f9).",
+    )(fn)
+    return fn
+
+
+def _flash_bringup(
+    ctx: Ctx,
+    t: object,
+    dap: Dap,
+    *,
+    reset_via: str,
+    no_fast: bool,
+    ap_spec: str | None,
+    ahb_base: str | None,
+    force_jedec: bool,
+    destructive: bool,
+) -> flasher_mod.QspiFlasher:
+    """F0-F5: fresh connection, gates, reset-quiesce, pinned M33s, QSPI up.
+
+    Ends with the controller initialised, the LUTs armed, the JEDEC identity
+    checked (for destructive callers), and the SMU halted by its own DHCSR
+    with every M33 EDBGREQ latch cleared -- the exact state `run_applet`
+    requires.
+    """
+    note = _flash_note
+    session = ctx.session
+    if session is not None:
+        # Finding 9, same policy as `load`: the DLL's WriteMem has a ~4 MB
+        # per-connection budget, and a flash op stages the applet plus up to
+        # megabytes of payload through it. The reopen's connect pulse lands
+        # moments before this flow's own quiesce reset, so nothing of value
+        # is disturbed.
+        note(
+            "fresh probe connection for this flash op (Finding 9: the DLL's "
+            "WriteMem wedges after ~4 MB per connection)"
+        )
+        t.close()
+        t.open()
+        t.select_interface(Tif.JTAG)
+        t.set_speed_khz(ctx.speed_khz)
+        _bring_up_link(t, ctx, Tif.JTAG)
+        dap.invalidate_select_cache()
+        dap.invalidate_csw_cache()
+        session.prepared = False
+
+    for prep_note in _prepare_dap(dap, ctx=ctx):
+        console.print(f"[dim]note:[/dim] {prep_note}")
+    gate_report = gates_mod.apply_ladder1(dap)
+    for w in gate_report.warnings:
+        console.print(f"[yellow]![/yellow] {w}")
+    # Pre-reset quiesce: best-effort whenever the EDBGREQ-latched reset
+    # follows (a blank-flash board answers nothing here, measured 2026-08-05);
+    # with --reset none there is no stronger mechanism coming, so a dead SMU
+    # is fatal right here.
+    loader_mod.halt_m33s(dap, note, smu_fatal=reset_via == "none")
+
+    if reset_via != "none":
+        if reset_via == "pin":
+            if not getattr(t, "can_pin_reset", False):
+                raise click.ClickException(
+                    "--reset pin needs the DLL's SetRESET/ClrRESET exports, "
+                    "which this transport does not provide"
+                )
+            driver: loader_mod.ResetDriver = loader_mod.PinReset(t)
+        else:
+            driver = loader_mod.SdaReset(dap)
+        note(
+            f"reset-quiesce: asserting {driver.name} functional reset with "
+            "every debug request latched"
+        )
+        driver.assert_reset()
+        gates_mod.arm_edbgreq(dap)
+        driver.release_reset()
+        loader_mod.wait_reset_deasserted(dap, note)
+        if session is not None:
+            session.note_system_reset()
+        # Every core woke into a pending EDBGREQ; re-pin the M33s by their
+        # own DHCSR before the latches can be dropped. Not instantly, though:
+        # measured 2026-08-05 (Finding 10), the SMU AHB-AP answers all-zeros
+        # for a moment after the reset release (identity reads zero, correct
+        # again shortly after, with the EDBGREQ latch having caught the
+        # core) -- so poll identity until the AP is back before the loud
+        # one-shot halt.
+        settle_t0 = time.monotonic()
+        while True:
+            ident = m33_mod.identify(dap, m33_mod.M33_APS["smu"])
+            if ident.is_cortex_m33 or time.monotonic() - settle_t0 > 10.0:
+                break
+            time.sleep(0.05)
+        settled = time.monotonic() - settle_t0
+        if settled > 0.1:
+            note(f"SMU AHB-AP came back {settled:.2f}s after the reset release")
+        loader_mod.halt_m33s(dap, note)
+    else:
+        note(
+            "--reset none: attaching to the SoC as-is. If firmware owns the "
+            "QSPI controller this flow may misprogram or hang (u-f9)."
+        )
+
+    # The trap this ordering exists for: a latched M33 EDBGREQ re-halts the
+    # SMU the instant it is resumed into the applet. Clear the latches only
+    # after the DHCSR pin-down, then prove the halt survived the drop.
+    gates_mod.clear_m33_edbgreq(dap)
+    cores = m33_mod.discover(dap)
+    smu = m33_mod.resolve("smu", cores)
+    for n in m33_mod.preflight(smu, write=True):
+        note(f"smu: {n}")
+    if smu.halted is not True:
+        raise click.ClickException(
+            "the SMU M33 did not stay halted once its EDBGREQ latch was "
+            "cleared; refusing to run the flash applet on a running core"
+        )
+    note("M33 EDBGREQ latches cleared; the SMU stays pinned by DHCSR")
+
+    ap_mem = memaccess.resolve_ap(ap_spec) if ap_spec else None
+    window_base = (
+        _parse_address(ahb_base, what="--ahb-base")
+        if ahb_base
+        else qspiflash.AHB_WINDOW_BASES[0]
+    )
+    fl = flasher_mod.QspiFlasher(
+        dap,
+        t,
+        smu,
+        note=note,
+        ap_mem=ap_mem,
+        ahb_base=window_base,
+        use_fast=not no_fast,
+    )
+    for n in fl.preflight():
+        console.print(f"[dim]note:[/dim] {n}")
+    fl.controller_init()
+    mode, jedec = fl.prepare()
+    console.print(f"[dim]flash:[/dim] mode [bold]{mode}[/bold], JEDEC 0x{jedec:08X}")
+    if destructive:
+        fl.check_jedec(force=force_jedec)
+    return fl
+
+
+def _flash_finish(
+    ctx: Ctx, fl: flasher_mod.QspiFlasher, report: flasher_mod.FlashReport, t0: float
+) -> None:
+    report.seconds = time.monotonic() - t0
+    fl.finish_report(report)
+    emit.print_flash_report(report, console)
+    if ctx.json_out:
+        _emit_json(ctx.json_out, report.as_dict())
+
+
+@main.group("flash")
+def flash_group() -> None:
+    """External QSPI NOR flash: program, erase, verify, read, jedec.
+
+    The s32multitool raw-QSPI route ported onto this tool: the QuadSPI
+    controller at 0x42320000 is driven directly and every write/erase runs in
+    a vendored 2 KiB applet on the SMU M33 (data/qspiflash.py carries the
+    citations). Every subcommand quiesces the SoC first -- functional reset
+    with all debug requests latched -- and leaves it halted afterwards.
+    Power-cycle the board to boot what was flashed; the reference project
+    documents that a debug reset is not equivalent.
+    """
+
+
+@flash_group.command("jedec")
+@_flash_options
+@click.pass_obj
+def flash_jedec(
+    ctx: Ctx, reset_via: str, no_fast: bool, ap_spec: str | None, ahb_base: str | None
+) -> None:
+    """Identify the flash device: access mode (SPI/OPI) and JEDEC ID.
+
+    The smoke test: a healthy MX25UW25A45G answers 0xC23989C2. Run this
+    before the first destructive command on any board.
+    """
+    t0 = time.monotonic()
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        fl = _flash_bringup(
+            ctx, t, dap, reset_via=reset_via, no_fast=no_fast, ap_spec=ap_spec,
+            ahb_base=ahb_base, force_jedec=False, destructive=False,
+        )
+        report = flasher_mod.FlashReport(op="jedec")
+        assert fl.jedec is not None
+        verdict = (
+            "matches the expected MX25UW25A45G"
+            if fl.jedec in qspiflash.EXPECTED_JEDEC_IDS
+            else "does NOT match the expected MX25UW25A45G (0xC23989C2)"
+        )
+        colour = "green" if fl.jedec in qspiflash.EXPECTED_JEDEC_IDS else "yellow"
+        console.print(f"[{colour}]JEDEC 0x{fl.jedec:08X} ({fl.mode}) -- {verdict}[/{colour}]")
+        _flash_finish(ctx, fl, report, t0)
+
+
+@flash_group.command("read")
+@click.option("--offset", default=None, help="Flash offset, 0x-prefixed hex.")
+@click.option("--area", default=None, help=f"Named region: {', '.join(qspiflash.REGIONS)}.")
+@click.option("--length", default=None,
+              help="Bytes to read (decimal or 0x-hex). Defaults to the --area size.")
+@click.option("--out", "out_path", required=True, type=click.Path(dir_okay=False),
+              help="Write the dump to this file.")
+@_flash_options
+@click.pass_obj
+def flash_read(
+    ctx: Ctx, offset: str | None, area: str | None, length: str | None, out_path: str,
+    reset_via: str, no_fast: bool, ap_spec: str | None, ahb_base: str | None,
+) -> None:
+    """Dump a flash range into a file, via the memory-mapped read window."""
+    off, capacity, label = _flash_resolve_target(offset, area)
+    if length is not None:
+        nbytes = _parse_value(length, what="--length")
+    elif capacity is not None:
+        nbytes = capacity
+    else:
+        raise click.ClickException("--length is required when using --offset")
+    if nbytes <= 0:
+        raise click.ClickException("--length must be positive")
+    if off + nbytes > qspiflash.DEVICE_SIZE:
+        raise click.ClickException(
+            f"reading {nbytes:,} bytes at 0x{off:08X} runs past the device end"
+        )
+    t0 = time.monotonic()
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        fl = _flash_bringup(
+            ctx, t, dap, reset_via=reset_via, no_fast=no_fast, ap_spec=ap_spec,
+            ahb_base=ahb_base, force_jedec=False, destructive=False,
+        )
+        report = flasher_mod.FlashReport(op="read", offset=off, length=nbytes)
+        data = fl.read(off, nbytes)
+        Path(out_path).write_bytes(data)
+        console.print(
+            f"[green]read {nbytes:,} bytes[/green] from {label} into {out_path}"
+        )
+        _flash_finish(ctx, fl, report, t0)
+
+
+@flash_group.command("verify")
+@click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--offset", default=None, help="Flash offset, 0x-prefixed hex.")
+@click.option("--area", default=None, help=f"Named region: {', '.join(qspiflash.REGIONS)}.")
+@click.option("--format", "format_", type=click.Choice(["bin"]), default=None,
+              help="Force raw-binary treatment even if the file starts with the ELF magic.")
+@_flash_options
+@click.pass_obj
+def flash_verify(
+    ctx: Ctx, input_path: str, offset: str | None, area: str | None, format_: str | None,
+    reset_via: str, no_fast: bool, ap_spec: str | None, ahb_base: str | None,
+) -> None:
+    """Byte-exact compare of a file (or flattened ELF) against flash content."""
+    data, name = _flash_read_input(input_path, force_bin=format_ == "bin")
+    off, capacity, label = _flash_resolve_target(offset, area)
+    _flash_check_fit(len(data), off, capacity, label)
+    t0 = time.monotonic()
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        fl = _flash_bringup(
+            ctx, t, dap, reset_via=reset_via, no_fast=no_fast, ap_spec=ap_spec,
+            ahb_base=ahb_base, force_jedec=False, destructive=False,
+        )
+        report = flasher_mod.FlashReport(op="verify", offset=off, length=len(data))
+        fl.verify(data, off, report, mode="full")
+        console.print(
+            f"[green]verify passed[/green]: {name} matches flash at {label}, byte-exact"
+        )
+        _flash_finish(ctx, fl, report, t0)
+
+
+@flash_group.command("erase")
+@click.option("--offset", default=None, help="Flash offset, 0x-prefixed hex, 4 KiB aligned.")
+@click.option("--area", default=None, help=f"Named region: {', '.join(qspiflash.REGIONS)}.")
+@click.option("--length", default=None,
+              help="Bytes to erase (4 KiB multiple). Defaults to the --area size.")
+@click.option("--all", "erase_all", is_flag=True,
+              help="Erase the WHOLE 32 MiB device (host-driven chip erase; minutes).")
+@click.option("--no-verify", is_flag=True, help="Skip the blank check afterwards.")
+@click.option("--force-jedec", is_flag=True,
+              help="Proceed even if the JEDEC ID is not the expected MX25UW25A45G.")
+@click.option("--yes", is_flag=True, help="Skip the interactive confirmation.")
+@_flash_options
+@click.pass_obj
+def flash_erase(
+    ctx: Ctx, offset: str | None, area: str | None, length: str | None, erase_all: bool,
+    no_verify: bool, force_jedec: bool, yes: bool,
+    reset_via: str, no_fast: bool, ap_spec: str | None, ahb_base: str | None,
+) -> None:
+    """Erase a flash range (4K/64K plan) or the whole device (--all).
+
+    Erased flash reads 0xFF. Erasing the blob area (offset 0) removes the
+    boot IVT: the board will no longer boot until something is programmed
+    back, and a blank boot flash escalates the BootROM failure cascade
+    (docs/virgin-board.md) -- recovery is `attach` plus `flash program`.
+    """
+    if erase_all:
+        if offset is not None or area is not None or length is not None:
+            raise click.ClickException("--all does not combine with --offset/--area/--length")
+        _flash_confirm(
+            "flash erase --all: erase the ENTIRE 32 MiB device, including the "
+            "bootloader and IVT at offset 0 (the board will not boot until "
+            "reflashed)",
+            yes,
+        )
+        off, nbytes, label = 0, qspiflash.DEVICE_SIZE, "the whole device"
+    else:
+        off, capacity, label = _flash_resolve_target(offset, area)
+        if length is not None:
+            nbytes = _parse_value(length, what="--length")
+        elif capacity is not None:
+            nbytes = capacity
+        else:
+            raise click.ClickException("--length is required when using --offset")
+        _flash_confirm(f"flash erase: {nbytes:,} bytes at {label}", yes)
+    t0 = time.monotonic()
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        fl = _flash_bringup(
+            ctx, t, dap, reset_via=reset_via, no_fast=no_fast, ap_spec=ap_spec,
+            ahb_base=ahb_base, force_jedec=force_jedec, destructive=True,
+        )
+        report = flasher_mod.FlashReport(
+            op="erase --all" if erase_all else "erase", offset=off, length=nbytes
+        )
+        if erase_all:
+            fl.chip_erase(report)
+            if not no_verify:
+                fl.blank_check(off, nbytes, report, mode="sampled")
+        else:
+            fl.erase(off, nbytes, report)
+            if not no_verify:
+                # A full read of a multi-MiB erase is minutes on a demoted
+                # read path; past 1 MiB the check samples one word per sector.
+                mode = "full" if nbytes <= 0x10_0000 else "sampled"
+                fl.blank_check(off, nbytes, report, mode=mode)
+        console.print(f"[green]erased[/green] {nbytes:,} bytes at {label}")
+        _flash_finish(ctx, fl, report, t0)
+
+
+@flash_group.command("program")
+@click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--offset", default=None, help="Flash offset, 0x-prefixed hex, 256-byte aligned.")
+@click.option("--area", default=None, help=f"Named region: {', '.join(qspiflash.REGIONS)}.")
+@click.option("--format", "format_", type=click.Choice(["bin"]), default=None,
+              help="Force raw-binary treatment even if the file starts with the ELF magic.")
+@click.option("--no-skip-blank", is_flag=True,
+              help="Program all-0xFF pages too instead of skipping them (they "
+                   "read 0xFF either way after the erase).")
+@click.option("--verify", "verify_mode", type=click.Choice(["full", "sampled", "none"]),
+              default="full", show_default=True,
+              help="Post-program read-back compare through the flash window.")
+@click.option("--force-jedec", is_flag=True,
+              help="Proceed even if the JEDEC ID is not the expected MX25UW25A45G.")
+@click.option("--yes", is_flag=True, help="Skip the interactive confirmation.")
+@_flash_options
+@click.pass_obj
+def flash_program(
+    ctx: Ctx, input_path: str, offset: str | None, area: str | None, format_: str | None,
+    no_skip_blank: bool, verify_mode: str, force_jedec: bool, yes: bool,
+    reset_via: str, no_fast: bool, ap_spec: str | None, ahb_base: str | None,
+) -> None:
+    """Erase-and-program an image into external flash, then verify.
+
+    A .bin is written verbatim at the offset (the s32multitool contract: the
+    image already carries whatever IVT/headers it needs). An ELF is flattened
+    LMA-relative first, 0xFF in the gaps. Erase always precedes programming,
+    sector-aligned around the target range.
+    """
+    data, name = _flash_read_input(input_path, force_bin=format_ == "bin")
+    off, capacity, label = _flash_resolve_target(offset, area)
+    _flash_check_fit(len(data), off, capacity, label)
+    if off % qspiflash.PAGE_SIZE:
+        raise click.ClickException(
+            f"program offset 0x{off:08X} is not 256-byte aligned"
+        )
+    if off == 0 and data[0] != 0xD1:
+        console.print(
+            "[yellow]![/yellow] this image does not start with the BootROM IVT "
+            "tag 0xD1, and offset 0 is where the BootROM looks for one -- the "
+            "board will not boot from it. Programming anyway as instructed."
+        )
+    erase_span = flasher_mod.align_up(
+        off + flasher_mod.align_up(len(data), qspiflash.PAGE_SIZE), qspiflash.SECTOR_SIZE
+    ) - flasher_mod.align_down(off, qspiflash.SECTOR_SIZE)
+    _flash_confirm(
+        f"flash program: erase 0x{erase_span:X} bytes around {label} and write "
+        f"{len(data):,} bytes from {name}",
+        yes,
+    )
+    t0 = time.monotonic()
+    with open_transport(ctx) as (t, dap):
+        assert dap is not None
+        fl = _flash_bringup(
+            ctx, t, dap, reset_via=reset_via, no_fast=no_fast, ap_spec=ap_spec,
+            ahb_base=ahb_base, force_jedec=force_jedec, destructive=True,
+        )
+        report = flasher_mod.FlashReport(op="program", offset=off, length=len(data))
+        try:
+            fl.program(data, off, report, skip_blank=not no_skip_blank)
+            fl.verify(data, off, report, mode=verify_mode)
+        except S32EError:
+            console.print(
+                "[red]![/red] the program did not complete: flash content at "
+                f"{label} is now UNDEFINED. Do not boot from it -- re-run "
+                "`flash program`, and if this was offset 0, keep the board "
+                "powered (a blank/partial boot flash escalates the BootROM "
+                "failure cascade, docs/virgin-board.md)."
+            )
+            raise
+        console.print(
+            f"[green]programmed[/green] {len(data):,} bytes from {name} at {label}"
+            + (
+                "  [dim](byte 0 reads 0xD1 -- boot IVT in place)[/dim]"
+                if off == 0 and verify_mode != "none" and data[0] == 0xD1
+                else ""
+            )
+        )
+        console.print(
+            "[dim]power-cycle the board to boot the flashed image -- the "
+            "reference project documents that a debug reset is not "
+            "equivalent to the cold boot the BootROM needs.[/dim]"
+        )
+        _flash_finish(ctx, fl, report, t0)
 
 
 # ---------------------------------------------------------------------------

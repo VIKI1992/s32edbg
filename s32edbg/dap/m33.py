@@ -223,6 +223,36 @@ def _wait_halted(
         time.sleep(0.005)
 
 
+def wait_halt(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> int:
+    """Poll DHCSR until the core is halted; returns the final DHCSR.
+
+    Public for the flash flow: it resumes the SMU into the QSPI applet and
+    waits here for the applet's terminating ``bkpt #0``. The generic resume()
+    already recognises an instant re-halt via S_RETIRE_ST; this covers the
+    longer ops (a megabyte-scale erase span) where the halt lands seconds
+    after the resume call returned "running".
+    """
+    return _wait_halted(dap, core, True, timeout_s=timeout_s)
+
+
+def ensure_halted(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> tuple[int, bool]:
+    """Assert C_HALT without ever dropping it. Returns (DHCSR, was_running).
+
+    ``halt()`` cannot be used to *confirm* a halt: its guide §6.2 sequence
+    raises C_DEBUGEN alone first, and on an already-halted core that write
+    clears C_HALT -- a resume for the gap between the two writes. This is
+    the re-pin the flash flow issues after every DLL fast-path burst
+    (Finding 6, flash edition, measured 2026-08-05: a WriteMem burst through
+    the registered AHB-AP left the SMU running again despite the arm-time
+    model sync): one write that sets C_DEBUGEN|C_HALT -- a no-op while
+    halted, a halt request while running -- then the usual wait.
+    """
+    before = _read(dap, core.ap_base, m33.DHCSR)
+    was_running = before is not None and not before & m33.DHCSR_S_HALT
+    _set_dhcsr(dap, core, m33.DHCSR_C_DEBUGEN | m33.DHCSR_C_HALT)
+    return _wait_halted(dap, core, True, timeout_s=timeout_s), was_running
+
+
 def halt(dap: Dap, core: M33Core, *, timeout_s: float = 2.0) -> int:
     """Stop the core. Two DHCSR writes, per the guide §6.2.
 

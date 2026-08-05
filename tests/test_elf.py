@@ -158,6 +158,42 @@ def test_load_returns_the_blob_the_segments_index_into(tmp_path) -> None:
     assert img.name == "app.elf"
 
 
+# ---------------------------------------------------------------------------
+# flatten -- the ELF-to-flat-image packer behind `flash program <app.elf>`
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_packs_segments_lma_relative_with_ff_gaps() -> None:
+    """0xFF is the erased state of NOR: gap pages cost nothing to program and
+    are indistinguishable from untouched flash afterwards."""
+    blob = make_elf(segments=[(0x32100000, 0, b"AAAA"), (0x32100010, 0, b"BB")])
+    base, flat = elf.flatten(elf.parse(blob), blob)
+    assert base == 0x32100000
+    assert flat == b"AAAA" + b"\xff" * 12 + b"BB"
+
+
+def test_flatten_of_one_segment_is_its_bytes_verbatim() -> None:
+    blob = make_elf(segments=[(0x32100000, 0, b"\xde\xad\xbe\xef")])
+    assert elf.flatten(elf.parse(blob), blob) == (0x32100000, b"\xde\xad\xbe\xef")
+
+
+def test_flatten_orders_by_lma_not_file_order() -> None:
+    """parse sorts segments by paddr, so a linker that emits them out of order
+    still flattens to the right layout."""
+    blob = make_elf(segments=[(0x32100008, 0, b"BBBB"), (0x32100000, 0, b"AAAA")])
+    base, flat = elf.flatten(elf.parse(blob), blob)
+    assert (base, flat) == (0x32100000, b"AAAA" + b"\xff" * 4 + b"BBBB")
+
+
+def test_flatten_refuses_a_span_no_flat_destination_can_hold() -> None:
+    """Two tiny segments half the address space apart describe a scatter
+    image, not one flat destination -- and the guard fires before the span is
+    ever allocated."""
+    blob = make_elf(segments=[(0x10000000, 0, b"AAAA"), (0x38000000, 0, b"BBBB")])
+    with pytest.raises(ElfError, match="sanity limit"):
+        elf.flatten(elf.parse(blob), blob)
+
+
 @pytest.mark.skipif(not BR1_REAR_ELF.exists(), reason="br1_rear.elf not on this machine")
 def test_golden_numbers_for_the_real_application_elf() -> None:
     """The numbers the bench acceptance asserts. Measured 2026-08-04 from

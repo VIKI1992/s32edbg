@@ -384,30 +384,43 @@ class SegmentWriter:
         *,
         use_fast: bool,
         note: Callable[[str], None],
+        ap: int = AP_AXI,
+        ap_type: str = "AXI-AP",
     ) -> None:
         self.dap = dap
         self.transport = transport
         self.note = note
+        #: The memory AP every access routes through. The default is the load
+        #: flow's system AXI-AP; the flash flow points this at the SMU M33's
+        #: AHB-AP instead, whose view holds the applet RAM and the QSPI
+        #: controller. Nothing else changes: the trust model is per-AP-agnostic.
+        self.ap = ap
+        self.ap_type = ap_type
         self.fast_alive = bool(use_fast and getattr(transport, "can_block_write", False))
         self.fast_ever_used = False
         self.fast_demoted = False
         self.fast_strikes = 0
         self._first_fast_block = True
         if self.fast_alive:
-            # Tell the DLL where the AXI-AP lives (guide §7.2 command strings)
-            # so WriteMem routes through it. Best-effort: mid-session use of
-            # these strings is undocumented, and the first-block full
-            # read-back below is the actual proof either way.
-            configure = getattr(transport, "configure_axi_memory_ap", None)
+            # Tell the DLL which memory AP to route WriteMem through (guide
+            # §7.2 command strings). Best-effort: mid-session use of these
+            # strings is undocumented, and the first-block full read-back
+            # below is the actual proof either way.
+            configure = getattr(transport, "configure_memory_ap", None)
             if configure is not None:
+                label = (
+                    "the AXI-AP"
+                    if self.ap == AP_AXI
+                    else f"the {self.ap_type} at 0x{self.ap:08X}"
+                )
                 try:
-                    reply = configure()
+                    reply = configure(self.ap, self.ap_type)
                     note(
-                        "registered the AXI-AP with the DLL for WriteMem"
+                        f"registered {label} with the DLL for WriteMem"
                         + (f" ({reply})" if reply else "")
                     )
                 except S32EError as exc:
-                    note(f"could not register the AXI-AP with the DLL ({exc})")
+                    note(f"could not register {label} with the DLL ({exc})")
                 self.dap.invalidate_select_cache()
                 self.dap.invalidate_csw_cache()
             self._sync_dll_halt_state(reason="arming the fast path")
@@ -428,7 +441,7 @@ class SegmentWriter:
             return
         verdict = sync()
         self.dap.invalidate_select_cache()
-        self.dap.invalidate_csw_cache(AP_AXI)
+        self.dap.invalidate_csw_cache(self.ap)
         self.note(
             f"synced the DLL's target model ({reason}): DLL Halt issued"
             + ("" if verdict is None else f", IsHalted={int(verdict)}")
@@ -464,7 +477,7 @@ class SegmentWriter:
                 self._fall_back(addr, exc, permanent=False)
             except S32EError as exc:  # verify mismatch, DapError
                 self._fall_back(addr, exc, permanent=True)
-        memaccess.write_words(self.dap, AP_AXI, addr, words)
+        memaccess.write_words(self.dap, self.ap, addr, words)
         return "adiv6"
 
     def _write_fast_with_retry(self, addr: int, words: list[int]) -> None:
@@ -487,7 +500,7 @@ class SegmentWriter:
                 last = exc
                 # The failed call may have moved SELECT/CSW anyway.
                 self.dap.invalidate_select_cache()
-                self.dap.invalidate_csw_cache(AP_AXI)
+                self.dap.invalidate_csw_cache(self.ap)
         assert last is not None
         raise last
 
@@ -506,19 +519,19 @@ class SegmentWriter:
                 f"(block fallback #{self.fast_strikes})"
             )
         # u4: a misbehaving DLL call may have disturbed more than SELECT;
-        # prove the AXI-AP is still usable before continuing.
+        # prove the memory AP is still usable before continuing.
         self.dap.invalidate_select_cache()
-        self.dap.invalidate_csw_cache(AP_AXI)
-        memaccess.preflight(self.dap, AP_AXI, write=True)
+        self.dap.invalidate_csw_cache(self.ap)
+        memaccess.preflight(self.dap, self.ap, write=True)
 
     def _write_fast(self, addr: int, words: list[int]) -> None:
         data = b"".join(w.to_bytes(4, "little") for w in words)
         self.transport.write_mem_block(addr, data)  # type: ignore[attr-defined]
         # u3: the DLL moved SELECT/CSW/TAR beneath the Dap object.
         self.dap.invalidate_select_cache()
-        self.dap.invalidate_csw_cache(AP_AXI)
+        self.dap.invalidate_csw_cache(self.ap)
         if self._first_fast_block:
-            got = memaccess.read_words(self.dap, AP_AXI, addr, len(words))
+            got = memaccess.read_words(self.dap, self.ap, addr, len(words))
             if got != list(words):
                 bad = next(i for i, (a, b) in enumerate(zip(got, words)) if a != b)
                 raise LoadError(
@@ -533,7 +546,7 @@ class SegmentWriter:
             return
         idxs = sorted({0, len(words) - 1} | set(range(0, len(words), FAST_SAMPLE_STRIDE)))
         for i in idxs:
-            got = memaccess.read_words(self.dap, AP_AXI, addr + i * 4, 1)[0]
+            got = memaccess.read_words(self.dap, self.ap, addr + i * 4, 1)[0]
             if got != words[i]:
                 raise LoadError(
                     f"WriteMem sampled verify mismatched at 0x{addr + i * 4:08X}: "
@@ -546,29 +559,17 @@ def _pin_down_parked_core(
 ) -> None:
     """Convert the EDBGREQ hold into a stable, acknowledged CTI halt.
 
-    Measured 2026-08-04 in exactly this order of discoveries: a core held only
-    by the MDM EDBGREQ reads EDPRSR.HALTED **without being architecturally in
-    Debug state** -- EDSCR.HDE is still clear from cold reset, the EDITR
-    register path refuses, and the moment the MDM request is cleared the core
-    resumes and runs the park loop (which the image write then replaces under
-    its feet -- the core ran away mid-load). The plugin's own ordering says the
-    same thing: it clears the request and then issues its normal `monitor
-    halt`. So: unlock + sanitise first, then `halt()` -- the bench-validated
-    CTI path that sets HDE, confirms Debug state, and acknowledges the request
-    (an unacknowledged halt is not stable, see halt()'s own comment) -- and
-    only then drop the MDM request, re-verifying the halt survived it.
+    The mechanism (measured 2026-08-04: an EDBGREQ-held core reads
+    EDPRSR.HALTED without being architecturally in Debug state, and clearing
+    the latch resumes it) lives in ``runcontrol.pin_down_edbgreq_hold`` --
+    shared with `core catch`. Here: unlock + sanitise first via the attach
+    hook, then the conversion, then the session bookkeeping.
     """
     hooks.attach_core(core)
-    runcontrol.halt(dap, core)
-    gates.clear_core_edbgreq(dap, index)
-    state = runcontrol.read_state(dap, core.debug_base)
-    if state.halted is not True:
-        raise LoadError(
-            f"{core.name} did not stay halted after the MDM EDBGREQ was "
-            f"cleared (EDSCR 0x{state.edscr or 0:08X}, EDPRSR "
-            f"0x{state.edprsr or 0:08X})"
-        )
-    core.state = state
+    try:
+        runcontrol.pin_down_edbgreq_hold(dap, core)
+    except runcontrol.RunControlError as exc:
+        raise LoadError(str(exc)) from exc
     hooks.note_halted(core.name)
 
 
@@ -602,14 +603,18 @@ def wait_halted(
     )
 
 
-def halt_m33s(dap: Dap, note: Callable[[str], None]) -> None:
+def halt_m33s(dap: Dap, note: Callable[[str], None], *, smu_fatal: bool = True) -> None:
     """P0's M33 quiescing, mirroring the plugin's three DHCSR halt writes.
 
-    The SMU is the system manager: failing to stop it is fatal for the flow.
-    The CE cores' AHB-APs can legitimately be unclocked on a quiet part, so
-    those two are best-effort with a note. After the reset in P1/P2 all three
-    stay halted anyway via the MDM EDBGREQ bits in CONTROL -- these pre-reset
-    halts replicate the plugin's ordering, not the mechanism that persists.
+    The SMU is the system manager: failing to stop it is fatal for the flow --
+    *when nothing stronger follows*. Callers about to run the EDBGREQ-latched
+    reset pass ``smu_fatal=False``: on a blank-flash board the SoC sits in the
+    BootROM fail cascade at attach and the SMU AHB-AP answers nothing
+    (measured 2026-08-05, right after the first chip erase), yet the reset
+    with EDBGREQ latched catches the SMU out of reset regardless -- the
+    pre-reset halts replicate the plugin's ordering, not the mechanism that
+    persists. The CE cores' AHB-APs can legitimately be unclocked on a quiet
+    part, so those two are always best-effort with a note.
     """
     cores = m33_mod.discover(dap)
     for c in cores:
@@ -619,11 +624,19 @@ def halt_m33s(dap: Dap, note: Callable[[str], None]) -> None:
             m33_mod.halt(dap, c)
             note(f"{c.name} halted")
         except S32EError as exc:
-            if c.name == "smu":
+            if c.name == "smu" and smu_fatal:
                 raise LoadError(
                     f"could not halt the SMU M33 ({exc}) -- the system manager "
                     "must be quiet before the load's reset"
                 ) from exc
+            if c.name == "smu":
+                note(
+                    f"smu: could not quiesce before the reset ({exc}) -- "
+                    "expected on a blank-flash board sitting in the BootROM "
+                    "fail cascade (docs/virgin-board.md); proceeding, the "
+                    "reset with EDBGREQ latched catches it out of reset"
+                )
+                continue
             note(f"{c.name}: could not halt ({exc}) -- continuing; the "
                  "EDBGREQ latched over the reset will hold it anyway")
 
@@ -665,7 +678,7 @@ def load_image(
 
     # P2 -- release, settle, prove the AXI-AP safe exactly once.
     reset.release_reset()
-    _wait_reset_deasserted(dap, hooks.note, timeout_s=settle_timeout_s)
+    wait_reset_deasserted(dap, hooks.note, timeout_s=settle_timeout_s)
     hooks.on_system_reset()
     _report, notes = memaccess.preflight(dap, AP_AXI, write=True)
     for n in notes:
@@ -855,10 +868,13 @@ def _verify(
     )
 
 
-def _wait_reset_deasserted(
+def wait_reset_deasserted(
     dap: Dap, note: Callable[[str], None], *, timeout_s: float = 2.0
 ) -> None:
-    """Poll both reset views (SDA SYSRSTS + MDM STATUS) until neither asserts."""
+    """Poll both reset views (SDA SYSRSTS + MDM STATUS) until neither asserts.
+
+    Public because the flash flow's reset-quiesce shares it with `load`.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         report = gates.status(dap)

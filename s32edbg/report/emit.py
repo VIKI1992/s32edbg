@@ -450,6 +450,53 @@ def print_m33_registers(name: str, values: dict, console: Console | None = None)
     console.print(table)
 
 
+def print_flash_report(report, console: Console | None = None) -> None:
+    """The `flash` group's closing summary: what happened, through what."""
+    console = console or Console()
+    table = Table(title=f"flash {report.op}")
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("offset", f"0x{report.offset:08X}")
+    table.add_row("length", f"{report.length:,} bytes")
+    if report.mode is not None and report.jedec is not None:
+        table.add_row("mode / JEDEC", f"{report.mode}  0x{report.jedec:08X}")
+    if report.erase_bytes:
+        table.add_row(
+            "erased",
+            f"{report.erase_bytes:,} bytes in {report.erase_seconds:.2f}s"
+            + (
+                f" ({report.erase_spans_64k}×64K + {report.erase_spans_4k}×4K spans)"
+                if report.erase_spans_64k or report.erase_spans_4k
+                else "  (chip erase)"
+            ),
+        )
+    if report.program_runs or report.programmed_bytes:
+        skipped = (
+            f", {report.skipped_pages} blank pages skipped" if report.skipped_pages else ""
+        )
+        table.add_row(
+            "programmed",
+            f"{report.programmed_bytes:,} bytes in {report.program_seconds:.2f}s "
+            f"({report.program_runs} run(s){skipped})",
+        )
+    verify = report.verify
+    if report.verify_seconds:
+        verify += f" in {report.verify_seconds:.2f}s"
+    table.add_row("verify", verify)
+    table.add_row(
+        "paths",
+        f"WriteMem {report.fast_write}, ReadMem {report.fast_read}, "
+        f"{report.applet_calls} applet call(s)",
+    )
+    table.add_row(
+        "via", f"AP 0x{report.ap_mem:08X}, AHB window base 0x{report.ahb_base:08X}"
+    )
+    table.add_row("total", f"{report.seconds:.2f}s")
+    console.print(table)
+    for note in report.notes:
+        console.print(f"[dim]note: {note}[/dim]")
+
+
 def print_load_report(report, console: Console | None = None) -> None:
     """The `load` command's closing table: what landed where, how, how fast."""
     console = console or Console()

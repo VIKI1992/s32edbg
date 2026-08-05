@@ -27,10 +27,23 @@
     Run only the read-only steps. Useful for a first pass on a board whose
     application must keep running.
 
+.PARAMETER FlashScratch
+    Flash offset for the external-QSPI scratch steps (jedec / read / erase /
+    program / verify -- test-plan "The flash flow", bench items u-f1..u-f7).
+    Defaults to 0x300000, the Application Area: never the bootloader at
+    offset 0. Pass '' to skip the flash steps entirely.
+
+.PARAMETER FlashBlobPath
+    A bootloader BLOB (byte 0 = 0xD1) to program at offset 0 -- the ONE step
+    that rewrites the boot flash, gated separately. Omit to skip it; run it
+    only after the scratch steps have passed on this setup.
+
 .EXAMPLE
     .\tools\bench-acceptance.ps1
     .\tools\bench-acceptance.ps1 -SkipStateChanging
     .\tools\bench-acceptance.ps1 -OutDir C:\temp\run1 -Yes
+    .\tools\bench-acceptance.ps1 -ElfPath C:\br1_rear_ecu\build\bin\br1_rear.elf
+    .\tools\bench-acceptance.ps1 -FlashBlobPath C:\blobs\s32e2xx_bootloader_M33_BLOB.bin
 #>
 
 [CmdletBinding()]
@@ -40,7 +53,11 @@ param(
     [switch] $SkipStateChanging,
     # Application ELF for the `load` (RAM-load) step. Omit to skip the step.
     # Expected on this bench: C:\br1_rear_ecu\build\bin\br1_rear.elf
-    [string] $ElfPath
+    [string] $ElfPath,
+    # External-QSPI scratch offset ('' skips the flash steps).
+    [string] $FlashScratch = '0x300000',
+    # Bootloader BLOB for the gated offset-0 program step.
+    [string] $FlashBlobPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,99 +72,8 @@ $transcript = Join-Path $OutDir 'console.txt'
 $results = [System.Collections.Generic.List[object]]::new()
 $stepNumber = 0
 
-function Hex {
-    <# The tool writes register values as "0x1234ABCD" strings in its JSON, and
-       PowerShell will not cast those to a number. UInt64 rather than UInt32
-       because a boundary-scan capture is wider than a register. #>
-    param([string] $Value)
-    # The parentheses matter: without them PowerShell hands ToUInt64 three
-    # arguments (value, '', 16) and it fails to find an overload.
-    return [Convert]::ToUInt64(($Value -replace '^0[xX]', ''), 16)
-}
-
-function Invoke-Step {
-    <#
-        $Check is a scriptblock receiving the parsed JSON artifact; return $true
-        to pass. Exit code alone is NOT a sufficient criterion and assuming it
-        was already let a wrong answer through once: `connect` on the dll
-        backend exits 0 while reporting the *reserved* DPACC register as DPIDR
-        (0x4BA07477 rather than 0x4C013477). A step with a known answer must
-        assert on the answer.
-    #>
-    param(
-        [Parameter(Mandatory)] [string]   $Name,
-        [Parameter(Mandatory)] [string[]] $Arguments,
-        [string]      $Expect,
-        [scriptblock] $Check,
-        [switch] $ChangesTargetState,
-        [switch] $AllowFailure
-    )
-
-    $script:stepNumber++
-    $id = '{0:d2}-{1}' -f $script:stepNumber, ($Name -replace '[^\w\-]', '-')
-
-    if ($ChangesTargetState -and $SkipStateChanging) {
-        Write-Host "SKIP  $Name (changes target state)" -ForegroundColor DarkGray
-        $script:results.Add([pscustomobject]@{ Step = $Name; Result = 'skipped'; Exit = $null })
-        return
-    }
-    if ($ChangesTargetState -and -not $Yes) {
-        Write-Host ""
-        Write-Host "NEXT STEP CHANGES TARGET STATE: $Name" -ForegroundColor Yellow
-        Write-Host "  $Expect"
-        $answer = Read-Host "  proceed? [y/N]"
-        if ($answer -notmatch '^[Yy]') {
-            Write-Host "SKIP  $Name (declined)" -ForegroundColor DarkGray
-            $script:results.Add([pscustomobject]@{ Step = $Name; Result = 'declined'; Exit = $null })
-            return
-        }
-    }
-
-    $json = Join-Path $OutDir "$id.json"
-    $log  = Join-Path $OutDir "$id.log"
-    $full = @('--json', $json, '--log', $log) + $Arguments
-
-    Write-Host ""
-    Write-Host ("=" * 78)
-    Write-Host "STEP $script:stepNumber  $Name" -ForegroundColor Cyan
-    if ($Expect) { Write-Host "  expect: $Expect" -ForegroundColor DarkGray }
-    Write-Host "  s32edbg $($full -join ' ')" -ForegroundColor DarkGray
-    Write-Host ("=" * 78)
-
-    & s32edbg @full
-    $code = $LASTEXITCODE
-
-    # 0 = ok, 2 = tool error, 3 = refused by safety policy, 130 = aborted.
-    $verdict = if ($code -eq 0) { 'pass' } else { 'FAIL' }
-    $note    = ''
-
-    if ($code -eq 0 -and $Check) {
-        $payload = $null
-        if (Test-Path $json) {
-            try { $payload = Get-Content $json -Raw | ConvertFrom-Json }
-            catch { $note = "could not parse $id.json" }
-        } else {
-            $note = 'no JSON artifact written'
-        }
-        if ($payload) {
-            try {
-                if (-not (& $Check $payload)) { $verdict = 'FAIL'; $note = 'value check failed' }
-            } catch {
-                $verdict = 'FAIL'; $note = "value check errored: $_"
-            }
-        } elseif (-not $note) {
-            $verdict = 'FAIL'; $note = 'no JSON to check'
-        }
-    }
-
-    $colour = if ($verdict -eq 'pass') { 'Green' } else { 'Red' }
-    Write-Host "  -> $verdict (exit $code)$(if ($note) { " -- $note" })" -ForegroundColor $colour
-    $script:results.Add([pscustomobject]@{ Step = $Name; Result = $verdict; Exit = $code; Note = $note })
-
-    if ($verdict -ne 'pass' -and -not $AllowFailure) {
-        throw "step '$Name' failed (exit $code$(if ($note) { "; $note" })). Artifacts in $OutDir"
-    }
-}
+# Hex + Invoke-Step live in bench-lib.ps1, shared with flash-state-matrix.ps1.
+. (Join-Path $PSScriptRoot 'bench-lib.ps1')
 
 Start-Transcript -Path $transcript | Out-Null
 try {
@@ -272,6 +198,67 @@ try {
             }
     } else {
         Write-Host "  (load step skipped: pass -ElfPath <app.elf> to run it)" -ForegroundColor DarkGray
+    }
+
+    # -- Tier 2c3: the external-flash flow ----------------------------------
+    #
+    # Test-plan "The flash flow": every subcommand quiesces the SoC with a
+    # functional reset first, so even `flash jedec` stops the application --
+    # every step here is state-changing. Scratch offset first, never offset 0
+    # (the bootloader lives there); the BLOB step is gated separately below.
+    # --speed 16000 is the flash procedure's documented clock (the reference
+    # plugin's own JTAG speed; the ADIv6 fallback at 4 MHz costs minutes).
+    if ($FlashScratch) {
+        Invoke-Step -Name 'flash-jedec' -Arguments @('--speed', '16000', 'flash', 'jedec') `
+            -ChangesTargetState `
+            -Expect 'STOPS THE APPLICATION (quiesce reset). JEDEC 0xC23989C2, mode spi or opi (u-f1/u-f6)' `
+            -Check { param($p) ($p.jedec -eq '0xC23989C2') -and ($p.mode -in @('spi', 'opi')) }
+
+        $flashDump = Join-Path $OutDir 'flash-scratch-read.bin'
+        Invoke-Step -Name 'flash-read-scratch' -Arguments @(
+                '--speed', '16000', 'flash', 'read',
+                '--offset', $FlashScratch, '--length', '0x10000', '--out', $flashDump) `
+            -ChangesTargetState `
+            -Expect "64 KiB from $FlashScratch through the AHB window (u-f1 base, u-f3 ReadMem)" `
+            -Check { param($p) (Test-Path $flashDump) -and ((Get-Item $flashDump).Length -eq 0x10000) }
+
+        Invoke-Step -Name 'flash-erase-scratch' -Arguments @(
+                '--speed', '16000', 'flash', 'erase',
+                '--offset', $FlashScratch, '--length', '0x10000', '--yes') `
+            -ChangesTargetState `
+            -Expect 'ERASES 64 KiB at the scratch offset; applet rc 0, bkpt halt not external (u-f4), blank check full' `
+            -Check { param($p) ($p.erase.bytes -eq 0x10000) -and ($p.verify -eq 'blank-full') }
+
+        # A ragged, non-page-multiple pattern: exercises padding and the
+        # 256-byte alignment machinery (test-plan flash procedure step 5).
+        $flashPattern = Join-Path $OutDir 'flash-pattern.bin'
+        [IO.File]::WriteAllBytes($flashPattern, [byte[]](0..([int]0x1233) | ForEach-Object { $_ % 251 }))
+        Invoke-Step -Name 'flash-program-scratch' -Arguments @(
+                '--speed', '16000', 'flash', 'program', $flashPattern,
+                '--offset', $FlashScratch, '--yes') `
+            -ChangesTargetState `
+            -Expect 'PROGRAMS 0x1234 bytes at the scratch offset; erase-before-write, full byte-exact verify (u-f2/u-f5/u-f7)' `
+            -Check { param($p) ($p.program.bytes -gt 0) -and ($p.verify -eq 'full') }
+
+        Invoke-Step -Name 'flash-verify-scratch' -Arguments @(
+                '--speed', '16000', 'flash', 'verify', $flashPattern,
+                '--offset', $FlashScratch) `
+            -ChangesTargetState `
+            -Expect 'the same bytes read back through a fresh session -- byte-exact' `
+            -Check { param($p) $p.verify -eq 'full' }
+    } else {
+        Write-Host "  (flash steps skipped: -FlashScratch is empty)" -ForegroundColor DarkGray
+    }
+
+    if ($FlashBlobPath) {
+        Invoke-Step -Name 'flash-program-blob' -Arguments @(
+                '--speed', '16000', 'flash', 'program', $FlashBlobPath,
+                '--offset', '0x0', '--yes') `
+            -ChangesTargetState `
+            -Expect 'REWRITES THE BOOT FLASH at offset 0. Byte 0 must verify 0xD1; power-cycle afterwards to boot it' `
+            -Check { param($p) ($p.offset -eq '0x00000000') -and ($p.program.bytes -gt 0) -and ($p.verify -eq 'full') }
+    } elseif ($FlashScratch) {
+        Write-Host "  (BLOB-at-offset-0 step skipped: pass -FlashBlobPath <blob.bin> to run it)" -ForegroundColor DarkGray
     }
 
     # -- Tier 2d: the whole-tool artifact -----------------------------------
