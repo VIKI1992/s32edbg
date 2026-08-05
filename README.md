@@ -913,6 +913,21 @@ unfired latch — a latch left behind halts core1 on the next boot's release wit
 which is exactly Finding 7. Standalone `catch --wait` drops the latch itself on timeout;
 `catch --disarm` drops it on demand.
 
+```bat
+s32edbg core catch --core rtu0.1                        :: arm only (session required)
+s32edbg core catch --core rtu0.1 --wait --timeout 60    :: arm + wait + convert (standalone ok)
+s32edbg core catch --core rtu0.1 --disarm               :: drop the latch on demand
+```
+
+What the catch looks like when it fires (measured 2026-08-05, wiped-flash board):
+
+```
+catch armed on rtu0.1 (MDM EDBGREQ latched).
+rtu0.0 running -- running (non-debug state)
+rtu0.1: cleared the OS lock
+rtu0.1 caught at its first instruction -- halted: external debug request  PC 0x32100020
+```
+
 ### `core reset-halt` — own a core from its first instruction
 
 ```bat
@@ -1136,7 +1151,26 @@ act on it.
 application's pair deadlocks when one core halts alone — see the `core` section). Armed: any
 halt, manual or a breakpoint hit on either core, stops both; bare `continue` restarts both on
 one pulse; a breakpoint hit noticed later is taken into the session's ownership so close
-resumes everything. `quit` always disarms.
+resumes everything. `quit` always disarms. Measured 2026-08-05 — the first cross-trigger halt
+ever fired on this silicon:
+
+```
+s32edbg[rtu0.0]> sync on
+rtu0.0: cross-trigger enabled (CTIGATE 0x0000000C)
+rtu0.1: cross-trigger enabled (CTIGATE 0x0000000C)
+sync on: any halt -- manual or a breakpoint hit -- now stops all cores together;
+bare `continue` restarts the whole group; `quit` disarms.
+s32edbg[rtu0.0]> halt
+rtu0.0 halted -- halted: external debug request (EDSCR 0x03054193, EDPRSR 0x00000011)
+sync: rtu0.1 stopped with the group
+s32edbg[rtu0.0]> step
+sync: cross-halt masked for the step; the other cores stay halted
+step 1  0x321D5B98 -> 0x321D5B9A  (halted: halting step, normal)
+s32edbg[rtu0.0]> continue
+synchronized restart: one pulse released 2 core(s)
+rtu0.0 running -- running (non-debug state)
+rtu0.1 running -- running (non-debug state)
+```
 
 **Closing restores the target.** On `quit`, end of piped input, or Ctrl-C at the prompt, the
 breakpoints and watchpoints the session set are cleared *first*, then the cores the session
@@ -1562,6 +1596,16 @@ pytest -m hardware -v -x            21 bench gates, in dependency order
 .\tools\bench-acceptance.ps1        the same sequence, with per-step JSON and wire-level logs
 .\tools\flash-state-matrix.ps1      debugging proven in every flash state (nothing / BL only /
                                     BL+app / BL+app+flag / app only) -- see the test plan
+```
+
+The matrix runs all five states in order by default; each state reprograms the flash with the
+tool's own commands, prompts for a power cycle, then runs the full battery (attach/connect,
+gates, discovery, a run-control session, `flash jedec`, RAM `load --verify`):
+
+```bat
+.\tools\flash-state-matrix.ps1 -Yes
+.\tools\flash-state-matrix.ps1 -Yes -States S1,S2               :: a prefix subset
+.\tools\flash-state-matrix.ps1 -BlobPath C:\blobs\bl.bin -OutDir C:\temp\matrix
 ```
 
 Run-control was built in five phases, each ending at a hardware checkpoint before the next began.
