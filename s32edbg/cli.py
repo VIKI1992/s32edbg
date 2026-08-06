@@ -30,9 +30,11 @@ from .dap import runcontrol
 from .dap.adiv6 import Dap
 from .data import qspiflash
 from .data import r52debug
+from .data import rtuboot
+from .data import smuboot
 from .data import swj
 from .data.bscan import BSCAN_DEFAULT_IRLEN, BSCAN_PROBE_BITS
-from .data.expected_apmap import AP_ALIASES, AP_APB, AP_MDM, AP_SDA, APBIC1_ROM_BASE
+from .data.expected_apmap import AP_ALIASES, AP_APB, AP_AXI, AP_MDM, AP_SDA, APBIC1_ROM_BASE
 from .data.known_ids import decode_dpidr
 from .data.ladder1 import MDM_IDR_EXPECTED, SDA_SYSRSTC, SDA_SYSRSTC_SYSFUNCREQ
 from .errors import ElfError, PowerUpError, S32EError, TransportError, UnsafeOperation
@@ -3042,14 +3044,26 @@ def _flash_options(fn):
     )(fn)
     fn = click.option(
         "--reset", "reset_via", type=click.Choice(["sda", "pin", "none"]),
-        default="sda", show_default=True,
-        help="Quiesce mechanism before touching QSPI. 'sda' = chip-internal "
-             "functional reset (default), 'pin' = probe nRESET (reaches the "
-             "SBC/PMIC through R439, defect D-2), 'none' = attach to the SoC "
-             "as-is -- unproven while firmware may own the controller "
-             "(bench item u-f9).",
+        default="pin", show_default=True,
+        help="Quiesce mechanism before touching QSPI. 'pin' = probe nRESET, "
+             "the s32multitool-exact RESET_B toggle (default for flash; it "
+             "reaches the SBC/PMIC through R439, defect D-2 -- the same path "
+             "every connect pulse already takes). 'sda' = chip-internal "
+             "functional reset (the load flow's default), the fallback if "
+             "the pin path misbehaves. 'none' = attach to the SoC as-is -- "
+             "cannot recover a wiped board (the SMU bring-up needs the "
+             "EDBGREQ-latched reset) and unproven while firmware may own "
+             "the controller (bench item u-f9).",
     )(fn)
     return fn
+
+
+#: Finding-10 settle bound: how long the flash flow waits for the SMU AHB-AP
+#: to answer identity after the reset release before proceeding. On a healthy
+#: board the AP is back in ~0.5 s; on a wiped (DEST0) board it stays dead for
+#: the full wait and the SMU bring-up below revives it (Finding 15).
+#: Module-level so tests can shrink the wait.
+FLASH_SMU_SETTLE_TIMEOUT_S = 10.0
 
 
 def _flash_bringup(
@@ -3064,12 +3078,15 @@ def _flash_bringup(
     force_jedec: bool,
     destructive: bool,
 ) -> flasher_mod.QspiFlasher:
-    """F0-F5: fresh connection, gates, reset-quiesce, pinned M33s, QSPI up.
+    """F0-F6: fresh connection, gates, reset-quiesce, SMU bring-up, QSPI up.
 
-    Ends with the controller initialised, the LUTs armed, the JEDEC identity
+    Since Finding 15 the flow boots the SMU itself, s32multitool-style:
+    EDBGREQ-latched reset, MC_ME/RGM partition enables, the NXP SRAM scrubs,
+    then the MC_ME PRTN0 core-0 release onto a debugger-written stub -- so a
+    wiped (DEST0) board is brought up the same way as a healthy one. Ends
+    with the controller initialised, the LUTs armed, the JEDEC identity
     checked (for destructive callers), and the SMU halted by its own DHCSR
-    with every M33 EDBGREQ latch cleared -- the exact state `run_applet`
-    requires.
+    with its EDBGREQ latch cleared -- the exact state `run_applet` requires.
     """
     note = _flash_note
     session = ctx.session
@@ -3123,33 +3140,85 @@ def _flash_bringup(
         loader_mod.wait_reset_deasserted(dap, note)
         if session is not None:
             session.note_system_reset()
+        # The reference's own post-release settle: s32multitool pauses a flat
+        # 200 ms after RESET_B goes high (_reset_to_first_instruction) before
+        # any AXI traffic. Kept verbatim on top of the flag polls above.
+        time.sleep(0.2)
         # Every core woke into a pending EDBGREQ; re-pin the M33s by their
         # own DHCSR before the latches can be dropped. Not instantly, though:
         # measured 2026-08-05 (Finding 10), the SMU AHB-AP answers all-zeros
         # for a moment after the reset release (identity reads zero, correct
         # again shortly after, with the EDBGREQ latch having caught the
         # core) -- so poll identity until the AP is back before the loud
-        # one-shot halt.
+        # one-shot halt. On a wiped (DEST0) board the poll times out with the
+        # AP still dead -- expected; the bring-up below is what revives it.
         settle_t0 = time.monotonic()
         while True:
             ident = m33_mod.identify(dap, m33_mod.M33_APS["smu"])
-            if ident.is_cortex_m33 or time.monotonic() - settle_t0 > 10.0:
+            smu_alive = ident.is_cortex_m33
+            if smu_alive or time.monotonic() - settle_t0 > FLASH_SMU_SETTLE_TIMEOUT_S:
                 break
             time.sleep(0.05)
         settled = time.monotonic() - settle_t0
         if settled > 0.1:
-            note(f"SMU AHB-AP came back {settled:.2f}s after the reset release")
+            note(
+                f"SMU AHB-AP {'came back' if smu_alive else 'still dead'} "
+                f"{settled:.2f}s after the reset release"
+            )
+        # The s32multitool bring-up, verbatim tables, always on (Finding 15):
+        # MC_ME/RGM partition enables, the NXP generic SRAM scrubs, then the
+        # MC_ME PRTN0 core-0 release that boots the SMU onto a two-word stub
+        # in its own SRAM -- flash-independent, which is what makes a wiped
+        # (DEST0) board flashable. All of it is AXI traffic and all of it
+        # runs only after the reset release, matching both the reference
+        # ordering and the RM's no-AXI-during-reset rule.
+        note(
+            "SMU bring-up (s32multitool, Finding 15): partitions + SRAM "
+            "scrubs + MC_ME PRTN0 core-0 release"
+        )
+        _axi_report, pf_notes = memaccess.preflight(dap, AP_AXI, write=True)
+        for n in pf_notes:
+            note(n)
+        loader_mod.run_init_actions(dap, rtuboot.ACTIONS_RTU0_PARTITION, note=note)
+        loader_mod.run_init_actions(dap, rtuboot.ACTIONS_RTU1_PARTITION, note=note)
+        loader_mod.run_init_actions(dap, rtuboot.ACTIONS_GENERIC_SRAM, note=note)
+        loader_mod.run_init_actions(dap, smuboot.ACTIONS_SMU_BOOT, note=note)
+        # The reference's wiped-board guarantee: config_m33 -- the M33
+        # subsystem clock select (MC_CGM2 MUX0) -- always runs in its full
+        # prepare before anything touches SMU SRAM (its applet staging comes
+        # only after prepare). This flow's first SMU-SRAM touch is the
+        # flasher preflight, so the same write must land here: measured
+        # 2026-08-06 on the DEST0-recovered bench board, the mux reads
+        # 0x0F000000 (no source selected) and SMU SRAM discards writes --
+        # the MC_ME release brings up the core and its debug view, not the
+        # SRAM fabric. Idempotent on a healthy board (BootROM selects the
+        # same source; the reference re-runs it on every full prepare).
+        loader_mod.run_init_actions(dap, qspiflash.ACTIONS_M33_CLOCK, note=note)
+        if not smu_alive:
+            # The AP was dead at the settle poll; give the just-released core
+            # a short beat to present its debug face before the loud halt.
+            revive_t0 = time.monotonic()
+            while True:
+                ident = m33_mod.identify(dap, m33_mod.M33_APS["smu"])
+                if ident.is_cortex_m33 or time.monotonic() - revive_t0 > 2.0:
+                    break
+                time.sleep(0.05)
         loader_mod.halt_m33s(dap, note)
     else:
         note(
             "--reset none: attaching to the SoC as-is. If firmware owns the "
-            "QSPI controller this flow may misprogram or hang (u-f9)."
+            "QSPI controller this flow may misprogram or hang (u-f9). No "
+            "reset also means no SMU bring-up -- recovering a wiped board "
+            "needs --reset pin (default) or sda."
         )
 
-    # The trap this ordering exists for: a latched M33 EDBGREQ re-halts the
-    # SMU the instant it is resumed into the applet. Clear the latches only
-    # after the DHCSR pin-down, then prove the halt survived the drop.
-    gates_mod.clear_m33_edbgreq(dap)
+    # The trap this ordering exists for: a latched SMU EDBGREQ re-halts the
+    # core the instant it is resumed into the applet. Drop the latch only
+    # after the DHCSR pin-down, then prove the halt survived the drop. (The
+    # reference de-asserts before its halt; the end state -- SMU halted via
+    # DHCSR, CONTROL bit 8 clear -- is identical, and this order is what the
+    # survival check below is built on.)
+    gates_mod.clear_smu_edbgreq(dap)
     cores = m33_mod.discover(dap)
     smu = m33_mod.resolve("smu", cores)
     for n in m33_mod.preflight(smu, write=True):
@@ -3159,7 +3228,11 @@ def _flash_bringup(
             "the SMU M33 did not stay halted once its EDBGREQ latch was "
             "cleared; refusing to run the flash applet on a running core"
         )
-    note("M33 EDBGREQ latches cleared; the SMU stays pinned by DHCSR")
+    note(
+        "SMU EDBGREQ latch cleared (multitool-exact: CONTROL &= ~0x10000100; "
+        "CE latches left as the reference leaves them); the SMU stays pinned "
+        "by DHCSR"
+    )
 
     ap_mem = memaccess.resolve_ap(ap_spec) if ap_spec else None
     window_base = (
@@ -3203,8 +3276,10 @@ def flash_group() -> None:
     The s32multitool raw-QSPI route ported onto this tool: the QuadSPI
     controller at 0x42320000 is driven directly and every write/erase runs in
     a vendored 2 KiB applet on the SMU M33 (data/qspiflash.py carries the
-    citations). Every subcommand quiesces the SoC first -- functional reset
-    with all debug requests latched -- and leaves it halted afterwards.
+    citations). Every subcommand resets the SoC with all debug requests
+    latched, then boots the SMU itself exactly as the reference does
+    (partitions + SRAM scrubs + MC_ME core release, Finding 15) -- so a
+    completely wiped board is flashable -- and leaves it halted afterwards.
     Power-cycle the board to boot what was flashed; the reference project
     documents that a debug reset is not equivalent.
     """
@@ -3337,21 +3412,21 @@ def flash_erase(
     Erased flash reads 0xFF. Erasing the blob area (offset 0) removes the
     boot IVT: the board will no longer boot until something is programmed
     back, and a blank boot flash escalates the BootROM failure cascade
-    (docs/virgin-board.md) -- recovery is `attach` plus `flash program`.
+    (docs/virgin-board.md) -- recovery is `flash program` at offset 0 (the
+    flow boots the SMU itself, Finding 15).
     """
     if erase_all:
         if offset is not None or area is not None or length is not None:
             raise click.ClickException("--all does not combine with --offset/--area/--length")
         _flash_confirm(
             "flash erase --all: erase the ENTIRE 32 MiB device, including the "
-            "bootloader and IVT at offset 0. THIS TOOL CANNOT PUT THEM BACK "
-            "(Finding 14, measured 2026-08-05): with no bootable image the "
-            "BootROM fail cascade escalates to a destructive reset and the "
-            "SMU M33 subsystem -- the core that executes the flash applet -- "
-            "reads as powered down, so every later flash op fails. RAM `load` "
-            "still works; reflashing needs s32multitool/S32DS or the "
-            "serial-boot strap (docs/virgin-board.md). Erase a RANGE instead "
-            "if the bootloader must survive",
+            "bootloader and IVT at offset 0. The board will not boot again "
+            "until something is programmed back -- with no bootable image the "
+            "BootROM fail cascade escalates to a destructive reset (DEST0, "
+            "Finding 14) and only debug access remains. Since Finding 15 this "
+            "tool CAN reflash that state (the flash flow boots the SMU "
+            "itself, s32multitool-style); still, erase a RANGE instead if "
+            "the bootloader must survive",
             yes,
         )
         off, nbytes, label = 0, qspiflash.DEVICE_SIZE, "the whole device"

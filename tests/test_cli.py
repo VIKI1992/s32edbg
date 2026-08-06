@@ -848,6 +848,51 @@ def test_flash_reset_none_still_requires_a_live_smu(run, target) -> None:
     assert "could not halt the SMU M33" in out
 
 
+def test_flash_bringup_boots_the_smu_out_of_dest0(run, target, monkeypatch) -> None:
+    """Finding 15 end to end: a wiped (DEST0) board -- SMU unpowered, and no
+    reset reviving it -- is brought up by the flash flow itself, s32multitool
+    style (partition enables + SRAM scrubs + MC_ME PRTN0 core-0 release onto
+    the debugger-written stub), and `flash jedec` completes. This is the exact
+    state Finding 14 measured as unrecoverable."""
+    target.smu_unpowered = True
+    target.smu_sram_gated = True  # bench 2026-08-06: SRAM dead until config_m33
+    monkeypatch.setattr(cli, "FLASH_SMU_SETTLE_TIMEOUT_S", 0.3)
+    code, out = run("flash", "jedec")
+    assert code == EXIT_OK
+    assert "JEDEC 0xC23989C2" in out
+    assert "SMU bring-up (s32multitool, Finding 15)" in out
+    assert target.smu_unpowered is False, "the MC_ME release powered the SMU up"
+    assert target.mem[0x4190_014C] == 0x2500_2000, "PRTN0_CORE0_ADDR = the stub vectors"
+    assert target.mem[0x4103_0300] == 0x0F00_0004, "config_m33 ran: SRAM clock selected"
+
+
+def test_flash_deassert_clears_only_the_smu_latch(run, target) -> None:
+    """The multitool-exact de-assert: after a flash op, MDM CONTROL keeps the
+    CE latches (bits 10:9) exactly as the reference leaves them and has
+    dropped only the SMU's bit 8 (and the verbatim bit 28)."""
+    from s32edbg.data.expected_apmap import AP_MDM
+    from s32edbg.data.ladder1 import MDM_CONTROL
+
+    code, out = run("flash", "jedec")
+    assert code == EXIT_OK
+    control = target.ap_space[AP_MDM + MDM_CONTROL]
+    assert control & 0x700 == 0x600, "CE latches stay latched; the SMU's drops"
+    assert control & 0x1000_0100 == 0
+
+
+def test_flash_default_reset_is_the_pin(run, target) -> None:
+    """Finding 15 aligns the flash reset default with the reference: RESET_B
+    (probe nRESET) toggled once -- assert, then release. `--reset sda`
+    remains the fallback and drives no pin traffic."""
+    code, out = run("flash", "jedec")
+    assert code == EXIT_OK
+    assert target.pin_reset_calls == [True, False]
+    target.pin_reset_calls.clear()
+    code, out = run("flash", "jedec", "--reset", "sda")
+    assert code == EXIT_OK
+    assert target.pin_reset_calls == []
+
+
 def test_flash_program_end_to_end_erases_writes_verifies_and_reports(
     run, target, tmp_path
 ) -> None:

@@ -131,3 +131,20 @@ def test_clear_core_edbgreq_is_a_true_read_modify_write() -> None:
 def test_clear_core_edbgreq_rejects_an_impossible_core_index() -> None:
     with pytest.raises(ValueError, match="not 0-3"):
         gates.clear_core_edbgreq(Dap(FakeTransport(pipelined=False)), core=4)
+
+
+def test_clear_smu_edbgreq_is_the_multitool_exact_rmw() -> None:
+    """s32multitool's M33_0 de-assert, verbatim (s32z2e2_cores.py
+    MDM_AP_DESC): RMW CONTROL clear 0x1000_0100. Bit 8 (the SMU latch) and
+    the undocumented bit 28 drop; the CE latches (bits 10:9), MSK_DBG_FAULT
+    and bits 30:29 survive; CONTROL2/CONTROL3 are untouched."""
+    from s32edbg.data.ladder1 import MDM_CONTROL, MDM_CONTROL2, MDM_CONTROL3
+
+    t = FakeTransport(pipelined=False)
+    t.ap_space[AP_MDM + MDM_CONTROL] = 0x7080_0700
+    t.ap_space[AP_MDM + MDM_CONTROL2] = 0x000F_0000
+    t.ap_space[AP_MDM + MDM_CONTROL3] = 0x000F_0000
+    gates.clear_smu_edbgreq(Dap(t))
+    assert t.ap_space[AP_MDM + MDM_CONTROL] == 0x6080_0600
+    assert t.ap_space[AP_MDM + MDM_CONTROL2] == 0x000F_0000
+    assert t.ap_space[AP_MDM + MDM_CONTROL3] == 0x000F_0000

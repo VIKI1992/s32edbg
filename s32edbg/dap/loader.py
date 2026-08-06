@@ -398,6 +398,12 @@ class SegmentWriter:
         self.ap_type = ap_type
         self.fast_alive = bool(use_fast and getattr(transport, "can_block_write", False))
         self.fast_ever_used = False
+        #: True once any WriteMem burst was ISSUED, successful or not. The
+        #: DLL wraps even a failing access in its stop-mode halt+access+go,
+        #: so the resume side effect (Finding 6) rides failed bursts too --
+        #: measured 2026-08-06: the first staging burst failed rc -1, fell
+        #: back to ADIv6, and the SMU was left running.
+        self.fast_ever_attempted = False
         self.fast_demoted = False
         self.fast_strikes = 0
         self._first_fast_block = True
@@ -466,6 +472,7 @@ class SegmentWriter:
           immediately: a lying writer is never trusted again this load.
         """
         if self.fast_alive:
+            self.fast_ever_attempted = True
             try:
                 self._write_fast_with_retry(addr, words)
                 self.fast_ever_used = True

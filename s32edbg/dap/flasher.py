@@ -282,6 +282,9 @@ class BulkReader:
         self.note = note
         self.fast_alive = bool(use_fast and getattr(transport, "can_block_read", False))
         self.fast_ever_used = False
+        #: True once any ReadMem burst was ISSUED, successful or not -- the
+        #: same failed-burst resume exposure as SegmentWriter.fast_ever_attempted.
+        self.fast_ever_attempted = False
         self.fast_demoted = False
         self.fast_bytes = 0
         self._first_fast_block = True
@@ -302,6 +305,7 @@ class BulkReader:
 
     def _read_block(self, addr: int, nbytes: int) -> bytes:
         if self.fast_alive:
+            self.fast_ever_attempted = True
             try:
                 data = self.transport.read_mem_block(addr, nbytes)  # type: ignore[attr-defined]
                 # The DLL moved SELECT/CSW/TAR beneath the Dap object.
@@ -474,8 +478,14 @@ class QspiFlasher:
         QSPI controller. One C_HALT re-assert (never `halt()` -- its first
         write would *resume* an already-halted core) after every burst, and
         a loud note when it actually caught the core running.
+
+        Gated on ATTEMPTED bursts, not successful ones: the DLL wraps even a
+        failing access in halt+access+go, so a burst that returned -1 and
+        fell back to ADIv6 resumed the core all the same (measured
+        2026-08-06 -- the first staging burst failed and the DCRSR register
+        save then died with S_REGRDY clear).
         """
-        if not (self.writer.fast_ever_used or self.reader.fast_ever_used):
+        if not (self.writer.fast_ever_attempted or self.reader.fast_ever_attempted):
             return
         _dhcsr, was_running = m33_mod.ensure_halted(self.dap, self.smu)
         if was_running:

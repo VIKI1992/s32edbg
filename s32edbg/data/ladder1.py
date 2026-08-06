@@ -72,12 +72,22 @@ MDM_CONTROL_MSK_DBG_FAULT = 1 << 23  # mask debug faults to the FCCU
 MDM_CONTROL_LOAD_ASSERT = 0x6080_0700
 
 #: CONTROL bits 10:8 -- the three M33 EDBGREQ latches (SMU + CE0/CE1) that
-#: MDM_CONTROL_LOAD_ASSERT raises. Which bit maps to which core is not
-#: documented in this repo's sources; the flash flow clears all three together,
-#: after every reachable M33 is pinned by its own DHCSR.C_HALT -- an EDBGREQ
-#: left latched re-halts the SMU the instant it is resumed into the flash
-#: applet (DFSR then reads "external debug request", not "breakpoint").
+#: MDM_CONTROL_LOAD_ASSERT raises. An EDBGREQ left latched re-halts the SMU
+#: the instant it is resumed into the flash applet (DFSR then reads "external
+#: debug request", not "breakpoint").
 MDM_CONTROL_M33_EDBGREQ_MASK = 0x0000_0700
+
+#: CONTROL bit 8 -- the SMU's own EDBGREQ latch. The bit-to-core mapping used
+#: to be undocumented here; it is established by s32multitool's de-assert
+#: table (s32z2e2_cores.py MDM_AP_DESC: M33_0 -> mask 0x10000100,
+#: CE_M33_0 -> 0x20000200, CE_M33_1 -> 0x40000400), which clears exactly this
+#: bit of [10:8] and then resumes the SMU into flash code without a re-halt.
+MDM_CONTROL_SMU_EDBGREQ = 0x0000_0100
+
+#: The verbatim clear mask from that de-assert: bit 8 plus bit 28, whose
+#: purpose is not documented in this repo's RM extracts -- carried verbatim
+#: (MDM_CONTROL_LOAD_ASSERT never sets bit 28, so clearing it is a no-op).
+MDM_CONTROL_SMU_EDBGREQ_CLEAR_MASK = 0x1000_0100
 MDM_CONTROL2_EDBGREQ_RTU0_ALL = 0x000F_0000
 MDM_CONTROL3_EDBGREQ_RTU1_ALL = 0x000F_0000
 

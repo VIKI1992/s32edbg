@@ -266,6 +266,96 @@ def test_the_run_builder_refuses_a_misaligned_chunk() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The SMU bring-up (Finding 15): s32multitool's _m33_smu(), verbatim
+# ---------------------------------------------------------------------------
+
+
+def test_the_smu_boot_table_is_the_multitool_sequence_verbatim() -> None:
+    """Order-exact pin of data/smuboot.ACTIONS_SMU_BOOT against the reference
+    (`_m33_smu()`, s32z2e2_init_sequence.py:210-250 in the NXP runtime that
+    s32multitool ships): thirteen writes, the CCUPD read-modify-write, the two
+    MC_ME key writes, the 20/10 ms pauses and the two gta-40 polls. A drifted
+    number here is a drifted bring-up -- this table is why a wiped board
+    flashes at all."""
+    from s32edbg.data import smuboot
+
+    expected = [
+        ("write32", 0x2500_2400, 0xF800_F000, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2404, 0xE7FE_E7FE, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2000, 0x2500_4000, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2004, 0x2500_2401, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2008, 0x2500_2401, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_200C, 0x2500_2401, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2010, 0x2500_2401, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2014, 0x2500_2401, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_2018, 0x2500_2401, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_4000, 0x0000_0000, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_4004, 0x0000_0000, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_4008, 0x0000_0000, 0xFFFF_FFFF, 0),
+        ("write32", 0x2500_400C, 0x0000_0000, 0xFFFF_FFFF, 0),
+        ("write32", 0x4106_004C, 0x0000_0000, 0xFFFF_FFFF, 0),
+        ("write32", 0x4190_014C, 0x2500_2000, 0xFFFF_FFFF, 0),
+        ("write32", 0x4190_0140, 0x0000_0001, 0xFFFF_FFFF, 0),
+        ("rmw", 0x4190_0144, 0x0000_0001, 0x0000_0001, 0),
+        ("write32", 0x4190_0000, 0x0000_5AF0, 0xFFFF_FFFF, 0),
+        ("write32", 0x4190_0000, 0x0000_A50F, 0xFFFF_FFFF, 0),
+        ("sleep", 0, 0, 0xFFFF_FFFF, 20),
+        ("poll", 0x4190_0144, 0x0000_0000, 0x0000_0001, 40),
+        ("poll", 0x4190_0148, 0x0000_0001, 0x0000_0001, 40),
+        ("sleep", 0, 0, 0xFFFF_FFFF, 10),
+    ]
+    got = [
+        (a.op, a.addr, a.value, a.mask, a.timeout_ms)
+        for a in smuboot.ACTIONS_SMU_BOOT
+    ]
+    assert got == expected
+
+
+def test_smu_boot_addresses_share_the_applet_map_deliberately() -> None:
+    """The bring-up writes its vector table over qspiflash.APPLET_STATUS and
+    zeroes stack words inside APPLET_DATA -- benign strictly by ordering (the
+    bring-up lands first, the flasher clobbers them later; the reference uses
+    the same memory map). Pinned so an applet-map move is noticed here rather
+    than as a corrupted mailbox on the bench."""
+    from s32edbg.data import smuboot
+
+    assert smuboot.SMU_VECTOR_BASE == qf.APPLET_STATUS
+    assert (
+        qf.APPLET_DATA
+        <= smuboot.SMU_STACK_TOP
+        < qf.APPLET_DATA + qf.APPLET_DATA_SIZE
+    )
+
+
+def test_run_init_actions_boots_a_dest0_smu_halted_at_the_stub() -> None:
+    """The Finding-15 mechanism against the DEST0 model: SMU unpowered
+    (Finding 14 -- every private-bus read zero, and no reset changes that),
+    EDBGREQ armed, then the four bring-up tables in the reference's order.
+    The MC_ME PRTN0 core-0 release powers the core up halted at the
+    debugger-written stub, identity readable again."""
+    from s32edbg.dap import memaccess
+    from s32edbg.data import rtuboot, smuboot
+    from s32edbg.data.expected_apmap import AP_AXI
+
+    target = SyntheticTarget()
+    target.smu_unpowered = True
+    dap = Dap(target)
+    dap.power_up()
+    gates.apply_ladder1(dap)
+    assert not m33_mod.identify(dap, m33_mod.M33_APS["smu"]).is_cortex_m33
+    gates.arm_edbgreq(dap)
+    memaccess.preflight(dap, AP_AXI, write=True)
+    loader.run_init_actions(dap, rtuboot.ACTIONS_RTU0_PARTITION)
+    loader.run_init_actions(dap, rtuboot.ACTIONS_RTU1_PARTITION)
+    loader.run_init_actions(dap, rtuboot.ACTIONS_GENERIC_SRAM)
+    loader.run_init_actions(dap, smuboot.ACTIONS_SMU_BOOT)
+    assert target.smu_unpowered is False
+    assert target.m33["halted"] is True, "the still-latched EDBGREQ caught it"
+    assert target.m33["pc"] == 0x2500_2400, "halted at the stub, not in BootROM"
+    assert m33_mod.identify(dap, m33_mod.M33_APS["smu"]).is_cortex_m33
+
+
+# ---------------------------------------------------------------------------
 # Flow tests against the SyntheticTarget's QSPI + applet model
 # ---------------------------------------------------------------------------
 
@@ -749,6 +839,33 @@ def test_a_writemem_that_resumes_the_smu_is_repinned_before_the_applet(monkeypat
     report = flasher.FlashReport(op="program")
     fl.program(data, 0x0030_0000, report)
     fl.verify(data, 0x0030_0000, report, mode="full")
+    assert any("resumed the SMU behind our back" in n for n in notes)
+    assert device.m33["halted"] is True, "the flow must end with the SMU pinned"
+
+
+class FailingResumingWriteTarget(FastWriteFlashTarget):
+    """The 2026-08-06 bench shape: every WriteMem burst FAILS (rc -1) -- and
+    still resumes the SMU, because the DLL wraps even a failing access in its
+    stop-mode halt+access+go."""
+
+    def write_mem_block(self, addr: int, data: bytes) -> None:
+        self.m33["halted"] = False
+        raise TransportError(f"JLINK_WriteMem(0x{addr:08X}, {len(data)}) returned -1")
+
+
+def test_a_failed_writemem_burst_still_gets_the_repin(monkeypatch) -> None:
+    """Measured 2026-08-06 on the DEST0-recovered board: the first staging
+    burst failed rc -1, fell back to ADIv6 -- and the DCRSR register save
+    then died with S_REGRDY clear, because the resume side effect rides
+    FAILED bursts too. The re-pin gates on attempted bursts, not successful
+    ones."""
+    monkeypatch.setattr(loader, "FAST_RETRY_PAUSE_S", 0)
+    device, _dap, fl, notes = make_flasher(FailingResumingWriteTarget(), use_fast=True)
+    data = bytes(range(256))
+    report = flasher.FlashReport(op="program")
+    fl.program(data, 0x0030_0000, report)
+    fl.verify(data, 0x0030_0000, report, mode="full")
+    assert fl.writer.fast_ever_used is False, "no burst ever succeeded"
     assert any("resumed the SMU behind our back" in n for n in notes)
     assert device.m33["halted"] is True, "the flow must end with the SMU pinned"
 

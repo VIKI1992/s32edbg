@@ -20,6 +20,7 @@ from s32edbg.data import m33debug as m33d
 from s32edbg.data import qspiflash as qflash
 from s32edbg.data import r52debug as r52
 from s32edbg.data import rtuboot
+from s32edbg.data import smuboot
 from s32edbg.data.expected_apmap import (
     AP_APB,
     AP_MDM,
@@ -403,6 +404,7 @@ class SyntheticTarget(MemApFake):
         self.mem[rtuboot.RGM_PSTAT0_1] = 0x1F
         #: (pconf, pupd, stat) triples the MC_ME key handshake commits.
         self._mc_me_triples = (
+            (0x4190_0140, 0x4190_0144, 0x4190_0148),  # PRTN0 core 0 (the SMU)
             (0x4190_0300, 0x4190_0304, 0x4190_0308),
             (0x4190_0340, 0x4190_0344, 0x4190_0348),
             (0x4190_0360, 0x4190_0364, 0x4190_0368),
@@ -470,6 +472,22 @@ class SyntheticTarget(MemApFake):
         #: M33 debug-register reads answer zero after each reset release.
         self.m33_dead_reads_after_reset = 0
         self._m33_dead_reads = 0
+        #: Finding 14 / DEST0 model: when True the SMU M33 subsystem is
+        #: unpowered -- every private-bus read answers zero, every write is
+        #: swallowed -- and no functional reset changes that. Only the MC_ME
+        #: PRTN0 core-0 release (Finding 15: CCE set, key commit) powers it
+        #: up, halted at its reset vector iff the MDM EDBGREQ latch is set.
+        self.smu_unpowered = False
+        #: Measured 2026-08-06 on the DEST0-recovered bench board: with the
+        #: M33 subsystem clock mux unselected (MC_CGM2_MUX0_CSC reads
+        #: 0x0F000000), SMU SRAM at 0x2500xxxx discards writes and reads
+        #: zero -- through every AP -- even though the MC_ME release brought
+        #: the core and its debug view up. When this knob is set, the SRAM
+        #: answers only once 0x41030300 holds 0x0F000004 (the config_m33
+        #: write the flash bring-up must issue).
+        self.smu_sram_gated = False
+        #: Every set_reset_pin() call, in order (True = assert nRESET).
+        self.pin_reset_calls: list[bool] = []
         # The PLL lock bit the bring-up table polls; everything else the
         # tables poll already reads as its expected value from an empty dict.
         self.mem[0x4022_0004] = 0x4
@@ -560,10 +578,13 @@ class SyntheticTarget(MemApFake):
         """Called when the SMU is resumed at the applet entry with the real
         binary staged. Returns True when it modelled the run (core re-halts).
 
-        The one trap modelled with full fidelity: a still-latched M33 EDBGREQ
-        in MDM CONTROL[10:8] re-halts the core before the applet executes,
-        with DFSR reading "external debug request" -- the failure
-        gates.clear_m33_edbgreq exists to prevent.
+        The one trap modelled with full fidelity: a still-latched SMU EDBGREQ
+        -- MDM CONTROL bit 8, the bit-to-core mapping s32multitool's de-assert
+        table establishes -- re-halts the core before the applet executes,
+        with DFSR reading "external debug request": the failure
+        gates.clear_smu_edbgreq exists to prevent. The CE latches (bits 10:9)
+        are not the SMU's and do not re-halt it; the flash flow deliberately
+        leaves them set, exactly as the reference does.
         """
         state = self.m33
         if state["pc"] != qflash.APPLET_BASE:
@@ -572,7 +593,7 @@ class SyntheticTarget(MemApFake):
             return False
         state["sticky"] |= m33d.DHCSR_S_RETIRE_ST
         control = self.ap_space.get(AP_MDM + lad.MDM_CONTROL, 0)
-        if control & lad.MDM_CONTROL_M33_EDBGREQ_MASK:
+        if control & lad.MDM_CONTROL_SMU_EDBGREQ:
             self.mem[m33d.DFSR] = self.mem.get(m33d.DFSR, 0) | m33d.DFSR_EXTERNAL
             return True  # halted again before the first instruction
         regs = state["regs"]
@@ -647,6 +668,20 @@ class SyntheticTarget(MemApFake):
             for pconf, pupd, stat in self._mc_me_triples:
                 self.mem[stat] = self.mem.get(pconf, 0)
                 self.mem[pupd] = 0
+            if (
+                self.smu_unpowered
+                and self.mem.get(smuboot.MC_ME_PRTN0_CORE0_PCONF, 0) & 1
+            ):
+                # Finding 15: the MC_ME PRTN0 core-0 release is what powers
+                # the SMU subsystem up out of DEST0 -- no reset does. With the
+                # MDM EDBGREQ latch (CONTROL bit 8) still set, the core comes
+                # up halted at the reset vector the debugger wrote -- the stub.
+                self.smu_unpowered = False
+                control = self.ap_space.get(AP_MDM + lad.MDM_CONTROL, 0)
+                state = self.m33
+                state["halted"] = bool(control & lad.MDM_CONTROL_SMU_EDBGREQ)
+                vector = self.mem.get(smuboot.MC_ME_PRTN0_CORE0_ADDR, 0)
+                state["pc"] = self.mem.get(vector + 4, 0) & ~1
             return
         if addr in self._sramc_bases:
             old = self.mem.get(addr, 0)
@@ -702,6 +737,8 @@ class SyntheticTarget(MemApFake):
         code under test relies on: channel 0 -> trigger out 0 -> debug request,
         channel 1 -> trigger out 1 -> restart.
         """
+        if self._smu_sram_dead(addr):
+            return True  # clock-starved SMU SRAM: the write lands on nothing
         self._loadflow_write(addr, value)
         handled = self._m33_write(addr, value)
         if handled:
@@ -781,6 +818,13 @@ class SyntheticTarget(MemApFake):
             if addr == debug_base + r52.EDPRSR:
                 self.mem[addr] = value & ~r52.EDPRSR_SDR
                 return value
+        if self.smu_unpowered and 0xE000_0000 <= addr < 0xE010_0000:
+            # DEST0 (Finding 14): the SMU subsystem is unpowered. The AP
+            # answers, but with nothing behind it -- and stays that way until
+            # the MC_ME PRTN0 core-0 release (Finding 15), reset or no reset.
+            return 0
+        if self._smu_sram_dead(addr):
+            return 0  # clock-starved SMU SRAM reads as nothing
         if self._m33_dead_reads > 0 and addr in (
             m33d.CPUID, m33d.DHCSR, m33d.DEMCR, m33d.FP_CTRL, m33d.DWT_CTRL, m33d.DFSR,
         ):
@@ -1031,6 +1075,11 @@ class SyntheticTarget(MemApFake):
         """The M33 registers whose write side is not plain storage."""
         state = self.m33
 
+        if self.smu_unpowered and 0xE000_0000 <= addr < 0xE010_0000:
+            # DEST0: writes to the unpowered private bus land on nothing --
+            # the blind DHCSR pre-arms the reference issues are no-ops there.
+            return True
+
         if addr == m33d.FP_CTRL:
             # NUM_CODE is read-only; ENABLE takes effect only with KEY set, and
             # a KEY-less write is discarded entirely -- both like silicon.
@@ -1160,7 +1209,17 @@ class SyntheticTarget(MemApFake):
             # anything): let the armed cross-halt channel do its level work.
             self._propagate_cross_halt()
 
+    def _smu_sram_dead(self, addr: int) -> bool:
+        """True while the gated SMU SRAM has no clock source selected."""
+        return (
+            self.smu_sram_gated
+            and 0x2500_0000 <= addr < 0x2504_0000
+            and self.mem.get(0x4103_0300, 0) != 0x0F00_0004
+        )
+
     def _functional_reset_released(self) -> None:
+        # `smu_unpowered` deliberately survives here: DEST0 ends at the MC_ME
+        # PRTN0 release (Finding 15), never at a reset (Finding 14).
         self._m33_dead_reads = self.m33_dead_reads_after_reset  # Finding 10
         rstctrl = self.ap_space.get(
             AP_SDA + lad.SDA_RSTCTRL, lad.SDA_RSTCTRL_RESET_VALUE
@@ -1197,6 +1256,27 @@ class SyntheticTarget(MemApFake):
         self.faulting.add(debug_base + r52.EDSCR)
 
     # -- transport surface the CLI reaches for with getattr -----------------
+
+    #: The DLL exports SetRESET/ClrRESET on the bench probe; the flash flow's
+    #: default reset is the pin since Finding 15.
+    can_pin_reset = True
+
+    def set_reset_pin(self, asserted: bool) -> None:
+        """J-Link SetRESET/ClrRESET: recorded, and mirrored onto the same
+        functional-reset model as SDASYSRSTC -- the nRESET pulse resets the
+        system, and the release runs the same post-reset consequences
+        (Finding-10 dead window, RTU debug-state wipe)."""
+        self.pin_reset_calls.append(asserted)
+        sysrsts = self.ap_space.get(AP_SDA + lad.SDA_SYSRSTS, 0)
+        if asserted:
+            self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
+                sysrsts | lad.SDA_SYSRSTS_SYSTEM_RESET
+            )
+        else:
+            self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
+                sysrsts & ~lad.SDA_SYSRSTS_SYSTEM_RESET
+            )
+            self._functional_reset_released()
 
     def open(self) -> None:
         self.open_calls = getattr(self, "open_calls", 0) + 1

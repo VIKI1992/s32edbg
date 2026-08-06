@@ -41,6 +41,7 @@ reset leaves the JTAGC and SWJ-DP alone.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from ..data.expected_apmap import AP_MDM, AP_SDA
@@ -54,6 +55,7 @@ from ..data.ladder1 import (
     MDM_CONTROL3_EDBGREQ_RTU1_ALL,
     MDM_CONTROL_LOAD_ASSERT,
     MDM_CONTROL_M33_EDBGREQ_MASK,
+    MDM_CONTROL_SMU_EDBGREQ_CLEAR_MASK,
     MDM_DEVARCH,
     MDM_DEVARCH_EXPECTED,
     MDM_IDR,
@@ -352,13 +354,30 @@ def clear_m33_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
     deliberately leaves them alone. The flash flow must not: an EDBGREQ left
     latched re-halts the SMU the instant it is resumed into the QSPI applet
     (DFSR then reads "external debug request" instead of "breakpoint").
-    Which of bits 10:8 belongs to which core is not documented in this repo's
-    sources, so all three are cleared together -- callers pin every reachable
-    M33 with its own DHCSR.C_HALT first, and an unreachable CE is unclocked
-    and cannot run anyway. MSK_DBG_FAULT and the rest of CONTROL are kept.
+    All three are cleared together -- callers pin every reachable M33 with its
+    own DHCSR.C_HALT first, and an unreachable CE is unclocked and cannot run
+    anyway. MSK_DBG_FAULT and the rest of CONTROL are kept. The flash flow
+    uses the multitool-exact narrow variant instead (`clear_smu_edbgreq`);
+    this cure-all remains valid -- it clears the SMU's bit 8 too.
     """
     current = dap.ap_read(ap_base, MDM_CONTROL)
     dap.ap_write(ap_base, MDM_CONTROL, current & ~MDM_CONTROL_M33_EDBGREQ_MASK)
+
+
+def clear_smu_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
+    """De-assert the SMU's debug request, s32multitool-verbatim.
+
+    The reference's `_m33_smu()` epilogue (`s32z2e2_cores.py`
+    `start_debug_by_core_name("..._M33_0")`): RMW CONTROL clear 0x1000_0100,
+    then a 0.05 s pause. Only the SMU's latch (bit 8) drops; the CE latches
+    (bits 10:9) stay exactly as the multitool leaves them -- the flash flow
+    resumes only the SMU, and on a wiped board the CEs are unpowered anyway.
+    Bit 28 is carried verbatim (undocumented in this repo's RM extracts;
+    `arm_edbgreq` never sets it, so clearing it is a no-op).
+    """
+    current = dap.ap_read(ap_base, MDM_CONTROL)
+    dap.ap_write(ap_base, MDM_CONTROL, current & ~MDM_CONTROL_SMU_EDBGREQ_CLEAR_MASK)
+    time.sleep(0.05)
 
 
 def assert_axi_safe(report: GateReport) -> None:
