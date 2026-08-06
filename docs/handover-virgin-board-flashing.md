@@ -1,7 +1,24 @@
-# Handover: bootloader flashing on a blank board must be fixed
+# Handover: bootloader flashing on a blank board (resolved by Finding 15)
 
-**Status: open defect. The board on this bench is currently blank and this tool
-cannot reflash it.**
+**Status: resolved — bench-verified 2026-08-06.** The fix is **Finding 15**
+(`docs/test-plan.md`): the flash flow now boots the SMU itself before every
+operation — s32multitool's `_m33_smu()` sequence, found verbatim in the NXP
+debugger runtime s32multitool ships
+(`ext/nxp_s32ds_3_6_1_debugger_runtime.nxp` →
+`tools/S32Debugger/Debugger/scripts/s32z2e2/s32z2e2_init_sequence.py:210-250`)
+— exactly where §4 below said to look, and the answer to its core question is
+**yes**. Ported as `s32edbg/data/smuboot.py` plus the bring-up block in
+`cli._flash_bringup` (+ the reference's `config_m33` clock step). The bench
+board wiped that day was recovered by this tool end to end: `flash jedec
+--ap axi` from DEST0, the full v3.1.0 BLOB programmed and byte-exact
+verified at offset 0, power cycle, bootloader running again.
+
+**Known issue (Finding 16, with TODOs):** the recovery is correct but slow —
+~37 minutes for the BLOB, because the DLL's WriteMem/ReadMem fast paths are
+unusable on this flow (`--no-fast` pure ADIv6 at ~1.3 KB/s) and a wiped
+board needs `--ap axi`. s32multitool does the same work in ~1.5–4.5 minutes.
+
+Everything below is the historical account of the defect, kept as measured.
 
 `s32edbg flash` programs, erases, verifies and reads the external QSPI NOR, and
 all of it is bench-proven — but **only while a bootable image is already in
@@ -120,6 +137,15 @@ reference GUI's virgin-board path (if it has one — worth checking whether
 s32multitool can program a blank board at all, or whether it also assumes a
 booting BootROM).
 
+*Resolved 2026-08-06: s32multitool CAN program a blank board, and the sequence
+was in its shipped S32DS runtime scripts all along — `_m33_smu()`, transcribed
+verbatim into `s32edbg/data/smuboot.py` and run by every flash op (Finding
+15). The clock-mux experiment below became moot: the reference releases the
+core via MC_ME PRTN0 with the mux untouched (its `config_m33` runs later, in
+the QSPI prepare), and the deferred-SMU idea in the last paragraph was not
+taken — the user chose exact alignment: every flash op boots the SMU, so all
+subcommands work on a blank board anyway.*
+
 Two experiments to run first, in order, on a blank board:
 
 1. Write `MC_CGM2_MUX0_CSC = 0x0F000004` via the AXI-AP (`mem write
@@ -164,6 +190,8 @@ last** → power cycle.
 
 - `flash erase --all` now refuses to be run casually: its confirmation states
   that the tool cannot put the bootloader back, and names the recovery routes.
+  (Since Finding 15 the confirmation says the opposite — the tool can reflash
+  the blank state — but stays a loud confirmation.)
 - README's `flash` section carries the same warning.
 - `docs/test-plan.md` carries Finding 14 (this defect) and Finding 13 (the
   related cascade race: on a blank board the escalating cascade also disturbs

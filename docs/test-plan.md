@@ -1786,14 +1786,14 @@ ordering.
 
 ---
 
-## The flash-state × debugging matrix — S1 measured 2026-08-05, S2-S5 blocked
+## The flash-state × debugging matrix — S1 measured 2026-08-05, S2-S5 unblocked by Finding 15
 
 **First-run status.** S1 (nothing in flash) ran and its record cells are
-measured (below). S2-S5 are blocked by **Finding 14**: their setup steps need
-`flash program`, which needs the SMU, which a blank board does not have. The
-matrix resumes once the bootloader is restored by one of Finding 14's routes —
-from S2 onward every state has a live SMU, so the remaining states should run
-as designed.
+measured (below). S2-S5 were blocked by **Finding 14**: their setup steps need
+`flash program`, which needs the SMU, which a blank board did not have.
+**Finding 15 removes the block** — the flash flow now boots the SMU itself,
+s32multitool-style — so the S1 `flash jedec` expectation flips to pass and
+the full S1→S5 run is pending its first bench execution.
 
 Measured S1 cells (`bench-runs/flashmatrix-20260805/S1/`), now the pinned
 expectations for a cascade board:
@@ -1804,8 +1804,8 @@ expectations for a cascade board:
 | `gates apply` | pass — gate open, exact read-back |
 | `apmap` | pass — matches RM Table 957 exactly |
 | `core list` | **no R52 debug frames answer at all** (refusal naming `gates apply`) |
-| `m33 list` | all three M33 APs read zeros — powered down in DEST0 |
-| `flash jedec` | **fails** at the SMU halt (Finding 14) |
+| `m33 list` | all three M33 APs read zeros — powered down in DEST0 (true *at attach*; a flash op then boots the SMU itself, Finding 15) |
+| `flash jedec` | **passes** since Finding 15 — measured 2026-08-06 with `--ap axi` (required on a cascade board, Finding 16). 2026-08-05 it failed at the SMU halt (Finding 14) |
 | `load --verify` | passes — proven repeatedly today (32.4 s, 111 KB/s) |
 
 
@@ -1883,12 +1883,142 @@ MC_CGM2 MUX0, measured reading `0x0F000000` = no source selected on the dead
 board), not an MC_ME partition-0 core release. That sequence is not in any
 source this repo may use; **ask the user/NXP before inventing it**.
 
-Consequence applied: the `flash erase --all` confirmation now states plainly
-that the tool cannot put the bootloader back, and points at the recovery
-routes. Range erases (which keep offset 0) carry no such trap.
+Consequence applied: the `flash erase --all` confirmation was made to state
+plainly that the tool cannot put the bootloader back, pointing at the recovery
+routes. (Superseded by Finding 15: the confirmation now says the opposite —
+the tool can reflash the blank state — and stays a loud confirmation.) Range
+erases (which keep offset 0) carry no such trap.
 
-**The full account, and what to fix, is
-`docs/handover-virgin-board-flashing.md`** — the open-defect handover for
-whoever takes this on.
+**The full account is `docs/handover-virgin-board-flashing.md`** — the
+handover for the defect. **Resolved by Finding 15**: the missing MC_ME
+partition-0 release existed in s32multitool's shipped NXP runtime all along,
+and the flash flow now runs it.
 
-The next finding number is **15**.
+### Finding 15 — the flash flow boots the SMU itself (s32multitool's `_m33_smu`), so a wiped board flashes
+
+2026-08-06. The answer to Finding 14's open question was sitting in
+s32multitool's own shipped debugger runtime
+(`C:\s32multitool\ext\nxp_s32ds_3_6_1_debugger_runtime.nxp` →
+`tools/S32Debugger/Debugger/scripts/s32z2e2/s32z2e2_init_sequence.py`), not
+in the four flash-profile files the original port took. The reference never
+depends on flash content: on **every** connect it pulses RESET_B with the MDM
+debug requests latched, enables the RTU partitions, ECC-inits the SMU/CE/RTU
+SRAMs, writes a two-word spin stub plus a vector table into SMU SRAM and
+releases the core through MC_ME PRTN0 core 0 (`_m33_smu()`, `:210-250`) — so
+DEST0 ends at the MC_ME release, not at any reset, and the still-latched
+EDBGREQ (CONTROL bit 8) catches the core at the stub.
+
+Ported verbatim (user decision 2026-08-06: always-on, full prologue):
+
+- `data/smuboot.py` — `ACTIONS_SMU_BOOT`, the `_m33_smu()` table: stub words,
+  vector table, stack zeros, `0x4106004C = 0` (NXP: "Release Cortex-M33 core
+  from WAIT state"), PRTN0_CORE0 ADDR/CCE/CCUPD, the MC_ME keys, the 20/10 ms
+  pauses and the two gta-40 polls. Pinned order-exact by
+  `tests/test_flash.py`.
+- `cli._flash_bringup` — after the reset release (plus the reference's flat
+  200 ms pause, kept on top of the flag polls) and the Finding-10 settle
+  poll, every flash op runs `ACTIONS_RTU0_PARTITION` →
+  `ACTIONS_RTU1_PARTITION` → `ACTIONS_GENERIC_SRAM` → `ACTIONS_SMU_BOOT` →
+  `qspiflash.ACTIONS_M33_CLOCK` through `loader.run_init_actions` on the
+  AXI-AP, then halts the SMU as before. The clock step is the reference's
+  `config_m33`, hoisted from the QSPI prepare into the bring-up: measured
+  2026-08-06, the MC_ME release brings up the core and its debug view but
+  SMU SRAM discards writes until MC_CGM2 MUX0 selects a source — and the
+  reference always runs `config_m33` before its first SRAM touch on a wiped
+  board. Wiped and healthy boards take the same path, exactly as the
+  reference does on every connect.
+- flash `--reset` default flipped `sda` → `pin`: the reference's RESET_B
+  toggle. `sda` and `none` remain as overrides (`none` still cannot recover
+  a wiped board and keeps its fatal preflight).
+- `gates.clear_smu_edbgreq` — the reference's de-assert verbatim
+  (`s32z2e2_cores.py` `MDM_AP_DESC`): RMW CONTROL clear `0x1000_0100`, then
+  0.05 s. Only the SMU's latch (bit 8) drops; the CE latches (10:9) stay
+  set, exactly as the reference leaves them. `clear_m33_edbgreq` remains for
+  the load flow and as the documented cure-all.
+- One deliberate ordering difference, kept and commented: the reference
+  de-asserts then halts; this flow halts (DHCSR pin-down) then de-asserts,
+  because the "prove the halt survived" check is built on that order. The
+  end state — SMU halted via DHCSR, bit 8 clear — is identical.
+
+The deltas that remain are transport-side only: the J-Link nRESET reaches the
+SBC/PMIC through R439 (D-2) where the S32 probe drives RESET_B directly
+(fallback: `--reset sda`), and the reference's blind DHCSR pre-arms on dead
+APs are preflight-skipped here (believed immaterial — writes to an unpowered
+AP land on nothing).
+
+Offline status: the DEST0 model (`SyntheticTarget.smu_unpowered` +
+`smu_sram_gated` — private bus reads zero, no reset revives it, only the
+MC_ME PRTN0 release does; SRAM answers only once the clock mux is selected)
+makes the old flow fail and the new flow pass end to end
+(`tests/test_cli.py`); the full suite is green.
+
+**Bench status: VERIFIED 2026-08-06** on the board wiped that same day
+(`flash erase --offset 0x0 --length 0x200000`, power-cycled into the
+cascade): `flash jedec --ap axi` passed from DEST0 — the settle poll timed
+out with the AP dead, the bring-up revived the SMU, the full cold QSPI
+tables ran including the PLL writes (the Finding-11 XRDC fault never
+materialised) — then `flash program <v3.1.0 BLOB> --offset 0x0 --ap axi
+--no-fast` erased, programmed and byte-exact-verified all 1,907,168 bytes
+(IVT `0xD1` confirmed in place), and the power cycle booted the restored
+bootloader on the SMU (operator-confirmed). Artifacts:
+`bench-runs/finding15-20260806/`. The recovery is correct but slow, and
+wiped boards need `--ap axi --no-fast` — the speed story and its TODOs are
+**Finding 16**. The full S1→S5 matrix re-run remains open.
+
+### Finding 16 — virgin-board flashing works, but slowly: the DLL fast paths are unusable on this flow (KNOWN ISSUE + TODO)
+
+Measured 2026-08-06 during the Finding-15 acceptance run (V13 J-Link, V9.62
+DLL, `--speed 16000`). The recovery **passed end to end but took 36.7
+minutes** (`bench-runs/finding15-20260806/06-program-blob.json`):
+
+| phase | measured |
+|---|---|
+| erase 1,908,736 bytes | 11.9 s |
+| program 1,043,456 non-blank bytes (13 applet calls, 3,374 blank pages skipped) | 778.5 s ≈ 1.3 KB/s |
+| full byte-exact verify of 1,907,168 bytes | 1381.6 s ≈ 1.3 KB/s |
+| total | 2199.4 s |
+
+s32multitool's own baseline for the same class of work is **~84–268 s**
+(`C:\s32multitool\docs\RAW_QSPI_PERFORMANCE_BASELINE.md`: "prime blob before
+mixed erase — program+verify 83.877s"; BR1-image smart-skip runs 104–268 s)
+— its GDB/GTA route stages bulk data through the core context instead of
+word-by-word over the DAP. This tool now matches it on capability, not on
+speed: roughly **10–26× slower**. Two measured causes:
+
+1. **`JLINK_WriteMem` fails every burst on this flow** — rc `-1` on the very
+   first 2072-byte staging write, healthy and wiped board alike, with either
+   the SMU AHB-AP or the AXI-AP registered; a USB replug of the probe does
+   not clear it. Worse than useless: the DLL wraps even a failing access in
+   its stop-mode halt+access+go, so a failed burst *resumed* the SMU (the
+   `_repin_after_fast` guard now gates on **attempted** bursts, not
+   successful ones — `tests/test_flash.py`
+   `test_a_failed_writemem_burst_still_gets_the_repin`), and with the AXI-AP
+   registered one failed burst left the whole SMU debug view reading zeros
+   (`DHCSR 0x00000000`, the `smu did not halt within 2.0s` abort). Every
+   successful flash op on the wiped board ran `--no-fast`: pure ADIv6 word
+   traffic at ~1.3 KB/s. Note this is not Finding 9's budget wedge (fresh
+   connection per op, first write of the session) — it is a new, unexplained
+   rc `-1`, first seen the same day the flow gained the pin-reset default
+   and the SMU bring-up.
+2. **Wiped boards additionally need `--ap axi`**: after the DEST0 recovery
+   the SMU AHB-AP serves the QSPI registers and the M33 debug view, but its
+   SRAM view stays cold — the preflight probe word reads zero even with the
+   M33 clock selected. The AXI-AP serves everything. The state-matrix script
+   passes `--ap axi` on the cascade states for exactly this reason.
+
+**TODO** (the known issue, in order of payoff):
+
+- [ ] Root-cause the WriteMem rc `-1` (pin-reset interaction? the
+  `CORTEX-R52` device string vs the M33 AP registration? DLL version?) and
+  bring the fast write path back — target is s32multitool's minutes, not
+  tens of minutes, for a BLOB program.
+- [ ] Auto-failover the flash memory AP: when the preflight RAM probe fails
+  on the default SMU AHB-AP, retry once on the AXI-AP before giving up, so
+  wiped boards need no operator flag.
+- [ ] Try a fast-read-only mode (ReadMem through the AXI-AP was the proven
+  fast configuration, Finding 12) so the verify leg stops costing 23 minutes
+  even while writes stay ADIv6.
+- [ ] Re-measure s32multitool's wall clock for the same v3.1.0 BLOB on this
+  bench as the concrete target number.
+
+The next finding number is **17**.

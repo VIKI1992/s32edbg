@@ -1308,12 +1308,16 @@ host-driven — WREN, the slot-0 `CHIP_ERASE` command, then an RDSR WIP poll tha
 run minutes. Reads and verify go through the memory-mapped AHB window; verify is byte-exact —
 no CRC anywhere in the chain, same as the reference.
 
-Every subcommand first quiesces the SoC the same way `load` does — fresh probe connection
-(Finding 9), LADDER-1, a functional reset with every debug request latched, every reachable M33
-pinned by its own DHCSR — then clears the M33 EDBGREQ latches (`MDM CONTROL[10:8]`; left set,
-the SMU re-halts the instant it is resumed into the applet) and proves the memory AP actually
-serves the controller and the applet RAM before anything destructive. Destructive commands also
-gate on the JEDEC identity first: anything but `0xC23989C2` is refused unless `--force-jedec`.
+Every subcommand first brings the SoC up the way s32multitool does on every connect — fresh
+probe connection (Finding 9), LADDER-1, a pin (RESET_B) reset with every debug request latched,
+then the reference's own bring-up: MC_ME/RGM partition enables, the NXP SRAM scrubs, and the
+MC_ME PRTN0 core-0 release that boots the SMU onto a debugger-written stub (Finding 15 — this
+is why a completely wiped board is flashable). The SMU is then pinned by its own DHCSR and its
+EDBGREQ latch dropped (multitool-exact: `CONTROL &= ~0x10000100`, the CE latches left as the
+reference leaves them; left set, the SMU re-halts the instant it is resumed into the applet),
+and the flow proves the memory AP actually serves the controller and the applet RAM before
+anything destructive. Destructive commands also gate on the JEDEC identity first: anything but
+`0xC23989C2` is refused unless `--force-jedec`.
 
 **Destinations are always explicit** — `--offset 0x...` or a named `--area` from the reference
 project's `flash_address_sets.json`; there is no default:
@@ -1338,13 +1342,23 @@ because erase-before-write is unconditional and all-`0xFF` 256-byte pages are sk
 NOR already reads `0xFF` (`--no-skip-blank` to program them anyway; the full verify covers the
 skipped pages either way).
 
-**Do not erase the whole device unless you have another way to reflash it.** Measured
-2026-08-05 (test-plan Finding 14): with nothing bootable in flash the BootROM fail cascade
-escalates to a destructive reset and the **SMU M33 reads as powered down** — and the SMU is the
-core that executes the flash applet, so every later `flash` command fails. `s32edbg` cannot put
-the bootloader back on a board it fully erased; recovery needs s32multitool/S32DS, the
-bootloader's UDS path, or the serial-boot strap (`docs/virgin-board.md`). RAM `load` keeps
-working throughout. Range erases that keep offset 0 carry no such trap.
+**`erase --all` un-boots the board until something is programmed back — and this tool can now
+program it back.** Measured 2026-08-05 (test-plan Finding 14): with nothing bootable in flash
+the BootROM fail cascade escalates to a destructive reset and the **SMU M33 reads as powered
+down** at attach. Since Finding 15 that state is recoverable here: every flash op boots the SMU
+itself (s32multitool's MC_ME PRTN0 core-0 release, `data/smuboot.py`), so
+`flash program <BLOB> --offset 0x0` restores the bootloader on a fully blank board —
+**bench-proven 2026-08-06** (wiped board → jedec → full BLOB program + byte-exact verify →
+power cycle → bootloader running). RAM `load` keeps working throughout; range erases that keep
+offset 0 never un-boot the board in the first place.
+
+**Known issue (Finding 16): virgin-board flashing works but is slow.** On a wiped board the
+flow currently needs `--ap axi` (the recovered SMU AHB-AP's SRAM view stays cold) and
+`--no-fast` (the DLL's WriteMem fails every burst on this flow and damages the SMU state even
+when failing), so the whole recovery rides pure ADIv6 at ~1.3 KB/s — ~37 minutes for the
+1.9 MiB BLOB where s32multitool's baseline is ~1.5–4.5 minutes. The measurements and the TODO
+list (root-cause WriteMem, auto-failover to the AXI-AP, fast-read-only verify) live under
+test-plan **Finding 16**.
 
 **Programming for normal boot needs more than the image.** The M33 bootloader starts the app
 only when the app-valid flag `0x55AA55AA` sits at flash `0x100000`, the app is laid out
@@ -1368,10 +1382,11 @@ before anything touches offset 0, and so should a first manual run.
 overrides the read-window base (default `0x0`, automatic one-time failover to `0x08000000` —
 the reference profile carries both); `--no-fast` disables the WriteMem/ReadMem fast paths (pure
 ADIv6, ~4 KB/s — the fast paths carry the same first-block-proof + sampled-cross-check + demote
-discipline as `load`); `--reset sda|pin|none` picks the quiesce mechanism (`none` attaches
-as-is — unproven while firmware may own the controller). `program`: `--verify full|sampled|none`
-(default full), `--no-skip-blank`. `erase`: `--length`, `--all`, `--no-verify` (skip the blank
-check). Destructive ops prompt unless `--yes`.
+discipline as `load`); `--reset pin|sda|none` picks the reset (default `pin`, the
+reference's RESET_B toggle — Finding 15; `sda` is the chip-internal fallback; `none` attaches
+as-is — cannot recover a wiped board, and unproven while firmware may own the controller).
+`program`: `--verify full|sampled|none` (default full), `--no-skip-blank`. `erase`: `--length`,
+`--all`, `--no-verify` (skip the blank check). Destructive ops prompt unless `--yes`.
 
 **Power-cycle to boot what you flashed.** No flash subcommand resets into the new image on
 purpose: the reference project documents that a debug reset is not equivalent to the cold boot

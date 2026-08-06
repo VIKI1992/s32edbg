@@ -7,6 +7,8 @@
     Five states, from docs/app-boot-contract.md:
 
       S1  nothing (chip-erased)      -> BootROM fail cascade; SMU AP dead at attach
+                                        (flash ops still work: they boot the SMU
+                                        themselves, test-plan Finding 15)
       S2  bootloader only            -> BL superloop on the SMU; R52s never released
       S3  bootloader + app, no flag  -> same as S2 (the flag gates the app start)
       S4  bootloader + app + flag    -> normal boot: the app runs on rtu0.0 + rtu0.1
@@ -181,7 +183,7 @@ function Invoke-StateBattery {
     Invoke-Step -Name "$State-core-list" -Arguments @('core', 'list') -AllowFailure `
         -Expect "R52 discovery; per-state core states are RECORDED on this run ($State)"
     Invoke-Step -Name "$State-m33-list" -Arguments @('m33', 'list') -AllowFailure `
-        -Expect 'M33 discovery; SMU running under the BL (S2-S4), dead AP on the cascade (S1/S5)'
+        -Expect 'M33 discovery; SMU running under the BL (S2-S4); dead APs at attach on the cascade (S1/S5 -- a flash op then boots the SMU itself, Finding 15)'
 
     # -- 5. run-control battery, one debug session ---------------------------
     if ($State -eq 'S4') {
@@ -226,9 +228,16 @@ function Invoke-StateBattery {
 
     # -- 6./7. the quiesce-resetting steps, last -----------------------------
     Note-ObservationWindow -State $State
+    $jedecArgs = @('flash', 'jedec')
+    if ($cascade) {
+        # Finding 16: on a cascade/DEST0-recovered board the SMU AHB-AP's
+        # SRAM view stays cold; the flash flow needs the AXI-AP (measured
+        # 2026-08-06 -- the default AP fails the preflight RAM probe).
+        $jedecArgs += @('--ap', 'axi')
+    }
     Invoke-Step -Name "$State-flash-jedec" -ChangesTargetState `
-        -Arguments ($SPEED + @('flash', 'jedec')) `
-        -Expect 'JEDEC 0xC23989C2 in every state (quiesce reset; ends the observation phase)' `
+        -Arguments ($SPEED + $jedecArgs) `
+        -Expect 'JEDEC 0xC23989C2 in every state (boots the SMU itself, Finding 15; ends the observation phase)' `
         -Check { param($p) $p.jedec -eq '0xC23989C2' }
     Invoke-Step -Name "$State-load" -ChangesTargetState `
         -Arguments ($SPEED + @('load', $ElfPath, '--verify')) `
