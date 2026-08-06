@@ -1,0 +1,730 @@
+{
+  "name": "s32e-debug",
+  "displayName": "S32E Debug",
+  "description": "Debug NXP S32E27x boards over J-Link using the s32edbg backend: run control, RAM load, breakpoints, disassembly for 4x Cortex-R52 + 3x Cortex-M33.",
+  "version": "0.1.0",
+  "publisher": "s32e-tools",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "s32eDebug",
+          "title": "S32E Debug",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "s32eDebug": [
+        {
+          "id": "s32e.session",
+          "name": "Session",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.cores",
+          "name": "Cores",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.callStack",
+          "name": "Call Stack",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.registers",
+          "name": "Registers",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.breakpoints",
+          "name": "Breakpoints",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.watchpoints",
+          "name": "Watchpoints",
+          "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.memory",
+          "name": "Memory",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "s32e.session",
+        "contents": "Not connected to the board.\n[Connect](command:s32e.connect)\nConnecting opens one persistent J-Link session (each fresh connect pulses the board's reset line, so the session stays open until you disconnect).\nBoard misbehaving? Run diagnostics first:\n[Doctor](command:s32e.doctor) · [Probe info](command:s32e.probe)",
+        "when": "!s32e.connected"
+      },
+      {
+        "view": "s32e.cores",
+        "contents": "Connect to discover cores.",
+        "when": "!s32e.connected"
+      }
+    ],
+    "commands": [
+      {
+        "command": "s32e.connect",
+        "title": "Connect",
+        "category": "S32E",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "s32e.disconnect",
+        "title": "Disconnect",
+        "category": "S32E",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "s32e.healthCheck",
+        "title": "Backend Health Check",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.showOutput",
+        "title": "Show Output Log",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.pickFocusCore",
+        "title": "Focus Core...",
+        "category": "S32E",
+        "icon": "$(record)"
+      },
+      {
+        "command": "s32e.focusCore",
+        "title": "Focus This Core",
+        "category": "S32E",
+        "icon": "$(record)"
+      },
+      {
+        "command": "s32e.haltCore",
+        "title": "Halt Core",
+        "category": "S32E",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "s32e.resumeCore",
+        "title": "Resume Core",
+        "category": "S32E",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "s32e.haltAll",
+        "title": "Halt All Cores",
+        "category": "S32E",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "s32e.resumeAll",
+        "title": "Resume All Cores",
+        "category": "S32E",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "s32e.toggleSync",
+        "title": "Toggle Sync (stop-the-world) Mode",
+        "category": "S32E",
+        "icon": "$(link)"
+      },
+      {
+        "command": "s32e.refreshCores",
+        "title": "Refresh Cores",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "s32e.unlockCore",
+        "title": "Unlock Core (OS/software lock)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.catchCore",
+        "title": "Catch at First Instruction",
+        "category": "S32E",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "s32e.disarmCatch",
+        "title": "Disarm Catch",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.resetHaltCore",
+        "title": "Reset and Halt (resets whole SoC)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.sampleCore",
+        "title": "Sample PC (profile running core)",
+        "category": "S32E",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "s32e.openDisasm",
+        "title": "Open Disassembly",
+        "category": "S32E",
+        "icon": "$(file-binary)"
+      },
+      {
+        "command": "s32e.continue",
+        "title": "Continue (focused core)",
+        "category": "S32E",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "s32e.halt",
+        "title": "Halt (focused core)",
+        "category": "S32E",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "s32e.stepLineIn",
+        "title": "Step Into (source line)",
+        "category": "S32E",
+        "icon": "$(debug-step-into)"
+      },
+      {
+        "command": "s32e.stepLineOver",
+        "title": "Step Over (source line)",
+        "category": "S32E",
+        "icon": "$(debug-step-over)"
+      },
+      {
+        "command": "s32e.stepOut",
+        "title": "Step Out",
+        "category": "S32E",
+        "icon": "$(debug-step-out)"
+      },
+      {
+        "command": "s32e.stepInstrIn",
+        "title": "Step Instruction",
+        "category": "S32E",
+        "icon": "$(debug-step-into)"
+      },
+      {
+        "command": "s32e.stepInstrOver",
+        "title": "Step Instruction Over (skip calls)",
+        "category": "S32E",
+        "icon": "$(debug-step-over)"
+      },
+      {
+        "command": "s32e.runToCursor",
+        "title": "Run to Cursor (S32E)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.chooseElf",
+        "title": "Choose ELF...",
+        "category": "S32E",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "s32e.loadElf",
+        "title": "Load ELF to RAM (resets whole SoC)",
+        "category": "S32E",
+        "icon": "$(desktop-download)"
+      },
+      {
+        "command": "s32e.resymbolicate",
+        "title": "Reload Symbols from Active ELF",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.addBreakpointByAddress",
+        "title": "Add Breakpoint by Address...",
+        "category": "S32E",
+        "icon": "$(add)"
+      },
+      {
+        "command": "s32e.removeBreakpoint",
+        "title": "Remove Breakpoint",
+        "category": "S32E",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "s32e.retargetBreakpoint",
+        "title": "Move Breakpoint to Another Core...",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.duplicateBreakpoint",
+        "title": "Duplicate Breakpoint to Another Core...",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.clearAllBreakpoints",
+        "title": "Clear All Breakpoints",
+        "category": "S32E",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "s32e.addWatchpoint",
+        "title": "Add Watchpoint...",
+        "category": "S32E",
+        "icon": "$(add)"
+      },
+      {
+        "command": "s32e.removeWatchpoint",
+        "title": "Remove Watchpoint",
+        "category": "S32E",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "s32e.clearAllWatchpoints",
+        "title": "Clear All Watchpoints",
+        "category": "S32E",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "s32e.toggleDisasmBreakpoint",
+        "title": "Toggle Breakpoint at This Instruction",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.refreshStack",
+        "title": "Refresh Call Stack",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "s32e.refreshRegisters",
+        "title": "Refresh Registers",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "s32e.editRegister",
+        "title": "Edit Register Value",
+        "category": "S32E",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "s32e.readMemory",
+        "title": "Read Memory...",
+        "category": "S32E",
+        "icon": "$(add)"
+      },
+      {
+        "command": "s32e.writeMemory",
+        "title": "Write Memory...",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.refreshMemory",
+        "title": "Refresh Memory View",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "s32e.doctor",
+        "title": "Diagnostics: Doctor (board diagnosis)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.probe",
+        "title": "Diagnostics: Probe Info",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.report",
+        "title": "Diagnostics: Full Report",
+        "category": "S32E"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "s32e.focusCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.haltCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.resumeCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.unlockCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.catchCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.disarmCatch",
+          "when": "false"
+        },
+        {
+          "command": "s32e.resetHaltCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.sampleCore",
+          "when": "false"
+        },
+        {
+          "command": "s32e.removeBreakpoint",
+          "when": "false"
+        },
+        {
+          "command": "s32e.retargetBreakpoint",
+          "when": "false"
+        },
+        {
+          "command": "s32e.duplicateBreakpoint",
+          "when": "false"
+        },
+        {
+          "command": "s32e.removeWatchpoint",
+          "when": "false"
+        },
+        {
+          "command": "s32e.editRegister",
+          "when": "false"
+        },
+        {
+          "command": "s32e.connect",
+          "when": "!s32e.connected"
+        },
+        {
+          "command": "s32e.disconnect",
+          "when": "s32e.connected"
+        },
+        {
+          "command": "s32e.doctor",
+          "when": "!s32e.connected"
+        },
+        {
+          "command": "s32e.probe",
+          "when": "!s32e.connected"
+        },
+        {
+          "command": "s32e.report",
+          "when": "!s32e.connected"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "s32e.connect",
+          "when": "view == s32e.session && !s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.disconnect",
+          "when": "view == s32e.session && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.haltAll",
+          "when": "view == s32e.cores && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.resumeAll",
+          "when": "view == s32e.cores && s32e.connected",
+          "group": "navigation@2"
+        },
+        {
+          "command": "s32e.toggleSync",
+          "when": "view == s32e.cores && s32e.connected",
+          "group": "navigation@3"
+        },
+        {
+          "command": "s32e.refreshCores",
+          "when": "view == s32e.cores && s32e.connected",
+          "group": "navigation@4"
+        },
+        {
+          "command": "s32e.refreshStack",
+          "when": "view == s32e.callStack && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.refreshRegisters",
+          "when": "view == s32e.registers && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.addBreakpointByAddress",
+          "when": "view == s32e.breakpoints && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.clearAllBreakpoints",
+          "when": "view == s32e.breakpoints && s32e.connected",
+          "group": "navigation@2"
+        },
+        {
+          "command": "s32e.addWatchpoint",
+          "when": "view == s32e.watchpoints && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.clearAllWatchpoints",
+          "when": "view == s32e.watchpoints && s32e.connected",
+          "group": "navigation@2"
+        },
+        {
+          "command": "s32e.readMemory",
+          "when": "view == s32e.memory && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.refreshMemory",
+          "when": "view == s32e.memory && s32e.connected",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "s32e.focusCore",
+          "when": "view == s32e.cores && viewItem =~ /core/",
+          "group": "inline@1"
+        },
+        {
+          "command": "s32e.haltCore",
+          "when": "view == s32e.cores && viewItem =~ /running/",
+          "group": "inline@2"
+        },
+        {
+          "command": "s32e.resumeCore",
+          "when": "view == s32e.cores && viewItem =~ /halted/",
+          "group": "inline@2"
+        },
+        {
+          "command": "s32e.openDisasm",
+          "when": "view == s32e.cores && viewItem =~ /core/",
+          "group": "inline@3"
+        },
+        {
+          "command": "s32e.catchCore",
+          "when": "view == s32e.cores && viewItem =~ /r52core/",
+          "group": "1_control@1"
+        },
+        {
+          "command": "s32e.disarmCatch",
+          "when": "view == s32e.cores && viewItem =~ /catcharmed/",
+          "group": "1_control@2"
+        },
+        {
+          "command": "s32e.resetHaltCore",
+          "when": "view == s32e.cores && viewItem =~ /r52core/",
+          "group": "1_control@3"
+        },
+        {
+          "command": "s32e.unlockCore",
+          "when": "view == s32e.cores && viewItem =~ /r52core/",
+          "group": "1_control@4"
+        },
+        {
+          "command": "s32e.sampleCore",
+          "when": "view == s32e.cores && viewItem =~ /running/",
+          "group": "1_control@5"
+        },
+        {
+          "command": "s32e.removeBreakpoint",
+          "when": "view == s32e.breakpoints && viewItem == breakpoint",
+          "group": "inline@1"
+        },
+        {
+          "command": "s32e.retargetBreakpoint",
+          "when": "view == s32e.breakpoints && viewItem == breakpoint",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "s32e.duplicateBreakpoint",
+          "when": "view == s32e.breakpoints && viewItem == breakpoint",
+          "group": "1_edit@2"
+        },
+        {
+          "command": "s32e.removeWatchpoint",
+          "when": "view == s32e.watchpoints && viewItem == watchpoint",
+          "group": "inline@1"
+        },
+        {
+          "command": "s32e.editRegister",
+          "when": "view == s32e.registers && viewItem == register",
+          "group": "inline@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "s32e.runToCursor",
+          "when": "s32e.connected && s32e.focusHalted && resourceScheme == file",
+          "group": "s32e@1"
+        },
+        {
+          "command": "s32e.toggleDisasmBreakpoint",
+          "when": "resourceScheme == s32e-disasm",
+          "group": "s32e@1"
+        },
+        {
+          "command": "s32e.runToCursor",
+          "when": "s32e.connected && s32e.focusHalted && resourceScheme == s32e-disasm",
+          "group": "s32e@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "s32e.continue",
+        "key": "f5",
+        "when": "s32e.connected && s32e.focusHalted && !inDebugMode"
+      },
+      {
+        "command": "s32e.halt",
+        "key": "f6",
+        "when": "s32e.connected && !s32e.focusHalted && !inDebugMode"
+      },
+      {
+        "command": "s32e.stepLineOver",
+        "key": "f10",
+        "when": "s32e.connected && s32e.focusHalted && !inDebugMode"
+      },
+      {
+        "command": "s32e.stepLineIn",
+        "key": "f11",
+        "when": "s32e.connected && s32e.focusHalted && !inDebugMode"
+      },
+      {
+        "command": "s32e.stepOut",
+        "key": "shift+f11",
+        "when": "s32e.connected && s32e.focusHalted && !inDebugMode"
+      },
+      {
+        "command": "s32e.stepInstrOver",
+        "key": "alt+f10",
+        "when": "s32e.connected && s32e.focusHalted && !inDebugMode"
+      },
+      {
+        "command": "s32e.stepInstrIn",
+        "key": "alt+f11",
+        "when": "s32e.connected && s32e.focusHalted && !inDebugMode"
+      }
+    ],
+    "colors": [
+      {
+        "id": "s32e.pcLineBackground",
+        "description": "Background of the line the focused core's PC is at",
+        "defaults": {
+          "dark": "#ffff0026",
+          "light": "#ffff6633",
+          "highContrast": "#ffff0026",
+          "highContrastLight": "#ffff6633"
+        }
+      }
+    ],
+    "configuration": {
+      "title": "S32E Debug",
+      "properties": {
+        "s32e.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python 3.11+ (64-bit) interpreter with s32edbg installed (pip install -e <repo>[ide])."
+        },
+        "s32e.jlinkDir": {
+          "type": "string",
+          "default": "",
+          "description": "SEGGER J-Link install directory (empty = auto-discover)."
+        },
+        "s32e.serial": {
+          "type": "string",
+          "default": "",
+          "description": "J-Link probe serial number (empty = auto)."
+        },
+        "s32e.speedKhz": {
+          "type": "number",
+          "default": 16000,
+          "description": "JTAG speed in kHz. 16000 is bench-proven on the S32E277 SOM; the tool's own default is 4000."
+        },
+        "s32e.device": {
+          "type": "string",
+          "default": "CORTEX-R52",
+          "description": "J-Link device name passed to the backend. Must never be empty (an empty device wedges the probe until board power-cycle)."
+        },
+        "s32e.pollIntervalMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 0,
+          "description": "Core-status poll interval while connected (0 disables polling; views then refresh only on your actions)."
+        },
+        "s32e.confirmDestructive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask before actions that reset the whole SoC (Load to RAM, Reset and Halt) or write memory."
+        },
+        "s32e.maxStackFrames": {
+          "type": "number",
+          "default": 32,
+          "description": "Maximum call-stack frames to unwind."
+        },
+        "s32e.disasm.before": {
+          "type": "number",
+          "default": 32,
+          "description": "Instructions to disassemble before the anchor address."
+        },
+        "s32e.disasm.after": {
+          "type": "number",
+          "default": 96,
+          "description": "Instructions to disassemble after the anchor address."
+        },
+        "s32e.memory.defaultAp": {
+          "type": "string",
+          "default": "axi",
+          "enum": ["axi", "apb", "mdm", "sda", "ahb-smu", "ahb-ce0", "ahb-ce1", "ahb-r0", "ahb-r1"],
+          "description": "Default access port for the memory viewer. axi sees RAM; it is unreachable while functional reset is asserted."
+        },
+        "s32e.load.verifyFull": {
+          "type": "boolean",
+          "default": false,
+          "description": "Full word-for-word verify after Load to RAM (sampled verification always runs)."
+        },
+        "s32e.load.core1": {
+          "type": "string",
+          "default": "leave",
+          "enum": ["leave", "park", "release"],
+          "enumDescriptions": [
+            "Leave rtu0.1 untouched (core0 firmware brings it up itself)",
+            "Bring rtu0.1 up halted at the entry",
+            "Bring rtu0.1 up free-running"
+          ],
+          "description": "rtu0.1 handling after Load to RAM."
+        }
+      }
+    }
+  }
+}
