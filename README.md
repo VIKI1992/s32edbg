@@ -1608,13 +1608,99 @@ This is the right thing to attach to a bug report.
 
 ---
 
+## IDE integration — machine mode, symbols, and the VS Code extension
+
+Everything above speaks to a human at a terminal. `vscode/` in this repo is a VS Code extension
+("S32E Debug") that speaks to the same tool from its own Activity Bar container — no Run-and-Debug
+tab, no DAP, no GDB stub. It rides on three additions to the CLI.
+
+### `debug --machine` — the NDJSON session protocol
+
+```bat
+s32edbg --speed 16000 debug --machine        (stdin must be a pipe)
+```
+
+One persistent session (the D-2 rule unchanged), driven as a line protocol: **stdin** takes the
+same command lines the interactive REPL takes; **stdout** carries only JSON, one object per line;
+**stderr** carries everything a human would have seen. After a `ready` event, every non-empty
+input line gets exactly one result envelope, in order:
+
+```
+{"event":"ready","version":"0.1.0","protocol":1,"cores":["rtu0.0",...],"m33":["smu","ce0","ce1"],...}
+{"seq":1,"ok":true,"cmd":"core halt","result":{"halt":[{"core":"rtu0.0",...}]}}
+{"seq":2,"ok":false,"cmd":"bp set","error":{"kind":"usage","message":"address 12345 must be 0x-prefixed hex, ..."}}
+{"seq":3,"event":"progress","message":"parking rtu0.0 on a `b .` loop ..."}   (long ops, before their envelope)
+{"event":"bye","restore_notes":["cleared breakpoint 0 on rtu0.0","resumed rtu0.0"],"kept":false}
+```
+
+`error.kind` mirrors the exit-code contract (`usage`, `tool`, `refused`, `aborted`, plus
+`unknown-command` and `internal`); the payloads inside `result` are exactly the `--json` payloads,
+captured instead of printed. `quit` (or EOF) runs the same restore-on-close the REPL runs — a
+frontend must always end the process this way, never kill it, or comparators stay armed and a
+stale catch latch breaks the application's own core release (Finding 7).
+
+`poll` is the frontend's 1 Hz heartbeat: one cheap sweep of every core's run state
+(EDSCR/EDPRSR per R52, DHCSR per M33, halt locations for halted cores) with no instruction
+injection and no PC reads on running cores.
+
+### The symbols layer — `sym`, `stack`, `disasm`, `stepline`, `stepout`, `runto`
+
+The base tool treats every address as a bare number, by design. The IDE needs files, lines and
+function names, so `pip install -e .[ide]` adds two pure-Python dependencies (pyelftools,
+capstone) and unlocks:
+
+```
+sym load <elf>          parse the ELF's DWARF once, cache it on the session
+sym addr2line 0x...     address -> function + file:line          sym line2addr <file> <line>
+stack [--max-frames N]  unwind the halted focused core: DWARF CFI, then the GCC frame-pointer
+                        chain, then LR once for a leaf -- each frame says which (`via`), and the
+                        walk stops with a stated reason instead of inventing frames
+disasm [--addr 0x...]   capstone around the PC (or an address); bytes from the ELF when it covers
+                        the address, target memory otherwise; T32/A32 from the mapping symbols,
+                        else DSPSR.T
+stepline [--over]       one SOURCE line: instruction-step until the line-table row changes
+stepout                 unwind one frame, temp hardware breakpoint at the return address, resume,
+                        wait, clear -- on timeout the core is LEFT RUNNING and the temp slot freed
+runto 0x...             the run-to-cursor primitive, same temp-breakpoint mechanics
+```
+
+All of these work on the R52s and the M33s (`m33 step --over` uses a capstone call-detect plus a
+temporary FPB comparator — the M33 twin of `runcontrol.step_over`). The unwinder and stepline are
+best-effort by nature: they refuse to invent frames, and `stepline` stops with a reason
+(`line-change`, `max-steps`, `no-line-info`, `no-progress`).
+
+### The extension
+
+```bat
+cd vscode && npm install && npm run build && npx vsce package --no-dependencies
+code --install-extension s32e-debug-0.1.0.vsix
+```
+
+Point `s32e.pythonPath` at the interpreter that has `s32edbg[ide]` installed. The container gives
+you: manual **Connect** (session + `gates apply` + discovery), a Cores view over all 7 cores, an
+always-visible **focused core** (status bar `⦿ rtu0.0`, click to switch — gutter breakpoints,
+stepping and the Registers/Stack views act on it), native gutter breakpoints armed on the focused
+core with retarget/duplicate in the Breakpoints view (the view, not the gutter dot, is the truth
+about armed/slot/failed — VS Code cannot render verified states without a DAP), watchpoints,
+source + instruction stepping with F5/F10/F11/Shift+F11, a per-core read-only disassembly document
+that follows the PC, call stack + raw SP window, register editing, Load-ELF-to-RAM with streamed
+progress (breakpoints re-armed after — the SoC reset wiped the comparators), catch-at-first-
+instruction with automatic conversion when it fires, a memory viewer, PC profiling, and the
+doctor/probe/report diagnostics (available only while disconnected — they open their own probe
+connection, which is a D-2 reset pulse).
+
+Disconnect (and window close) runs the session restore; if the backend dies instead, the extension
+says so and offers reconnect — it never auto-reconnect-loops into the D-2 defect.
+
+---
+
 ## Validation
 
 **`docs/test-plan.md` is the authority** — it carries a per-command evidence table saying what has
 been proven on silicon, what has only run against test doubles, and what has never been executed.
 
 ```
-pytest                              713 tests, no probe and no SEGGER install needed
+pytest                              761 tests, no probe and no SEGGER install needed
 pytest -m hardware -v -x            21 bench gates, in dependency order
 .\tools\bench-acceptance.ps1        the same sequence, with per-step JSON and wire-level logs
 .\tools\flash-state-matrix.ps1      debugging proven in every flash state (nothing / BL only /
@@ -1737,7 +1823,10 @@ those. The CLI never calls `Dap.mem_*` directly.
 ```
 s32edbg/
   cli.py              click command groups
+  machine.py          the `debug --machine` NDJSON protocol (payload sink, stdout swap)
   elf.py              minimal ELF32 reader for `load`/`flash` (stdlib struct; parse, flatten)
+  symbols/            the [ide]-extra layer: dwarf (SymbolIndex: lines, functions, mapping
+                      symbols, lazy CFI), unwind (CFI -> FP chain -> LR), disasm (capstone)
   transport/          base ABC, ctypes DLL, Commander subprocess, SVF/JTAGLoad, install discovery
   dap/                adiv6 (SELECT, power-up, MEM-AP), apmap, romtable, gates,
                       memaccess (bus policy), iface (protocol detection),
@@ -1767,5 +1856,8 @@ tools/
   bench-acceptance.ps1        runs the hardware sequence, keeps the artifacts
   flash-state-matrix.ps1      the flash-state × debugging matrix (S1..S5)
   bench-lib.ps1               Invoke-Step/Hex, shared by both bench scripts
-tests/                713 hardware-free tests, plus 21 bench gates behind `-m hardware`
+vscode/               the "S32E Debug" VS Code extension (TypeScript; own Activity Bar
+                      container; spawns one `debug --machine` session)
+tests/                761 hardware-free tests (fixtures/ holds the committed symbol-layer
+                      ELF), plus 21 bench gates behind `-m hardware`
 ```

@@ -2021,4 +2021,106 @@ speed: roughly **10–26× slower**. Two measured causes:
 - [ ] Re-measure s32multitool's wall clock for the same v3.1.0 BLOB on this
   bench as the concrete target number.
 
+---
+
+## 11. IDE integration — machine mode, symbols layer, VS Code extension — implemented 2026-08-06, offline-proven, bench pending
+
+Three additions, one consumer. The CLI gained a machine-readable session mode
+and a symbols layer; `vscode/` holds the "S32E Debug" extension that drives
+them. Nothing about the existing command surface changed semantics; the new
+JSON payloads follow the existing `if ctx.json_out:` pattern, so one-shot
+`--json` callers gain them too.
+
+### What was added
+
+- **`debug --machine`** (`s32edbg/machine.py` + the dispatch refactor in
+  `cli.py`): stdin takes ordinary session lines; stdout carries only NDJSON —
+  a `ready` event, exactly one result envelope per input line (progress
+  events may precede it), a `bye` event carrying the restore notes; stderr
+  carries the whole Rich stream (Rich resolves `sys.stdout` lazily, so one
+  `sys.stdout = sys.stderr` swap reroutes every human print path, including
+  `report/emit.py`'s fresh consoles). Envelope `error.kind` mirrors the §5
+  exit-code contract. `click.confirm` can never fire in machine mode —
+  stdin is the protocol channel — so `mem write` without `--yes` refuses
+  (usage) instead of prompting.
+- **`poll`**: the frontend heartbeat — EDSCR/EDPRSR per R52, DHCSR per M33
+  (`m33.quick_status`, one read), halt locations for halted R52s, plus
+  focus/sync/catch-latch state. No EDITR traffic, no PC reads on running
+  cores; measured-safe primitives only.
+- **Payload gaps closed**: `bp clear`, `wp clear`, `mem write`,
+  `m33 resume`, `m33 step`, `m33 bp list/set/clear`, `m33 wp clear`, `use`,
+  `sync` now emit JSON.
+- **Symbols layer** (`s32edbg/symbols/`, behind the `[ide]` extra —
+  pyelftools + capstone, lazily imported; the base CLI still runs with zero
+  extras): `SymbolIndex` (line table both directions with
+  nearest-following-line semantics, DW_TAG_subprogram + .symtab functions,
+  ARM mapping symbols, PT_LOAD byte cache, FDEs indexed eagerly / decoded
+  lazily), the unwinder (CFI → GCC FP chain (r7/T32, r11/A32) → LR once for
+  a leaf; sanity windows, loop guard, stated stop reason), capstone
+  disassembly (mode from mapping symbols, else DSPSR.T, else T32;
+  `thumb-m` for the M33s).
+- **New commands**: `sym load/info/addr2line/line2addr`, `stack`, `disasm`,
+  `stepline [--over]`, `stepout`, `runto`, `m33 reg NAME [VALUE]`,
+  `m33 step --over` (capstone BL detect + temporary FPB comparator — the
+  M33 twin of `runcontrol.step_over`). `stepout`/`runto` reuse the proven
+  temp-comparator pattern and always clear the slot in `finally`; on
+  timeout the core is left running, stated, with the slot freed.
+- **`DebugSession.symbols`**: the index cache; deliberately survives
+  `note_system_reset` (a `load` does not change which ELF is being
+  debugged).
+- **`vscode/`**: TypeScript extension, own Activity Bar container (Session /
+  Cores / Call Stack / Registers / Breakpoints / Watchpoints / Memory),
+  status-bar focused-core selector, native gutter breakpoints armed on the
+  focused core, per-core disassembly documents, Load-to-RAM with streamed
+  progress and breakpoint re-arm, catch-arm with automatic `--wait`
+  conversion when the poll sees it fire, memory viewer, PC profiling,
+  doctor/probe/report one-shots hard-blocked while a session is alive
+  (D-2), and a quit-first shutdown so the restore ledger always runs; a
+  backend crash offers reconnect but never auto-reconnect-loops.
+
+### Evidence
+
+Offline (tier 0/1): 761 tests green, including `tests/test_machine.py`
+(envelope-per-line, error-kind mapping, restore-on-EOF, poll shape, load
+progress ordering, machine-mode `--json` file suppression) and
+`tests/test_symbols.py` (DWARF round-trips against the committed
+`tests/fixtures/fixture.elf` — built with the production GCC 10.2
+arm32-eabi toolchain so the DWARF flavor under test is the field's —
+plus unwinder property tests and machine-protocol integration).
+`vscode/`: `tsc --noEmit` clean, esbuild bundle, vitest framing tests,
+`vsce package` produces `s32e-debug-0.1.0.vsix`.
+
+**Not yet proven (bench pending)** — the IDE bench checklist, in order,
+one session, on a board with the known-good app in flash:
+
+1. Install the vsix; set `s32e.pythonPath`; run "Backend Health Check".
+2. **Connect** → gates applied on a power-cycled board, Cores view shows
+   rtu0.0/rtu0.1/rtu1.0/rtu1.1 + smu/ce0/ce1 with truthful run states.
+3. Choose the app ELF → symbols load; status bar shows `⦿ rtu0.0`.
+4. Gutter-click a line in a file the app executes → Breakpoints view shows
+   it armed with a slot on rtu0.0 → the running core halts on it → the
+   source line is revealed and highlighted, Registers/Stack populate,
+   frame names match the app's call chain.
+5. F10 / F11 / Shift+F11 walk lines, calls and a return; Alt+F11 single
+   instructions with the disassembly document following the PC arrow.
+6. Run-to-cursor on a later line reaches it; on an unreached line the
+   timeout warning appears and the core reports running.
+7. Load ELF to RAM (~35 s at 16 MHz with progress) → rtu0.0 parked at the
+   entry, gutter breakpoints re-armed (fresh slots), Continue hits them.
+8. Catch on rtu0.1 → Continue rtu0.0 → "caught at its first instruction"
+   notification lands at the expected reset PC (compare Finding 7 bench).
+9. Watchpoint on `counter`-class data → hit shows the EDWAR address in
+   the Cores view detail.
+10. Memory viewer reads app RAM over AXI; a guarded write reads back.
+11. PC profiling on a running core resolves hot addresses to functions.
+12. `sync on` → any halt stops all cores; Continue restarts the group.
+13. Disconnect → output log shows the restore notes (comparators cleared,
+    cores resumed); reconnect works without a board power-cycle (D-2
+    budget respected: exactly one connect pulse per session).
+14. Kill the backend process mid-session (Task Manager) → the extension
+    reports the unexpected end, warns that restore did not run, offers
+    reconnect; reconnect + disconnect cleans the target.
+
+Record the run under `bench-runs/` as usual.
+
 The next finding number is **17**.
