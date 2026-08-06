@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import struct
 import sys
 import time
 from contextlib import contextmanager
@@ -17,6 +18,10 @@ from rich.console import Console
 
 from . import __version__
 from . import elf as elf_mod
+from . import machine as machine_mod
+from .symbols import disasm as symdisasm
+from .symbols import dwarf as symdwarf
+from .symbols import unwind as symunwind
 from .dap import adiv6
 from .dap import apmap as apmap_mod
 from .dap import flasher as flasher_mod
@@ -71,9 +76,16 @@ class Ctx:
     #: fresh one -- which is the whole point of a session on a board where
     #: every connect pulses reset into the SBC/PMIC (test-plan defect D-2).
     session: DebugSession | None = None
+    #: True inside `debug --machine`: stdin is the protocol channel, so no
+    #: command may ever read it (a click.confirm would eat the next request).
+    machine: bool = False
 
 
 def _emit_json(target: str | None, payload: object) -> None:
+    # In machine mode every payload becomes part of the command's NDJSON
+    # result envelope instead of being printed or written to a file.
+    if machine_mod.capture(payload):
+        return
     text = json.dumps(payload, indent=2, default=str)
     if target in (None, "-"):
         console.print_json(text)
@@ -1022,6 +1034,13 @@ def mem_write(ctx: Ctx, addr: str, value: str, ap_spec: str, size: str, yes: boo
     data = _parse_value(value)
     width = int(size)
     if not yes:
+        if ctx.machine:
+            # In machine mode stdin carries protocol lines: a prompt would eat
+            # the next request. The IDE confirms and always passes --yes.
+            raise click.ClickException(
+                "mem write changes target state; in machine mode pass --yes "
+                "(the frontend owns the confirmation)"
+            )
         click.confirm(
             f"write 0x{data:0{width // 4}X} to 0x{target:08X} via {memaccess.ap_label(ap_base)}?",
             abort=True,
@@ -1043,6 +1062,15 @@ def mem_write(ctx: Ctx, addr: str, value: str, ap_spec: str, size: str, yes: boo
                 "[yellow]![/yellow] read-back differs. That is normal for a "
                 "write-1-to-clear or read-only field, but check it is what you meant."
             )
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "ap": f"0x{ap_base:08X}",
+                "address": f"0x{target:08X}",
+                "wrote": f"0x{data:0{width // 4}X}",
+                "readback": f"0x{readback:0{width // 4}X}",
+                "size_bits": width,
+                "match": readback == data,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -1988,6 +2016,7 @@ def m33_resume(ctx: Ctx, core_spec: str | None) -> None:
         dhcsr, rehalted = m33_mod.resume(dap, c)
         if ctx.session is not None and not rehalted:
             ctx.session.note_m33_resumed(c.name)
+        pc: int | None = None
         if rehalted:
             pc = m33_mod.read_register(dap, c, "pc")
             console.print(
@@ -2000,24 +2029,44 @@ def m33_resume(ctx: Ctx, core_spec: str | None) -> None:
             )
         else:
             console.print(f"[green]{c.name} running[/green]  DHCSR 0x{dhcsr:08X}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "resume": [{
+                    "core": c.name,
+                    "running": not rehalted,
+                    "rehalted": rehalted,
+                    "pc": f"0x{pc:08X}" if pc is not None else None,
+                }]
+            })
 
 
 @m33.command("step")
 @_m33_option
 @click.option("--count", type=int, default=1, show_default=True)
+@click.option("--over", is_flag=True,
+              help="Run a BL/BLX call to completion instead of stepping into it "
+                   "(capstone decode + a temporary FPB comparator at the return).")
 @click.option("--mask-interrupts/--allow-interrupts", default=True, show_default=True,
               help="Masking keeps a step from landing in an interrupt handler.")
 @click.pass_obj
-def m33_step(ctx: Ctx, core_spec: str | None, count: int, mask_interrupts: bool) -> None:
+def m33_step(
+    ctx: Ctx, core_spec: str | None, count: int, over: bool, mask_interrupts: bool
+) -> None:
     """Step a halted M33 core one instruction at a time."""
     with _one_m33(ctx, core_spec) as (dap, c):
         if ctx.session is not None:
             ctx.session.note_m33_halted(c.name)
+        after: int | None = None
         for n in range(count):
             before = m33_mod.read_register(dap, c, "pc")
-            m33_mod.step(dap, c, mask_interrupts=mask_interrupts)
+            if over:
+                _m33_step_over(ctx, dap, c, _session_symbols(ctx))
+            else:
+                m33_mod.step(dap, c, mask_interrupts=mask_interrupts)
             after = m33_mod.read_register(dap, c, "pc")
             console.print(f"[green]step {n + 1}[/green]  0x{before:08X} -> 0x{after:08X}")
+        if ctx.json_out and after is not None:
+            _emit_json(ctx.json_out, {"core": c.name, "pc": f"0x{after:08X}", "steps": count})
 
 
 @m33.command("regs")
@@ -2038,6 +2087,42 @@ def m33_regs(ctx: Ctx, core_spec: str | None) -> None:
                 ctx.json_out,
                 {"core": c.name, "registers": {k: f"0x{v:08X}" for k, v in values.items()}},
             )
+
+
+@m33.command("reg")
+@click.argument("name")
+@click.argument("value", required=False)
+@_m33_option
+@click.pass_obj
+def m33_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> None:
+    """Read or write one M33 register: r0-r12, sp, lr, pc, xpsr, msp, psp, control.
+
+    The M33 register file is reached through DCRSR/DCRDR -- a selector and a
+    data register -- so neither direction disturbs the halted context.
+    """
+    key = name.strip().lower()
+    data: int | None = None
+    if value is not None:
+        data = _parse_value(value)
+    with _one_m33(ctx, core_spec, write=value is not None) as (dap, c):
+        try:
+            if data is not None:
+                m33_mod.write_register(dap, c, key, data)
+            result = m33_mod.read_register(dap, c, key)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from None
+        if data is not None:
+            console.print(
+                f"{c.name} {key} = 0x{result:08X}  (wrote 0x{data:08X})"
+            )
+        else:
+            console.print(f"{c.name} {key} = 0x{result:08X}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "core": c.name,
+                "register": key,
+                "value": f"0x{result:08X}",
+            })
 
 
 @m33.command("sample")
@@ -2089,6 +2174,8 @@ def m33_bp(ctx: Ctx, action: str, address: str | None, core_spec: str | None) ->
         if action == "list":
             entries = m33_mod.list_breakpoints(dap, c)
             emit.print_comparators(f"{c.name} breakpoints", entries, console)
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {"core": c.name, "breakpoints": entries})
         elif action == "set":
             assert target is not None
             entry = m33_mod.set_breakpoint(dap, c, target)
@@ -2097,12 +2184,16 @@ def m33_bp(ctx: Ctx, action: str, address: str | None, core_spec: str | None) ->
             console.print(
                 f"[green]breakpoint {entry['index']}[/green] at {entry['address']} on {c.name}"
             )
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {"core": c.name, "breakpoint": entry})
         else:
             assert slot is not None
             m33_mod.clear_breakpoint(dap, c, slot)
             if ctx.session is not None:
                 ctx.session.note_m33_bp_cleared(c.name, slot)
             console.print(f"cleared breakpoint {slot} on {c.name}")
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {"core": c.name, "cleared": [slot], "all": False})
 
 
 @m33.command("wp")
@@ -2171,6 +2262,8 @@ def m33_wp(
             if ctx.session is not None:
                 ctx.session.note_m33_wp_cleared(c.name, slot)
             console.print(f"cleared watchpoint {slot} on {c.name}")
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {"core": c.name, "cleared": [slot], "all": False})
 
 
 @m33.command("reset-halt")
@@ -2366,12 +2459,14 @@ def bp_clear(ctx: Ctx, index: int | None, core_spec: str | None, all_slots: bool
         raise click.ClickException("give a comparator index, or --all")
     with _one_core(ctx, core_spec) as (dap, c):
         total, _ = runcontrol.comparator_counts(c)
-        targets = range(total) if all_slots else [index]
-        for n in targets:  # type: ignore[arg-type]
-            runcontrol.clear_breakpoint(dap, c, int(n))
+        targets = list(range(total)) if all_slots else [int(index)]  # type: ignore[arg-type]
+        for n in targets:
+            runcontrol.clear_breakpoint(dap, c, n)
         if ctx.session is not None:
             ctx.session.note_bp_cleared(c.name, None if all_slots else int(index))  # type: ignore[arg-type]
         console.print(f"cleared {'all ' if all_slots else ''}breakpoint(s) on {c.name}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {"core": c.name, "cleared": targets, "all": all_slots})
 
 
 @main.group()
@@ -2436,11 +2531,729 @@ def wp_clear(ctx: Ctx, index: int | None, core_spec: str | None, all_slots: bool
         raise click.ClickException("give a comparator index, or --all")
     with _one_core(ctx, core_spec) as (dap, c):
         _, total = runcontrol.comparator_counts(c)
-        for n in (range(total) if all_slots else [index]):  # type: ignore[arg-type]
-            runcontrol.clear_watchpoint(dap, c, int(n))
+        targets = list(range(total)) if all_slots else [int(index)]  # type: ignore[arg-type]
+        for n in targets:
+            runcontrol.clear_watchpoint(dap, c, n)
         if ctx.session is not None:
             ctx.session.note_wp_cleared(c.name, None if all_slots else int(index))  # type: ignore[arg-type]
         console.print(f"cleared {'all ' if all_slots else ''}watchpoint(s) on {c.name}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {"core": c.name, "cleared": targets, "all": all_slots})
+
+
+@main.command("poll")
+@click.pass_obj
+def poll_cmd(ctx: Ctx) -> None:
+    """One cheap status sweep of every core -- an IDE frontend's heartbeat.
+
+    Reads each R52's EDSCR/EDPRSR and each M33's DHCSR: no instruction
+    injection, no PC reads, nothing invasive, so it is safe against running
+    cores at 1 Hz. A halted R52 also reports where it stopped (the armed
+    comparator that matched, or EDWAR for a watchpoint) -- a few comparator
+    reads on those cores only. PC and registers are deliberately not read
+    here; a frontend fetches `regs` once when it sees running go to halted.
+    """
+    with open_transport(ctx) as (_t, dap):
+        assert dap is not None
+        session = ctx.session
+        discovery_error: str | None = None
+        try:
+            cores = _discover_cores(ctx, dap)
+        except S32EError as exc:
+            cores = []
+            discovery_error = str(exc)
+
+        r52_rows: list[dict[str, object]] = []
+        for c in cores:
+            d = c.state.as_dict()
+            edscr = d.get("edscr")
+            edprsr = d.get("edprsr")
+            row: dict[str, object] = {
+                "core": c.name,
+                "halted": d.get("halted"),
+                "status": edscr.get("status") if isinstance(edscr, dict) else None,
+                "in_reset": edprsr.get("in_reset") if isinstance(edprsr, dict) else None,
+                "os_locked": edprsr.get("os_locked") if isinstance(edprsr, dict) else None,
+                "unreachable": d.get("unreachable_reason"),
+            }
+            if c.state.halted:
+                row["location"] = runcontrol.halt_location(dap, c)
+            r52_rows.append(row)
+            console.print(
+                f"{c.name}: "
+                + ("halted" if c.state.halted else
+                   "running" if c.state.halted is False else "unknown")
+            )
+
+        m33_rows: list[dict[str, object]] = []
+        if session is not None and session.m33_cores is not None:
+            m33_cores = session.m33_cores
+            for mc in m33_cores:
+                m33_rows.append(m33_mod.quick_status(dap, mc))
+        else:
+            for note in _prepare_dap(dap, ctx=ctx):
+                console.print(f"[dim]note:[/dim] {note}")
+            m33_cores = m33_mod.discover(dap)
+            if session is not None:
+                session.m33_cores = m33_cores
+            for mc in m33_cores:
+                m33_rows.append({
+                    "name": mc.name,
+                    "halted": mc.halted,
+                    "answered": mc.identity.dhcsr is not None,
+                })
+        for row in m33_rows:
+            state = ("halted" if row["halted"] else
+                     "running" if row["halted"] is False else "no answer")
+            console.print(f"{row['name']}: {state}")
+
+        payload: dict[str, object] = {
+            "r52": r52_rows,
+            "m33": m33_rows,
+            "focus": session.focus if session is not None else None,
+            "m33_focus": session.m33_focus if session is not None else None,
+            "sync": session.sync if session is not None else False,
+            "catch_armed": sorted(session.edbgreq_armed) if session is not None else [],
+        }
+        if discovery_error is not None:
+            payload["discovery_error"] = discovery_error
+        if ctx.json_out:
+            _emit_json(ctx.json_out, payload)
+
+
+# ---------------------------------------------------------------------------
+# IDE support -- symbols, stack, disassembly, source-level stepping
+# ---------------------------------------------------------------------------
+
+
+def _require_symbols(ctx: Ctx) -> symdwarf.SymbolIndex:
+    if ctx.session is not None and ctx.session.symbols is not None:
+        return ctx.session.symbols
+    raise click.ClickException(
+        "no symbols loaded -- run `sym load <elf>` inside the debug session first"
+    )
+
+
+def _session_symbols(ctx: Ctx) -> symdwarf.SymbolIndex | None:
+    return ctx.session.symbols if ctx.session is not None else None
+
+
+def _ide_target(ctx: Ctx, core_spec: str | None) -> tuple[str, str]:
+    """(family, spec) for the IDE commands: 'm33' for smu/ce0/ce1, else 'r52'."""
+    spec = core_spec
+    if spec is None and ctx.session is not None:
+        spec = ctx.session.focus or ctx.session.m33_focus
+    if spec is None:
+        raise click.ClickException(
+            "say which core: --core <r52 name|smu|ce0|ce1> "
+            "(or `use <core>` in a session)"
+        )
+    family = "m33" if spec.strip().lower() in m33_mod.M33_APS else "r52"
+    return family, spec
+
+
+def _ap_word_reader(dap: Dap, ap_base: int):
+    """A cached word reader over one AP for the unwinder. Faults become None."""
+    cache: dict[int, int | None] = {}
+
+    def read_word(addr: int) -> int | None:
+        a = addr & ~3 & 0xFFFFFFFF
+        if a not in cache:
+            try:
+                cache[a] = memaccess.read_words(dap, ap_base, a, 1)[0]
+            except S32EError:
+                cache[a] = None
+        return cache[a]
+
+    return read_word
+
+
+def _wait_halt_r52(dap: Dap, c: runcontrol.Core, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        state = runcontrol.read_state(dap, c.debug_base)
+        if state.halted is True:
+            c.state = state
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _require_halted_r52(c: runcontrol.Core) -> None:
+    if c.state.halted is not True:
+        raise click.ClickException(f"{c.name} is not halted -- halt it first")
+
+
+def _r52_unwind_inputs(regs: runcontrol.Registers) -> tuple[int, dict[str, int], bool]:
+    """(pc, register values, executing-T32) for the unwinder, or a clean error."""
+    if regs.pc is None:
+        raise click.ClickException("could not read the PC (DLR)")
+    dspsr = regs.values.get("dspsr")
+    thumb = bool(dspsr & (1 << 5)) if dspsr is not None else True
+    return regs.pc, regs.values, thumb
+
+
+@main.group("sym")
+def sym() -> None:
+    """Symbols from an ELF: line tables, function names, unwind info.
+
+    The base tool treats every address as a bare number. These commands parse
+    an ELF's DWARF (pyelftools) and cache the index on the debug session so
+    `stack`, `disasm` and `stepline` -- and an IDE frontend -- can speak in
+    files, lines and functions. Needs the ide extras: pip install -e .[ide].
+    """
+
+
+@sym.command("load")
+@click.argument("elf_path")
+@click.pass_obj
+def sym_load(ctx: Ctx, elf_path: str) -> None:
+    """Parse an ELF's DWARF and cache the symbol index on the session."""
+    try:
+        index = symdwarf.SymbolIndex.load(elf_path)
+    except OSError as exc:
+        raise click.ClickException(f"cannot read {elf_path}: {exc}") from None
+    if ctx.session is not None:
+        ctx.session.symbols = index
+    else:
+        console.print(
+            "[yellow]![/yellow] no debug session: parsed and reported, but there "
+            "is no session to cache the index on"
+        )
+    s = index.summary()
+    console.print(
+        f"symbols: {s['functions']} function(s), {s['line_rows']} line row(s), "
+        f"CFI {s['cfi']} ({s['fdes']} FDEs), entry {s['entry']}"
+    )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, s)
+
+
+@sym.command("info")
+@click.pass_obj
+def sym_info(ctx: Ctx) -> None:
+    """Report the currently loaded symbol index."""
+    index = _require_symbols(ctx)
+    s = index.summary()
+    console.print(f"symbols from {s['image']} (sha1 {s['sha1']})")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, s)
+
+
+@sym.command("addr2line")
+@click.argument("addresses", nargs=-1, required=True)
+@click.pass_obj
+def sym_addr2line(ctx: Ctx, addresses: tuple[str, ...]) -> None:
+    """Resolve addresses to function/file:line (batch)."""
+    index = _require_symbols(ctx)
+    rows: list[dict[str, object]] = []
+    for text in addresses:
+        addr = _parse_address(text)
+        hit = index.addr_to_line(addr)
+        f = index.func_at(addr)
+        rows.append({
+            "addr": f"0x{addr:08X}",
+            "file": hit.file if hit else None,
+            "line": hit.line if hit else None,
+            "func": f.name if f else None,
+        })
+        where = f"{hit.file}:{hit.line}" if hit else "?"
+        console.print(f"0x{addr:08X}  {f.name if f else '?'}  {where}")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {"lookups": rows})
+
+
+@sym.command("line2addr")
+@click.argument("file")
+@click.argument("line", type=int)
+@click.pass_obj
+def sym_line2addr(ctx: Ctx, file: str, line: int) -> None:
+    """Where a source line's code starts -- nearest following line with code.
+
+    This is the gutter-click primitive: clicking line N places the breakpoint
+    on the first line >= N that generated code, exactly like every debugger.
+    """
+    index = _require_symbols(ctx)
+    actual, addrs = index.line_to_addrs(file, line)
+    if actual is None:
+        console.print(f"no code for {file}:{line}")
+    else:
+        console.print(
+            f"{file}:{actual}  " + " ".join(f"0x{a:08X}" for a in addrs)
+        )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "file": file,
+            "requested": line,
+            "line": actual,
+            "addrs": [f"0x{a:08X}" for a in addrs],
+        })
+
+
+@main.command("stack")
+@_core_option
+@click.option("--max-frames", type=int, default=32, show_default=True)
+@click.pass_obj
+def stack_cmd(ctx: Ctx, core_spec: str | None, max_frames: int) -> None:
+    """Unwind a halted core's call stack (DWARF CFI, FP chain, LR -- best effort).
+
+    Frame 0 is the live registers. Deeper frames come from the loaded symbol
+    index's unwind rules, falling back to the GCC frame-pointer chain; the
+    walk stops with a stated reason instead of inventing frames. Stack memory
+    is read over the AXI-AP for the R52s (unreachable while functional reset
+    is asserted) and over the core's own AHB-AP for an M33.
+    """
+    family, spec = _ide_target(ctx, core_spec)
+    index = _session_symbols(ctx)
+    if family == "r52":
+        with _one_core(ctx, spec, write=False) as (dap, c):
+            _require_halted_r52(c)
+            regs = runcontrol.read_registers(dap, c)
+            pc, values, thumb = _r52_unwind_inputs(regs)
+            _report, _notes = memaccess.preflight(dap, AP_AXI, write=False)
+            frames, reason = symunwind.unwind(
+                pc=pc,
+                sp=values.get("r13"),
+                fp=values.get("r7" if thumb else "r11"),
+                lr=values.get("r14"),
+                read_word=_ap_word_reader(dap, AP_AXI),
+                index=index,
+                max_frames=max_frames,
+                thumb_r7=thumb,
+            )
+            name = c.name
+    else:
+        with _one_m33(ctx, spec, write=False) as (dap, c):
+            m33_mod.quick_status(dap, c)
+            if c.halted is not True:
+                raise click.ClickException(f"{c.name} is not halted -- halt it first")
+            values = m33_mod.read_registers(dap, c)
+            frames, reason = symunwind.unwind(
+                pc=values["pc"],
+                sp=values.get("sp"),
+                fp=values.get("r7"),
+                lr=values.get("lr"),
+                read_word=_ap_word_reader(dap, c.ap_base),
+                index=index,
+                max_frames=max_frames,
+                thumb_r7=True,
+            )
+            name = c.name
+
+    for f in frames:
+        where = f"{f.func or '?'}"
+        if f.file is not None:
+            where += f"  {f.file}:{f.line}"
+        console.print(f"#{f.index:<2} 0x{f.pc:08X}  {where}  [dim]({f.via})[/dim]")
+    console.print(f"[dim]stopped: {reason}[/dim]")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "core": name,
+            "frames": [f.as_dict() for f in frames],
+            "stopped": reason,
+        })
+
+
+@main.command("disasm")
+@_core_option
+@click.option("--addr", "addr_text", default=None,
+              help="Anchor address; default is the halted focused core's PC.")
+@click.option("--before", type=int, default=16, show_default=True,
+              help="Instructions before the anchor (the window snaps to the "
+                   "containing function's start when symbols know it).")
+@click.option("--count", type=int, default=48, show_default=True,
+              help="Total instructions to emit.")
+@click.option("--ap", "ap_spec", default=None,
+              help="AP for target-memory reads when the ELF does not cover the "
+                   "address (default: axi for an R52, the M33's own AHB-AP).")
+@click.pass_obj
+def disasm_cmd(
+    ctx: Ctx,
+    core_spec: str | None,
+    addr_text: str | None,
+    before: int,
+    count: int,
+    ap_spec: str | None,
+) -> None:
+    """Disassemble around an address (capstone), source lines annotated.
+
+    Bytes come from the loaded ELF when it covers the address -- the file is
+    the truth for code the debugger itself loaded -- else from target memory
+    over the chosen AP. Mode (T32/A32) comes from the ELF's mapping symbols,
+    else the halted core's DSPSR.T, else T32.
+    """
+    family, spec = _ide_target(ctx, core_spec)
+    index = _session_symbols(ctx)
+    dis = symdisasm.Disassembler()
+
+    with (
+        _one_core(ctx, spec, write=False) if family == "r52"
+        else _one_m33(ctx, spec, write=False)
+    ) as (dap, c):
+        dspsr_t: bool | None = None
+        if addr_text is not None:
+            anchor = _parse_address(addr_text)
+        elif family == "r52":
+            _require_halted_r52(c)
+            anchor = runcontrol.read_pc(dap, c)
+            dspsr = runcontrol.read_dspsr(dap, c)
+            dspsr_t = bool(dspsr & (1 << 5))
+        else:
+            m33_mod.quick_status(dap, c)
+            if c.halted is not True:
+                raise click.ClickException(
+                    f"{c.name} is not halted -- pass --addr to disassemble "
+                    "without touching the core"
+                )
+            anchor = m33_mod.read_register(dap, c, "pc")
+        anchor &= ~1
+
+        mode = symdisasm.pick_mode(
+            index, anchor, dspsr_t=dspsr_t, m_profile=family == "m33"
+        )
+        start = max(0, anchor - max(before, 0) * 4)
+        if index is not None:
+            f = index.func_at(anchor)
+            if f is not None and f.low > start:
+                start = f.low
+        start &= ~3
+        length = (anchor - start) + max(count, 1) * 4 + 8
+
+        source = "elf"
+        data = index.bytes_at(start, length) if index is not None else None
+        if data is None:
+            source = "target"
+            if family == "m33":
+                ap_base = c.ap_base if ap_spec is None else _resolve_ap_or_fail(ap_spec)
+            else:
+                ap_base = AP_AXI if ap_spec is None else _resolve_ap_or_fail(ap_spec)
+            _report, _notes = memaccess.preflight(dap, ap_base, write=False)
+            words = memaccess.read_words(dap, ap_base, start, (length + 3) // 4)
+            data = struct.pack(f"<{len(words)}I", *words)
+
+        insns = dis.disassemble(data, start, mode)
+        anchor_i = next(
+            (i for i, x in enumerate(insns) if x.addr >= anchor), len(insns) - 1
+        )
+        lo = max(0, anchor_i - max(before, 0))
+        window = insns[lo : lo + max(count, 1)]
+
+        rows: list[dict[str, object]] = []
+        prev_line: tuple[str, int] | None = None
+        for insn in window:
+            d = insn.as_dict()
+            if index is not None:
+                fn = index.func_at(insn.addr)
+                if fn is not None and fn.low == insn.addr:
+                    d["func"] = fn.name
+                hit = index.addr_to_line(insn.addr)
+                if hit is not None and (hit.file, hit.line) != prev_line:
+                    d["file"], d["line"] = hit.file, hit.line
+                    prev_line = (hit.file, hit.line)
+            rows.append(d)
+            marker = "=>" if insn.addr == anchor else "  "
+            console.print(
+                f"{marker} 0x{insn.addr:08X}  {insn.data.hex():<10} "
+                f"{insn.mnemonic:<8} {insn.op_str}"
+            )
+
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "core": c.name,
+                "mode": mode,
+                "anchor": f"0x{anchor:08X}",
+                "source": source,
+                "instructions": rows,
+            })
+
+
+@main.command("stepline")
+@_core_option
+@click.option("--over", is_flag=True, help="Treat calls as one step (uses the "
+              "temp-breakpoint-at-return mechanism per instruction).")
+@click.option("--max-steps", type=int, default=128, show_default=True)
+@click.pass_obj
+def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int) -> None:
+    """Step one SOURCE line: instruction-step until the line table row changes.
+
+    Instructions with no line info (compiler glue) are stepped through. Stops
+    with a reason: line-change, max-steps, no-line-info (started outside the
+    line table; one instruction step is taken), or no-progress.
+    """
+    index = _require_symbols(ctx)
+    family, spec = _ide_target(ctx, core_spec)
+
+    if family == "r52":
+        with _one_core(ctx, spec) as (dap, c):
+            _require_halted_r52(c)
+            pc0 = runcontrol.read_pc(dap, c)
+            start_hit = index.addr_to_line(pc0)
+            steps = 0
+            stopped = "no-line-info"
+            pc = pc0
+            if start_hit is not None:
+                stopped = "max-steps"
+                for _ in range(max_steps):
+                    if over:
+                        runcontrol.step_over(dap, c)
+                    else:
+                        runcontrol.step(dap, c)
+                    steps += 1
+                    new_pc = runcontrol.read_pc(dap, c)
+                    if new_pc == pc:
+                        stopped = "no-progress"
+                        break
+                    pc = new_pc
+                    hit = index.addr_to_line(pc)
+                    if hit is not None and (hit.file, hit.line) != (
+                        start_hit.file, start_hit.line
+                    ):
+                        stopped = "line-change"
+                        break
+            else:
+                runcontrol.step(dap, c)
+                steps = 1
+                pc = runcontrol.read_pc(dap, c)
+            if ctx.session is not None:
+                ctx.session.note_halted(c.name)
+            name = c.name
+    else:
+        with _one_m33(ctx, spec) as (dap, c):
+            pc0 = m33_mod.read_register(dap, c, "pc")
+            start_hit = index.addr_to_line(pc0)
+            steps = 0
+            stopped = "no-line-info"
+            pc = pc0
+            if start_hit is not None:
+                stopped = "max-steps"
+                for _ in range(max_steps):
+                    if over:
+                        _m33_step_over(ctx, dap, c, index)
+                    else:
+                        m33_mod.step(dap, c)
+                    steps += 1
+                    new_pc = m33_mod.read_register(dap, c, "pc")
+                    if new_pc == pc:
+                        stopped = "no-progress"
+                        break
+                    pc = new_pc
+                    hit = index.addr_to_line(pc)
+                    if hit is not None and (hit.file, hit.line) != (
+                        start_hit.file, start_hit.line
+                    ):
+                        stopped = "line-change"
+                        break
+            else:
+                m33_mod.step(dap, c)
+                steps = 1
+                pc = m33_mod.read_register(dap, c, "pc")
+            if ctx.session is not None:
+                ctx.session.note_m33_halted(c.name)
+            name = c.name
+
+    end_hit = index.addr_to_line(pc)
+    console.print(
+        f"{name}: 0x{pc0:08X} -> 0x{pc:08X} in {steps} step(s) ({stopped})"
+        + (f"  {end_hit.file}:{end_hit.line}" if end_hit else "")
+    )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "core": name,
+            "pc_before": f"0x{pc0:08X}",
+            "pc_after": f"0x{pc:08X}",
+            "line_before": (
+                {"file": start_hit.file, "line": start_hit.line}
+                if start_hit else None
+            ),
+            "line_after": (
+                {"file": end_hit.file, "line": end_hit.line} if end_hit else None
+            ),
+            "steps": steps,
+            "stopped": stopped,
+        })
+
+
+def _m33_step_over(ctx: Ctx, dap: Dap, c, index) -> None:
+    """M33 instruction step that runs a BL/BLX call to completion.
+
+    The R52 path has this in runcontrol.step_over (a32.py call detector); the
+    M33 equivalent decodes with capstone and uses a temporary FPB comparator
+    at the return address -- same shape, different breakpoint unit.
+    """
+    pc = m33_mod.read_register(dap, c, "pc") & ~1
+    data = index.bytes_at(pc, 4) if index is not None else None
+    if data is None:
+        h0 = dap.mem_read(c.ap_base, pc, size=16)
+        h1 = dap.mem_read(c.ap_base, pc + 2, size=16)
+        data = struct.pack("<HH", h0 & 0xFFFF, h1 & 0xFFFF)
+    insn = symdisasm.Disassembler().first(data, pc, "thumb-m")
+    if insn is None or not symdisasm.thumb_is_call(insn):
+        m33_mod.step(dap, c)
+        return
+    entry = m33_mod.set_breakpoint(dap, c, pc + insn.size)
+    slot = int(entry["index"])
+    try:
+        m33_mod.resume(dap, c)
+        m33_mod.wait_halt(dap, c, timeout_s=5.0)
+    finally:
+        m33_mod.clear_breakpoint(dap, c, slot)
+
+
+def _r52_run_to(
+    ctx: Ctx,
+    dap: Dap,
+    c: runcontrol.Core,
+    address: int,
+    timeout_s: float,
+    index: symdwarf.SymbolIndex | None,
+) -> dict[str, object]:
+    """Temp hardware breakpoint at address, resume, wait, clear -- the
+    mechanism runcontrol.step_over proved out, aimed at an arbitrary target."""
+    thumb = symdisasm.pick_mode(index, address) != "arm"
+    entry = runcontrol.set_breakpoint(dap, c, address, thumb=thumb)
+    slot = int(entry["index"])
+    session = ctx.session
+    try:
+        runcontrol.resume(dap, c)
+        if session is not None:
+            session.note_resumed(c.name)
+        halted = _wait_halt_r52(dap, c, timeout_s)
+    finally:
+        runcontrol.clear_breakpoint(dap, c, slot)
+    if halted:
+        if session is not None:
+            session.note_halted(c.name)
+        pc = runcontrol.read_pc(dap, c)
+        return {"stopped": "reached", "pc": f"0x{pc:08X}"}
+    return {"stopped": "timeout", "pc": None}
+
+
+def _m33_run_to(
+    ctx: Ctx, dap: Dap, c, address: int, timeout_s: float
+) -> dict[str, object]:
+    entry = m33_mod.set_breakpoint(dap, c, address)
+    slot = int(entry["index"])
+    session = ctx.session
+    try:
+        m33_mod.resume(dap, c)
+        if session is not None:
+            session.note_m33_resumed(c.name)
+        try:
+            m33_mod.wait_halt(dap, c, timeout_s=timeout_s)
+            halted = True
+        except S32EError:
+            halted = False
+    finally:
+        m33_mod.clear_breakpoint(dap, c, slot)
+    if halted:
+        if session is not None:
+            session.note_m33_halted(c.name)
+        pc = m33_mod.read_register(dap, c, "pc")
+        return {"stopped": "reached", "pc": f"0x{pc:08X}"}
+    return {"stopped": "timeout", "pc": None}
+
+
+@main.command("stepout")
+@_core_option
+@click.option("--timeout", "timeout_s", type=float, default=10.0, show_default=True,
+              help="Seconds to wait for the caller frame's return address.")
+@click.pass_obj
+def stepout_cmd(ctx: Ctx, core_spec: str | None, timeout_s: float) -> None:
+    """Run until the current function returns: unwind one frame, temp
+    breakpoint at the return address, resume, wait, clear. Best effort -- it
+    needs the unwinder to find a caller frame, and a free hardware comparator.
+
+    On timeout the core is LEFT RUNNING (the temp breakpoint is cleared);
+    halt it manually when ready.
+    """
+    family, spec = _ide_target(ctx, core_spec)
+    index = _session_symbols(ctx)
+
+    if family == "r52":
+        with _one_core(ctx, spec) as (dap, c):
+            _require_halted_r52(c)
+            regs = runcontrol.read_registers(dap, c)
+            pc, values, thumb = _r52_unwind_inputs(regs)
+            frames, reason = symunwind.unwind(
+                pc=pc,
+                sp=values.get("r13"),
+                fp=values.get("r7" if thumb else "r11"),
+                lr=values.get("r14"),
+                read_word=_ap_word_reader(dap, AP_AXI),
+                index=index,
+                max_frames=2,
+                thumb_r7=thumb,
+            )
+            if len(frames) < 2:
+                raise click.ClickException(
+                    f"no caller frame to return to ({reason})"
+                )
+            result = _r52_run_to(ctx, dap, c, frames[1].pc, timeout_s, index)
+            name = c.name
+    else:
+        with _one_m33(ctx, spec) as (dap, c):
+            values = m33_mod.read_registers(dap, c)
+            frames, reason = symunwind.unwind(
+                pc=values["pc"],
+                sp=values.get("sp"),
+                fp=values.get("r7"),
+                lr=values.get("lr"),
+                read_word=_ap_word_reader(dap, c.ap_base),
+                index=index,
+                max_frames=2,
+                thumb_r7=True,
+            )
+            if len(frames) < 2:
+                raise click.ClickException(
+                    f"no caller frame to return to ({reason})"
+                )
+            result = _m33_run_to(ctx, dap, c, frames[1].pc, timeout_s)
+            name = c.name
+
+    if result["stopped"] == "reached":
+        console.print(f"[green]{name} returned[/green] to {result['pc']}")
+    else:
+        console.print(
+            f"[yellow]{name} still running[/yellow] after {timeout_s:.0f}s -- "
+            "the temp breakpoint was cleared; halt it manually when ready"
+        )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {"core": name, **result})
+
+
+@main.command("runto")
+@click.argument("address")
+@_core_option
+@click.option("--timeout", "timeout_s", type=float, default=10.0, show_default=True)
+@click.pass_obj
+def runto_cmd(ctx: Ctx, address: str, core_spec: str | None, timeout_s: float) -> None:
+    """Run to an address: temp hardware breakpoint, resume, wait, clear.
+
+    The run-to-cursor primitive (the IDE resolves file:line to an address via
+    `sym line2addr` first). On timeout the core is LEFT RUNNING and the temp
+    breakpoint is cleared.
+    """
+    target = _parse_address(address)
+    family, spec = _ide_target(ctx, core_spec)
+    index = _session_symbols(ctx)
+    if family == "r52":
+        with _one_core(ctx, spec) as (dap, c):
+            _require_halted_r52(c)
+            result = _r52_run_to(ctx, dap, c, target, timeout_s, index)
+            name = c.name
+    else:
+        with _one_m33(ctx, spec) as (dap, c):
+            result = _m33_run_to(ctx, dap, c, target, timeout_s)
+            name = c.name
+    if result["stopped"] == "reached":
+        console.print(f"[green]{name} reached[/green] {result['pc']}")
+    else:
+        console.print(
+            f"[yellow]{name} still running[/yellow] after {timeout_s:.0f}s -- "
+            "the temp breakpoint was cleared; halt it manually when ready"
+        )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {"core": name, **result})
 
 
 # ---------------------------------------------------------------------------
@@ -2515,19 +3328,30 @@ def _print_session_help() -> None:
     )
 
 
-def _session_use(ctx: Ctx, args: list[str]) -> None:
+def _session_use(ctx: Ctx, args: list[str]) -> tuple[str, str]:
+    """The `use <core>` builtin. Returns (outcome kind, message) -- "ok" on
+    success -- so machine mode can report it structurally."""
     session = ctx.session
     assert session is not None
+
+    def emit_focus() -> None:
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "focus": session.focus, "m33_focus": session.m33_focus,
+            })
+
     if not args:
         console.print(
             f"focus: {session.focus or '-'} (R52), {session.m33_focus or '-'} (M33)"
         )
-        return
+        emit_focus()
+        return "ok", ""
     spec = args[0]
     if spec.lower() in m33_mod.M33_APS:
         session.m33_focus = spec.lower()
         console.print(f"M33 focus: {session.m33_focus}")
-        return
+        emit_focus()
+        return "ok", ""
     if session.cores is None:
         # `use` right after an in-session `gates apply` on a power-cycled
         # board: discovery has not run yet -- run it now rather than telling
@@ -2536,17 +3360,19 @@ def _session_use(ctx: Ctx, args: list[str]) -> None:
             _discover_cores(ctx, session.dap)
         except S32EError as exc:
             console.print(f"[red]error:[/red] {exc}")
-            return
+            return "tool", str(exc)
     try:
         c = runcontrol.resolve(spec, session.cores or [])
     except ValueError as exc:
         console.print(f"[red]error:[/red] {exc}")
-        return
+        return "usage", str(exc)
     session.focus = c.name
     console.print(f"focus: {c.name}")
+    emit_focus()
+    return "ok", ""
 
 
-def _session_sync(ctx: Ctx, args: list[str]) -> None:
+def _session_sync(ctx: Ctx, args: list[str]) -> tuple[str, str]:
     """The `sync on|off|status` session builtin -- stop-the-world mode.
 
     Armed, the guide-§5.9 cross-halt group makes ANY halt (manual or a
@@ -2557,27 +3383,33 @@ def _session_sync(ctx: Ctx, args: list[str]) -> None:
     """
     session = ctx.session
     assert session is not None
+
+    def emit_sync() -> None:
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {"sync": session.sync})
+
     if not args or args[0] not in ("on", "off", "status"):
         console.print("usage: sync on|off|status")
-        return
+        return "usage", "usage: sync on|off|status"
     if args[0] == "status":
         console.print(f"sync: {'on' if session.sync else 'off'}")
-        return
+        emit_sync()
+        return "ok", ""
     want = args[0] == "on"
     try:
         cores = _discover_cores(ctx, session.dap)
     except S32EError as exc:
         console.print(f"[red]error:[/red] {exc}")
-        return
+        return "tool", str(exc)
     usable = [c for c in cores if not runcontrol.identity_problems(c)]
     if want and not usable:
         console.print("[red]error:[/red] no usable cores to arm")
-        return
+        return "tool", "no usable cores to arm"
     try:
         notes = runcontrol.set_cross_trigger(session.dap, usable, want)
     except S32EError as exc:
         console.print(f"[red]error:[/red] {exc}")
-        return
+        return "tool", str(exc)
     for note in notes:
         console.print(f"[dim]{note}[/dim]")
     session.sync = want
@@ -2589,80 +3421,116 @@ def _session_sync(ctx: Ctx, args: list[str]) -> None:
         )
     else:
         console.print("[green]sync off[/green]")
+    emit_sync()
+    return "ok", ""
 
 
-def _session_tokens(line: str) -> list[str] | None:
-    """Split a session line into argv tokens. None on a lexing error."""
+def _session_tokens(line: str) -> tuple[list[str] | None, str | None]:
+    """Split a session line into argv tokens: (tokens, lexing error)."""
     try:
         raw = shlex.split(line, posix=False)
     except ValueError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        return None
+        return None, str(exc)
     # posix=False keeps Windows paths intact but leaves surrounding quotes on;
     # strip them so `--json "out file.json"` arrives as one clean token.
     return [
         t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t
         for t in raw
-    ]
+    ], None
 
 
-def _session_dispatch(ctx: Ctx, line: str) -> bool:
-    """Run one session command line. Returns False when the session should end."""
-    tokens = _session_tokens(line)
+@dataclass
+class Outcome:
+    """What one session line did, structurally.
+
+    ``kind`` mirrors the exit-code contract the way machine mode reports it:
+    "ok", "quit", "usage" (1), "tool" (2), "refused" (3), "aborted" (130),
+    plus "unknown-command" and "internal". The interactive REPL only cares
+    about "quit"; `debug --machine` turns the rest into error envelopes.
+    """
+
+    kind: str
+    message: str = ""
+    cmd: str = ""
+
+
+def _dispatch_outcome(ctx: Ctx, line: str) -> Outcome:
+    """Run one session line, printing exactly what the REPL always printed."""
+    tokens, lex_error = _session_tokens(line)
+    if lex_error is not None:
+        console.print(f"[red]error:[/red] {lex_error}")
+        return Outcome("usage", lex_error)
     if not tokens:
-        return True
+        return Outcome("ok")
     name = tokens[0].lower()
     if name in ("quit", "exit", "q"):
-        return False
+        return Outcome("quit", cmd="quit")
     if name in ("help", "?"):
         _print_session_help()
-        return True
+        return Outcome("ok", cmd="help")
     if name == "use":
-        _session_use(ctx, tokens[1:])
-        return True
+        kind, message = _session_use(ctx, tokens[1:])
+        return Outcome(kind, message, "use")
     if name == "sync":
-        _session_sync(ctx, tokens[1:])
-        return True
+        kind, message = _session_sync(ctx, tokens[1:])
+        return Outcome(kind, message, "sync")
     if name in SESSION_ALIASES:
         tokens = [*SESSION_ALIASES[name], *tokens[1:]]
         name = tokens[0]
     reason = SESSION_BLOCKED.get(name)
     if reason is not None:
-        console.print(
-            f"[red]refused:[/red] `{name}` cannot run inside a debug session: {reason}. "
+        message = (
+            f"`{name}` cannot run inside a debug session: {reason}. "
             "Quit the session first."
         )
-        return True
+        console.print(f"[red]refused:[/red] {message}")
+        return Outcome("refused", message, name)
     command = main.commands.get(name)
     if command is None:
-        console.print(
-            f"[red]error:[/red] unknown command {name!r}. `help` lists what works here."
-        )
-        return True
+        message = f"unknown command {name!r}. `help` lists what works here."
+        console.print(f"[red]error:[/red] {message}")
+        return Outcome("unknown-command", message, name)
+    label = (
+        " ".join(tokens[:2])
+        if isinstance(command, click.Group) and len(tokens) > 1
+        else name
+    )
     try:
         with command.make_context(name, tokens[1:], obj=ctx) as command_ctx:
             command.invoke(command_ctx)
     except click.exceptions.Exit:
         pass
     except click.ClickException as exc:
-        console.print(f"[red]error:[/red] {exc.format_message()}")
+        message = exc.format_message()
+        console.print(f"[red]error:[/red] {message}")
+        return Outcome("usage", message, label)
     except click.Abort:
         console.print("[yellow]aborted[/yellow]")
+        return Outcome("aborted", "aborted", label)
     except UnsafeOperation as exc:
         console.print(f"[red]refused:[/red] {exc}")
+        return Outcome("refused", str(exc), label)
     except S32EError as exc:
         console.print(f"[red]error:[/red] {exc}")
+        return Outcome("tool", str(exc), label)
     except KeyboardInterrupt:
         console.print(
             "\n[yellow]interrupted[/yellow] -- the session is still open; `quit` leaves it"
         )
+        return Outcome("aborted", "interrupted", label)
     except Exception as exc:  # defence in depth: no input may end the session
         console.print(f"[red]internal error:[/red] {type(exc).__name__}: {exc}")
         console.print(
             "[dim]This is a bug in s32edbg, not target state -- the session is "
             "still open. Please report it with the command that caused it.[/dim]"
         )
-    return True
+        return Outcome("internal", f"{type(exc).__name__}: {exc}", label)
+    return Outcome("ok", cmd=label)
+
+
+def _session_dispatch(ctx: Ctx, line: str) -> bool:
+    """Run one session command line. Returns False when the session should end."""
+    return _dispatch_outcome(ctx, line).kind != "quit"
 
 
 def _session_repl(ctx: Ctx) -> None:
@@ -2680,6 +3548,31 @@ def _session_repl(ctx: Ctx) -> None:
             break
 
 
+def _machine_loop(ctx: Ctx, mio: machine_mod.MachineIO) -> None:
+    """Read protocol lines until EOF or `quit`, one envelope per line."""
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        mio.seq += 1
+        mio.take_payloads()  # drop anything a broken command left behind
+        outcome = _dispatch_outcome(ctx, line)
+        payloads = mio.take_payloads()
+        result: object = payloads[0] if len(payloads) == 1 else (payloads or None)
+        if outcome.kind == "quit":
+            mio.emit({"seq": mio.seq, "ok": True, "cmd": "quit", "result": None})
+            break
+        envelope: dict[str, object] = {
+            "seq": mio.seq,
+            "ok": outcome.kind == "ok",
+            "cmd": outcome.cmd,
+            "result": result,
+        }
+        if outcome.kind != "ok":
+            envelope["error"] = {"kind": outcome.kind, "message": outcome.message}
+        mio.emit(envelope)
+
+
 @main.command("debug")
 @click.option("--core", "core_spec", default=None,
               help="Focus core: an R52 name/index/address, or smu/ce0/ce1.")
@@ -2691,6 +3584,9 @@ def _session_repl(ctx: Ctx) -> None:
                    "(guide §5.7 initialises them because their reset state is UNKNOWN).")
 @click.option("-c", "--command", "batch", multiple=True,
               help="Run this session command and exit; repeatable, runs in order.")
+@click.option("--machine", "machine_flag", is_flag=True,
+              help="NDJSON protocol for IDE frontends: one JSON result per input "
+                   "line on stdout, all human output on stderr. Needs piped stdin.")
 @click.pass_obj
 def debug_cmd(
     ctx: Ctx,
@@ -2698,6 +3594,7 @@ def debug_cmd(
     keep_on_exit: bool,
     keep_breakpoints: bool,
     batch: tuple[str, ...],
+    machine_flag: bool,
 ) -> None:
     """Open one debug session: breakpoints, halt, step, resume -- then close it.
 
@@ -2728,54 +3625,95 @@ def debug_cmd(
     if ctx.session is not None:
         raise click.ClickException("a debug session is already open.")
 
-    with open_transport(ctx) as (t, dap):
-        assert dap is not None
-        session = DebugSession(
-            transport=t, dap=dap, keep_breakpoints=keep_breakpoints
-        )
-        ctx.session = session
-        try:
-            try:
-                cores = _discover_cores(ctx, dap)
-                console.print(
-                    f"[green]session open[/green] -- {len(cores)} R52 core(s): "
-                    + " ".join(c.name for c in cores)
-                    + "; M33: " + " ".join(m33_mod.M33_APS)
-                )
-            except S32EError as exc:
-                # A fresh power cycle loses the LADDER-1 enables, so discovery
-                # can legitimately fail before `gates apply` has run. The
-                # session stays open so it can be run *inside* -- rediscovery
-                # happens on the next core command.
-                console.print(f"[yellow]![/yellow] {exc}")
-                console.print(
-                    "[dim]session open with no cores discovered yet -- run "
-                    "`gates apply`, then `core list`.[/dim]"
-                )
-            if core_spec:
-                _session_use(ctx, [core_spec])
+    mio: machine_mod.MachineIO | None = None
+    if machine_flag:
+        if batch:
+            raise click.ClickException(
+                "--machine and -c do not combine: the protocol reads stdin."
+            )
+        if sys.stdin.isatty():
+            raise click.ClickException(
+                "--machine reads protocol lines from piped stdin; there is "
+                "nothing machine-readable about a terminal."
+            )
+        # From here on the whole Rich stream -- including everything the
+        # transport bring-up below prints -- belongs on stderr.
+        mio = machine_mod.begin()
+        ctx.json_out = machine_mod.JSON_SINK
+        ctx.machine = True
 
-            if batch:
-                for line in batch:
-                    if not _session_dispatch(ctx, line):
-                        break
-            elif not sys.stdin.isatty():
-                for line in sys.stdin:
-                    if not _session_dispatch(ctx, line.rstrip("\n")):
-                        break
-            else:
-                _session_repl(ctx)
-        finally:
-            ctx.session = None
-            if keep_on_exit:
-                console.print(
-                    "[yellow]--keep-on-exit:[/yellow] breakpoints stay armed and "
-                    "halted cores stay halted."
-                )
-            else:
-                for note in session.restore():
-                    console.print(f"[dim]restore:[/dim] {note}")
-            console.print("[green]session closed[/green]")
+    try:
+        with open_transport(ctx) as (t, dap):
+            assert dap is not None
+            session = DebugSession(
+                transport=t, dap=dap, keep_breakpoints=keep_breakpoints
+            )
+            ctx.session = session
+            try:
+                discovery_error: str | None = None
+                try:
+                    cores = _discover_cores(ctx, dap)
+                    console.print(
+                        f"[green]session open[/green] -- {len(cores)} R52 core(s): "
+                        + " ".join(c.name for c in cores)
+                        + "; M33: " + " ".join(m33_mod.M33_APS)
+                    )
+                except S32EError as exc:
+                    # A fresh power cycle loses the LADDER-1 enables, so discovery
+                    # can legitimately fail before `gates apply` has run. The
+                    # session stays open so it can be run *inside* -- rediscovery
+                    # happens on the next core command.
+                    discovery_error = str(exc)
+                    console.print(f"[yellow]![/yellow] {exc}")
+                    console.print(
+                        "[dim]session open with no cores discovered yet -- run "
+                        "`gates apply`, then `core list`.[/dim]"
+                    )
+                if core_spec:
+                    _session_use(ctx, [core_spec])
+                    if mio is not None:
+                        mio.take_payloads()  # the ready event carries the focus
+
+                if mio is not None:
+                    mio.event(
+                        "ready",
+                        version=__version__,
+                        protocol=machine_mod.PROTOCOL,
+                        cores=[c.name for c in (session.cores or [])],
+                        m33=list(m33_mod.M33_APS),
+                        focus=session.focus,
+                        m33_focus=session.m33_focus,
+                        discovery_error=discovery_error,
+                    )
+                    _machine_loop(ctx, mio)
+                elif batch:
+                    for line in batch:
+                        if not _session_dispatch(ctx, line):
+                            break
+                elif not sys.stdin.isatty():
+                    for line in sys.stdin:
+                        if not _session_dispatch(ctx, line.rstrip("\n")):
+                            break
+                else:
+                    _session_repl(ctx)
+            finally:
+                ctx.session = None
+                restore_notes: list[str] = []
+                if keep_on_exit:
+                    console.print(
+                        "[yellow]--keep-on-exit:[/yellow] breakpoints stay armed and "
+                        "halted cores stay halted."
+                    )
+                else:
+                    restore_notes = session.restore()
+                    for note in restore_notes:
+                        console.print(f"[dim]restore:[/dim] {note}")
+                if mio is not None:
+                    mio.event("bye", restore_notes=restore_notes, kept=keep_on_exit)
+                console.print("[green]session closed[/green]")
+    finally:
+        if machine_flag:
+            machine_mod.end()
 
 
 # ---------------------------------------------------------------------------
@@ -2852,6 +3790,7 @@ def load_cmd(
 
         def note(text: str) -> None:
             console.print(f"[dim]load:[/dim] {text}")
+            machine_mod.progress(text)
 
         session = ctx.session
         if session is not None:

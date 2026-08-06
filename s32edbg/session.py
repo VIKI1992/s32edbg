@@ -41,6 +41,10 @@ class DebugSession:
 
     #: Set once the ADIv6 power-up and AP-read calibration have run.
     prepared: bool = False
+    #: The symbol index (`sym load <elf>`) an IDE frontend attached, if any.
+    #: Survives `note_system_reset` deliberately: a `load` does not change
+    #: which ELF the source-level commands should read.
+    symbols: Any = None
     #: Cached discovery. Identity is stable for the life of a session; state
     #: (halted, locked) is not, and is re-read on every use of the cache.
     cores: list[runcontrol.Core] | None = None

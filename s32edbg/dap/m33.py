@@ -150,6 +150,20 @@ def discover(dap: Dap) -> list[M33Core]:
     return cores
 
 
+def quick_status(dap: Dap, core: M33Core) -> dict[str, object]:
+    """One DHCSR read -- the cheap status primitive an IDE polls at 1 Hz.
+
+    Refreshes the cached identity's DHCSR so ``core.halted`` stays truthful
+    without repeating the full five-read `identify`.
+    """
+    core.identity.dhcsr = _read(dap, core.ap_base, m33.DHCSR)
+    return {
+        "name": core.name,
+        "halted": core.halted,
+        "answered": core.identity.dhcsr is not None,
+    }
+
+
 def resolve(spec: str, cores: list[M33Core]) -> M33Core:
     key = spec.strip().lower()
     for core in cores:

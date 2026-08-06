@@ -9,6 +9,11 @@ description = "CoreSight/JTAG command-line tool for NXP S32E27x via SEGGER J-Lin
 requires-python = ">=3.11"
 dependencies = ["click>=8.1", "rich>=13.0"]
 
+[project.optional-dependencies]
+# The IDE integration (vscode/ extension) needs DWARF + a disassembler; the
+# base CLI deliberately stays click+rich only. `pip install -e .[ide]`.
+ide = ["pyelftools>=0.31", "capstone>=5.0"]
+
 [project.scripts]
 s32edbg = "s32edbg.cli:entry"
 
