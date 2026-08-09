@@ -1059,3 +1059,77 @@ def test_an_all_invalid_sample_says_why_rather_than_reporting_nothing() -> None:
     assert result["invalid"] == 5
     assert "no PC was captured" in str(result["note"])
     assert "OS lock" in str(result["note"])
+
+
+# --- resume steps off the comparator it is halted on -------------------------
+
+
+def _resume_calls_step(monkeypatch, status: int) -> bool:
+    """Drive resume() with a pre-state of `status`; report whether it stepped.
+
+    The DAP traffic around the decision (CTI prepare, restart, confirm) is
+    stubbed: what is under test is the *decision* to retire the instruction
+    under the comparator, which is the part that regressed into "continue from
+    a breakpoint never reaches the next one".
+    """
+    from s32edbg.dap import runcontrol as rc
+
+    stepped = {"n": 0}
+    state = rc.CoreState(edscr=status, edprsr=0, rehalted=False)
+
+    def fake_step(dap, core, **kw):
+        stepped["n"] += 1
+        return state
+
+    monkeypatch.setattr(rc, "read_state", lambda *a, **k: state)
+    monkeypatch.setattr(rc, "step", fake_step)
+    monkeypatch.setattr(rc, "_prepare_cti", lambda *a, **k: None)
+    monkeypatch.setattr(rc, "_restart", lambda *a, **k: None)
+    monkeypatch.setattr(rc, "_confirm_restart", lambda *a, **k: state)
+
+    core = rc.discover(Dap(SyntheticTarget()))[0]
+    rc.resume(Dap(SyntheticTarget()), core)
+    return stepped["n"] == 1
+
+
+def test_resume_steps_off_a_breakpoint_before_restarting(monkeypatch) -> None:
+    """Halted ON a comparator, DLR still points at the un-executed instruction,
+    so a bare restart re-matches it and the core makes no progress. Reproduced
+    on an S32E278: continue from cdd_btn9970.c:437 re-halted at 0x323DC472
+    every time and never reached :443."""
+    from s32edbg.data import r52debug
+
+    assert _resume_calls_step(monkeypatch, r52debug.EDSCR_STATUS_BREAKPOINT)
+
+
+def test_resume_does_not_step_when_halted_for_other_reasons(monkeypatch) -> None:
+    """An external debug request (or any non-breakpoint halt) left the PC on an
+    instruction that has not been matched by a comparator, so stepping would
+    silently execute one extra instruction the user never asked for."""
+    from s32edbg.data import r52debug
+
+    for status in (
+        r52debug.EDSCR_STATUS_EXTERNAL_DEBUG_REQUEST,
+        r52debug.EDSCR_STATUS_WATCHPOINT,
+        r52debug.EDSCR_STATUS_RESET_CATCH,
+    ):
+        assert not _resume_calls_step(monkeypatch, status)
+
+
+def test_resume_step_off_can_be_turned_off(monkeypatch) -> None:
+    """The halt-group paths resume cores stopped by the cross-trigger, not by
+    their own comparator, and want a literal restart."""
+    from s32edbg.dap import runcontrol as rc
+    from s32edbg.data import r52debug
+
+    stepped = {"n": 0}
+    state = rc.CoreState(edscr=r52debug.EDSCR_STATUS_BREAKPOINT, edprsr=0, rehalted=False)
+    monkeypatch.setattr(rc, "read_state", lambda *a, **k: state)
+    monkeypatch.setattr(rc, "step", lambda *a, **k: stepped.__setitem__("n", 1) or state)
+    monkeypatch.setattr(rc, "_prepare_cti", lambda *a, **k: None)
+    monkeypatch.setattr(rc, "_restart", lambda *a, **k: None)
+    monkeypatch.setattr(rc, "_confirm_restart", lambda *a, **k: state)
+
+    core = rc.discover(Dap(SyntheticTarget()))[0]
+    rc.resume(Dap(SyntheticTarget()), core, step_off_breakpoint=False)
+    assert stepped["n"] == 0

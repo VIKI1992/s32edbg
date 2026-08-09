@@ -1452,9 +1452,15 @@ def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool, sync: bool) ->
                     f"{r52debug.edscr_status_name(state.edscr or 0)}"
                     + (f" at {where['address']}" if where.get("address") else "")
                 )
+                # `resume` steps off the comparator it was halted on, so an
+                # immediate re-halt is a DIFFERENT breakpoint that happens to be
+                # a few instructions away -- progress, not a stuck resume. Only
+                # a re-halt at the same address is the pathological case, and
+                # after the step-off that should no longer happen.
                 console.print(
-                    "[dim]That is a working breakpoint, not a failed resume. To get "
-                    "past it, clear the comparator or step over it first.[/dim]"
+                    "[dim]That is a working breakpoint, not a failed resume -- the "
+                    "resume stepped off the previous one, so this is a different "
+                    "comparator close by.[/dim]"
                 )
             else:
                 console.print(

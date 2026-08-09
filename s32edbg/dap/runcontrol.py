@@ -946,7 +946,12 @@ def _confirm_restart(
 
 
 def resume(
-    dap: Dap, core: Core, *, ap_base: int = AP_APB, timeout_s: float = 2.0
+    dap: Dap,
+    core: Core,
+    *,
+    ap_base: int = AP_APB,
+    timeout_s: float = 2.0,
+    step_off_breakpoint: bool = True,
 ) -> CoreState:
     """Let a halted core run again.
 
@@ -955,9 +960,43 @@ def resume(
     that the request is still asserted at the trigger matrix and the core
     swallows the restart (guide §5.5). The restart itself is then confirmed
     through EDPRSR.SDR.
+
+    **Stepping off a breakpoint.** A breakpoint matches when the instruction at
+    the matched address is committed for execution, and the PE halts *before*
+    executing it -- so DLR still points at that instruction. Restarting from
+    there re-matches the same comparator before anything retires, and the core
+    halts again having made no progress. There is no skip-one bit on the R52:
+    the comparator has to be taken out of the way for exactly one instruction.
+
+    Without this, two breakpoints on consecutive lines behave as "the first one
+    is hit, continue does nothing visible, the second is never reached" --
+    which reads as a lost breakpoint rather than a working one. Reproduced on
+    an S32E278 at cdd_btn9970.c:437/:443: continue from :437 re-halted at
+    0x323DC472 every time and never reached :443.
+
+    ``step`` already suspends every enabled comparator, single-steps and
+    restores them, so one step is all that is needed and the comparators stay
+    armed afterwards. Pass ``step_off_breakpoint=False`` for a literal restart
+    (what the halt-group paths want, since they resume cores that were stopped
+    by the cross-trigger rather than by their own comparator).
     """
     before = read_state(dap, core.debug_base, ap_base=ap_base)
     before_status = r52.edscr_status(before.edscr) if before.edscr is not None else None
+
+    if step_off_breakpoint and before_status == r52.EDSCR_STATUS_BREAKPOINT:
+        # Retire the instruction under the comparator, then fall through to the
+        # ordinary restart. If the step itself fails, resume anyway rather than
+        # leaving the core halted: the caller asked it to run.
+        try:
+            after_step = step(dap, core, ap_base=ap_base)
+        except RunControlError:
+            pass
+        else:
+            before_status = (
+                r52.edscr_status(after_step.edscr)
+                if after_step.edscr is not None
+                else before_status
+            )
 
     _prepare_cti(dap, core, ap_base=ap_base)
     _restart(dap, core, ap_base=ap_base)

@@ -1664,6 +1664,17 @@ stepout                 unwind one frame, temp hardware breakpoint at the return
 runto 0x...             the run-to-cursor primitive, same temp-breakpoint mechanics
 ```
 
+`resume`/`continue` steps off the comparator it was halted on. A breakpoint halts the PE
+*before* the matched instruction executes, so DLR still points at it and a bare restart
+re-matches the same comparator having made no progress — there is no skip-one bit on the
+R52. Two breakpoints on consecutive lines otherwise behave as "the first is hit, continue
+does nothing, the second is never reached", which reads as a lost breakpoint rather than a
+working one. Verified on an S32E278 at `cdd_btn9970.c:437`/`:443`: before, continue re-halted
+at `0x323DC472` indefinitely; after, it lands on `0x323DC4CA`. Pass
+`step_off_breakpoint=False` at the API level for a literal restart (what the halt-group
+paths want, since those cores were stopped by the cross-trigger, not by their own
+comparator).
+
 All of these work on the R52s and the M33s (`m33 step --over` uses a capstone call-detect plus a
 temporary FPB comparator — the M33 twin of `runcontrol.step_over`). The unwinder and stepline are
 best-effort by nature: they refuse to invent frames, and `stepline` stops with a reason
