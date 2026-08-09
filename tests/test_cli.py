@@ -1052,3 +1052,131 @@ def test_flash_verify_passes_on_matching_content_and_exits_2_on_a_mismatch(
     assert code == EXIT_TOOL_ERROR
     # Byte 0 matches (both are 0x00); the first real difference is byte 1.
     assert "verify mismatched at flash offset 0x00300001" in out
+
+
+# --- stepline: stepping one source line -------------------------------------
+#
+# _step_to_next_line is the loop both the R52 and M33 paths run. It takes its
+# step and read-pc as callables, so the whole thing is exercisable with a fake
+# core and no probe -- which is the point: the AUTOSAR idle-loop case used to
+# cost the better part of a minute on hardware to observe once.
+
+
+class _FakeIndex:
+    """Minimal addr_to_line: an address map, missing entries mean no line info."""
+
+    def __init__(self, by_addr):
+        self._by_addr = by_addr
+
+    def addr_to_line(self, addr):
+        return self._by_addr.get(addr)
+
+
+class _Hit:
+    def __init__(self, file, line):
+        self.file = file
+        self.line = line
+
+
+def _walker(pcs):
+    """Drive the PC through `pcs`: pcs[n] is the PC after the (n+1)th step()."""
+    state = {"i": 0}
+
+    def step():
+        state["i"] += 1
+
+    def read_pc():
+        return pcs[min(state["i"] - 1, len(pcs) - 1)]
+
+    return step, read_pc
+
+
+def test_step_to_next_line_stops_on_line_change():
+    from s32edbg.cli import _step_to_next_line
+
+    idle = _Hit("a.c", 1)
+    nxt = _Hit("a.c", 2)
+    index = _FakeIndex({0x1000: idle, 0x1002: idle, 0x1004: nxt})
+    step, read_pc = _walker([0x1002, 0x1004])
+    pc, steps, stopped, loop_at = _step_to_next_line(
+        step, read_pc, index, 0x1000, idle, 128, True
+    )
+    assert (pc, steps, stopped, loop_at) == (0x1004, 2, "line-change", None)
+
+
+def test_step_to_next_line_catches_the_idle_loop_in_two_steps():
+    """`nop; b.n .-2` on one line -- the Os_Task_Os_IdleTask shape.
+
+    Before the loop guard this ran the full 128-step budget (~1 minute on
+    hardware) and reported the uninformative "max-steps". Note "no-progress"
+    does NOT catch it: the PC alternates, so it never equals the previous PC.
+    """
+    from s32edbg.cli import _step_to_next_line
+
+    idle = _Hit("Os_Hal_Core.h", 409)
+    index = _FakeIndex({0x321D2EE6: idle, 0x321D2EE8: idle})
+    # nop -> branch -> back to nop -> ... forever
+    step, read_pc = _walker([0x321D2EE8, 0x321D2EE6] * 200)
+    pc, steps, stopped, loop_at = _step_to_next_line(
+        step, read_pc, index, 0x321D2EE6, idle, 128, True
+    )
+    assert stopped == "loop"
+    assert steps == 2
+    assert loop_at == 0x321D2EE6
+
+
+def test_step_to_next_line_loop_guard_can_be_disabled():
+    from s32edbg.cli import _step_to_next_line
+
+    idle = _Hit("Os_Hal_Core.h", 409)
+    index = _FakeIndex({0x321D2EE6: idle, 0x321D2EE8: idle})
+    step, read_pc = _walker([0x321D2EE8, 0x321D2EE6] * 200)
+    pc, steps, stopped, loop_at = _step_to_next_line(
+        step, read_pc, index, 0x321D2EE6, idle, 16, False
+    )
+    assert (steps, stopped, loop_at) == (16, "max-steps", None)
+
+
+def test_step_to_next_line_still_reports_no_progress():
+    from s32edbg.cli import _step_to_next_line
+
+    idle = _Hit("a.c", 1)
+    index = _FakeIndex({0x1000: idle})
+    step, read_pc = _walker([0x1000])  # PC never moves
+    pc, steps, stopped, loop_at = _step_to_next_line(
+        step, read_pc, index, 0x1000, idle, 128, True
+    )
+    assert (pc, steps, stopped, loop_at) == (0x1000, 1, "no-progress", None)
+
+
+def test_step_to_next_line_prefers_line_change_over_loop():
+    """A step that both revisits an address AND leaves the line is a
+    line-change, not a loop -- the line test runs first."""
+    from s32edbg.cli import _step_to_next_line
+
+    here = _Hit("a.c", 1)
+    there = _Hit("a.c", 2)
+    # 0x1000 is the start; stepping returns to 0x1000 but it now maps to a
+    # different line row (a loop head that the line table attributes onwards).
+    index = _FakeIndex({0x1000: there, 0x1002: here})
+    step, read_pc = _walker([0x1002, 0x1000])
+    pc, steps, stopped, loop_at = _step_to_next_line(
+        step, read_pc, index, 0x1000, here, 128, True
+    )
+    assert stopped == "line-change"
+    assert loop_at is None
+
+
+def test_step_to_next_line_walks_glue_without_line_info():
+    """Instructions with no line info are stepped through, not treated as a
+    line change (addr_to_line returns None for them)."""
+    from s32edbg.cli import _step_to_next_line
+
+    here = _Hit("a.c", 1)
+    there = _Hit("a.c", 2)
+    index = _FakeIndex({0x1000: here, 0x1004: there})  # 0x1002 = glue, no line
+    step, read_pc = _walker([0x1002, 0x1004])
+    pc, steps, stopped, _ = _step_to_next_line(
+        step, read_pc, index, 0x1000, here, 128, True
+    )
+    assert (pc, steps, stopped) == (0x1004, 2, "line-change")

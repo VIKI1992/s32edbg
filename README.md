@@ -1667,7 +1667,20 @@ runto 0x...             the run-to-cursor primitive, same temp-breakpoint mechan
 All of these work on the R52s and the M33s (`m33 step --over` uses a capstone call-detect plus a
 temporary FPB comparator — the M33 twin of `runcontrol.step_over`). The unwinder and stepline are
 best-effort by nature: they refuse to invent frames, and `stepline` stops with a reason
-(`line-change`, `max-steps`, `no-line-info`, `no-progress`).
+(`line-change`, `loop`, `max-steps`, `no-line-info`, `no-progress`).
+
+`loop` means the PC came back to an address it had already visited without ever leaving the
+line — the line's own code cycles, so a source step can never finish. The case that motivated
+it is the AUTOSAR idle task: `-Og` folds `Os_CoreIdle` → `Os_Hal_CoreIdle` → `Os_Hal_CoreNop`
+→ `Os_Hal_Nop()` into `nop; b.n .-2`, two instructions on one source line. `no-progress` does
+not catch that (it compares against the *previous* PC only, and in a two-instruction cycle the
+PC always differs), so before the guard this ran the full 128-step budget — the better part of
+a minute on hardware — and reported `max-steps`. It now stops on the second instruction.
+
+The guard bails at the **first** revisited address, so a data-dependent loop written entirely
+on one line (`for (i = 0; i < 10; i++) sum += i;`) reports `loop` rather than running to
+completion — the PC alone cannot distinguish the two. Pass `--no-loop-guard` for the old
+exhaustive behaviour.
 
 ### The extension
 

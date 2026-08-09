@@ -942,10 +942,24 @@ async function stepLine(deps: Deps, over: boolean): Promise<void> {
     pc_after: string;
     stopped: string;
     steps: number;
+    loop_at?: string | null;
   };
   if (result.stopped === "no-line-info") {
     void vscode.window.setStatusBarMessage(
       "S32E: no line info at the PC -- took one instruction step",
+      4000,
+    );
+  } else if (result.stopped === "loop") {
+    // Worth a real notification rather than a status-bar flash: the step did
+    // NOT advance a line and no amount of further stepping will, so the user
+    // has to pick a different verb.
+    void vscode.window.showWarningMessage(
+      `S32E: this source line loops back to ${result.loop_at ?? "itself"} — a source step ` +
+        "can never leave it. Use Continue, Step Out, or run to a line past the loop.",
+    );
+  } else if (result.stopped === "max-steps") {
+    void vscode.window.setStatusBarMessage(
+      `S32E: still on the same line after ${result.steps} steps`,
       4000,
     );
   }

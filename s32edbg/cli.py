@@ -2967,18 +2967,96 @@ def disasm_cmd(
             })
 
 
+def _step_to_next_line(
+    step,
+    read_pc,
+    index,
+    pc0: int,
+    start_hit,
+    max_steps: int,
+    loop_guard: bool,
+) -> tuple[int, int, str, int | None]:
+    """Instruction-step until the line-table row changes.
+
+    Shared by the R52 and M33 paths, which differ only in how they step and
+    read the PC. Returns ``(pc, steps, stopped, loop_at)``.
+
+    ``stopped`` is one of:
+
+    ``line-change``
+        Reached a different source line -- the success case.
+    ``loop``
+        The PC came back to an address it had already visited without ever
+        leaving the line, so the line's own code cycles. ``loop_at`` is that
+        address. Only reported when ``loop_guard`` is set.
+    ``no-progress``
+        The PC did not move at all.
+    ``max-steps``
+        Ran out of budget.
+
+    Why the loop guard exists: ``-Og`` folds the AUTOSAR idle chain
+    (``Os_CoreIdle`` -> ``Os_Hal_CoreIdle`` -> ``Os_Hal_CoreNop`` ->
+    ``Os_Hal_Nop()``) into two instructions on ONE source line::
+
+        321d2ee6 <Os_Task_Os_IdleTask>:
+        321d2ee6:  bf00    nop
+        321d2ee8:  e7fd    b.n  321d2ee6
+
+    The PC alternates forever, so ``line-change`` never fires. ``no-progress``
+    does not catch it either: it compares against the *previous* PC only, and
+    in a two-instruction cycle the PC always differs from the previous one.
+    The loop therefore ran the full budget -- 128 steps at ~0.4-0.5 s each is
+    the better part of a minute -- and then reported the uninformative
+    ``max-steps``. The guard stops on the second instruction instead.
+
+    Trade-off, deliberate: this bails at the FIRST revisited address, so a
+    data-dependent loop written entirely on one line (``for (i = 0; i < 10;
+    i++) sum += i;``) now reports ``loop`` instead of running the loop to
+    completion. We cannot tell the two apart from the PC alone -- proving
+    termination needs the loop's data, not its addresses. Pass
+    ``--no-loop-guard`` to get the old exhaustive behaviour.
+    """
+    pc = pc0
+    steps = 0
+    seen = {pc0}
+    for _ in range(max_steps):
+        step()
+        steps += 1
+        new_pc = read_pc()
+        if new_pc == pc:
+            return new_pc, steps, "no-progress", None
+        pc = new_pc
+        hit = index.addr_to_line(pc)
+        if hit is not None and (hit.file, hit.line) != (
+            start_hit.file, start_hit.line
+        ):
+            return pc, steps, "line-change", None
+        # Checked after the line test so a cycle that *does* leave the line on
+        # this very step is still reported as the line-change it is.
+        if loop_guard and pc in seen:
+            return pc, steps, "loop", pc
+        seen.add(pc)
+    return pc, steps, "max-steps", None
+
+
 @main.command("stepline")
 @_core_option
 @click.option("--over", is_flag=True, help="Treat calls as one step (uses the "
               "temp-breakpoint-at-return mechanism per instruction).")
 @click.option("--max-steps", type=int, default=128, show_default=True)
+@click.option("--loop-guard/--no-loop-guard", default=True, show_default=True,
+              help="Stop as soon as the PC revisits an address without leaving "
+                   "the line (an infinite loop on one source line, e.g. the "
+                   "AUTOSAR idle task). Disable to step the full --max-steps "
+                   "budget, which is what a one-line data-dependent loop needs.")
 @click.pass_obj
-def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int) -> None:
+def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int,
+                 loop_guard: bool) -> None:
     """Step one SOURCE line: instruction-step until the line table row changes.
 
     Instructions with no line info (compiler glue) are stepped through. Stops
-    with a reason: line-change, max-steps, no-line-info (started outside the
-    line table; one instruction step is taken), or no-progress.
+    with a reason: line-change, loop, max-steps, no-line-info (started outside
+    the line table; one instruction step is taken), or no-progress.
     """
     index = _require_symbols(ctx)
     family, spec = _ide_target(ctx, core_spec)
@@ -2990,26 +3068,15 @@ def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int) ->
             start_hit = index.addr_to_line(pc0)
             steps = 0
             stopped = "no-line-info"
+            loop_at = None
             pc = pc0
             if start_hit is not None:
-                stopped = "max-steps"
-                for _ in range(max_steps):
-                    if over:
-                        runcontrol.step_over(dap, c)
-                    else:
-                        runcontrol.step(dap, c)
-                    steps += 1
-                    new_pc = runcontrol.read_pc(dap, c)
-                    if new_pc == pc:
-                        stopped = "no-progress"
-                        break
-                    pc = new_pc
-                    hit = index.addr_to_line(pc)
-                    if hit is not None and (hit.file, hit.line) != (
-                        start_hit.file, start_hit.line
-                    ):
-                        stopped = "line-change"
-                        break
+                pc, steps, stopped, loop_at = _step_to_next_line(
+                    (lambda: runcontrol.step_over(dap, c)) if over
+                    else (lambda: runcontrol.step(dap, c)),
+                    lambda: runcontrol.read_pc(dap, c),
+                    index, pc0, start_hit, max_steps, loop_guard,
+                )
             else:
                 runcontrol.step(dap, c)
                 steps = 1
@@ -3023,26 +3090,15 @@ def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int) ->
             start_hit = index.addr_to_line(pc0)
             steps = 0
             stopped = "no-line-info"
+            loop_at = None
             pc = pc0
             if start_hit is not None:
-                stopped = "max-steps"
-                for _ in range(max_steps):
-                    if over:
-                        _m33_step_over(ctx, dap, c, index)
-                    else:
-                        m33_mod.step(dap, c)
-                    steps += 1
-                    new_pc = m33_mod.read_register(dap, c, "pc")
-                    if new_pc == pc:
-                        stopped = "no-progress"
-                        break
-                    pc = new_pc
-                    hit = index.addr_to_line(pc)
-                    if hit is not None and (hit.file, hit.line) != (
-                        start_hit.file, start_hit.line
-                    ):
-                        stopped = "line-change"
-                        break
+                pc, steps, stopped, loop_at = _step_to_next_line(
+                    (lambda: _m33_step_over(ctx, dap, c, index)) if over
+                    else (lambda: m33_mod.step(dap, c)),
+                    lambda: m33_mod.read_register(dap, c, "pc"),
+                    index, pc0, start_hit, max_steps, loop_guard,
+                )
             else:
                 m33_mod.step(dap, c)
                 steps = 1
@@ -3056,6 +3112,19 @@ def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int) ->
         f"{name}: 0x{pc0:08X} -> 0x{pc:08X} in {steps} step(s) ({stopped})"
         + (f"  {end_hit.file}:{end_hit.line}" if end_hit else "")
     )
+    if stopped == "loop":
+        # Say what to do about it: a source step here can never finish, so the
+        # user needs a different verb, not a bigger budget.
+        console.print(
+            f"  this source line loops back to 0x{loop_at:08X} -- a source step "
+            "can never leave it. Use 'continue', 'stepout', or set a breakpoint "
+            "past the loop. Pass --no-loop-guard to step the full budget anyway."
+        )
+    elif stopped == "max-steps":
+        console.print(
+            f"  still on the same line after {steps} steps -- raise --max-steps "
+            "if the line really is this long."
+        )
     if ctx.json_out:
         _emit_json(ctx.json_out, {
             "core": name,
@@ -3070,6 +3139,7 @@ def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int) ->
             ),
             "steps": steps,
             "stopped": stopped,
+            "loop_at": f"0x{loop_at:08X}" if loop_at is not None else None,
         })
 
 
