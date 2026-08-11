@@ -306,6 +306,12 @@
         "icon": "$(trash)"
       },
       {
+        "command": "s32e.clearOrphanComparator",
+        "title": "Clear Hardware Comparator",
+        "category": "S32E",
+        "icon": "$(close)"
+      },
+      {
         "command": "s32e.clearAllWatchpoints",
         "title": "Clear All Watchpoints",
         "category": "S32E",
@@ -373,6 +379,12 @@
         "title": "Edit Variable Value",
         "category": "S32E",
         "icon": "$(edit)"
+      },
+      {
+        "command": "s32e.plotVariable",
+        "title": "Plot Variable",
+        "category": "S32E",
+        "icon": "$(graph-line)"
       },
       {
         "command": "s32e.toggleHexVariables",
@@ -483,6 +495,14 @@
         },
         {
           "command": "s32e.editVariable",
+          "when": "false"
+        },
+        {
+          "command": "s32e.plotVariable",
+          "when": "false"
+        },
+        {
+          "command": "s32e.clearOrphanComparator",
           "when": "false"
         },
         {
@@ -680,6 +700,16 @@
           "group": "1_edit@2"
         },
         {
+          "command": "s32e.clearOrphanComparator",
+          "when": "view == s32e.breakpoints && viewItem == hwOrphanBp",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "s32e.clearOrphanComparator",
+          "when": "view == s32e.watchpoints && viewItem == hwOrphanWp",
+          "group": "1_edit@1"
+        },
+        {
           "command": "s32e.removeWatchpoint",
           "when": "view == s32e.watchpoints && viewItem == watchpoint",
           "group": "inline@1"
@@ -693,6 +723,11 @@
           "command": "s32e.editVariable",
           "when": "view == s32e.variables && viewItem =~ /editable/",
           "group": "inline@1"
+        },
+        {
+          "command": "s32e.plotVariable",
+          "when": "view == s32e.variables && viewItem =~ /variable/",
+          "group": "inline@3"
         },
         {
           "command": "s32e.removeWatch",
@@ -842,6 +877,19 @@
           "default": 1000,
           "minimum": 0,
           "description": "Refresh interval for Globals/Watch while the focused core RUNS (0 disables live refresh). Locals refresh only on halt."
+        },
+        "s32e.comparators.verifyMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 0,
+          "description": "How often the hardware breakpoint/watchpoint comparators are read back and reconciled against this session's lists (0 disables; the Breakpoints/Watchpoints Auto-refresh checkboxes gate it per view). One pass also runs after every stop."
+        },
+        "s32e.plot.sampleHz": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Initial sampling frequency for Plot Variable panels. Each sample is one probe round trip; the achieved rate shown in the panel may be lower under load."
         },
         "s32e.variables.childrenCap": {
           "type": "number",

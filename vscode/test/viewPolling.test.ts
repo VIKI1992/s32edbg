@@ -23,7 +23,11 @@ class FakeMemento implements vscode.Memento {
 describe("ViewPolling defaults", () => {
   it("everything on except memory (a dump per region per stop)", () => {
     const p = new ViewPolling(new FakeMemento());
-    for (const view of ["cores", "variables", "callStack", "registers"] as const) {
+    const onByDefault = [
+      "cores", "variables", "callStack", "registers",
+      "breakpoints", "watchpoints",
+    ] as const;
+    for (const view of onByDefault) {
       expect(p.on(view)).toBe(true);
     }
     expect(p.on("memory")).toBe(false);

@@ -2207,6 +2207,22 @@ one session, on a board with the known-good app in flash:
       line) and step-instruction buttons next to continue; on a NON-focused
       halted row they focus that core first (⦿ moves, views follow) and
       then step it. Running rows show none of them.
+    - 16g. Breakpoints/Watchpoints Auto-refresh: with a BP armed and the
+      checkbox on, the row gains `✓ hw` within `s32e.comparators.verifyMs`
+      (default 5 s). `load` (SoC reset) flips it to `⚠ hw:` until re-arm.
+      An externally armed comparator (e.g. `bp set` from a second CLI
+      session — do not actually run one mid-session on the bench; simulate
+      by clearing/re-arming) shows as an orphan row whose right-click
+      Clear action disarms it. Unchecking stops the `bp list`/`wp list`
+      traffic in the output channel; an OS-locked core shows
+      `hw: unreadable` and the local rows survive.
+    - 16h. Plot Variable on a free-running counter global: saw-tooth at the
+      default 10 Hz; raising Hz to 25 raises the achieved-rate readout;
+      the window selector rescales; hover shows a crosshair with the
+      sample's value/age; step + continue while plotting — the trace
+      continues (handle re-resolved across the generation bump); pause
+      freezes it; Export CSV writes timestamp_ms,value rows; plotting a
+      register-located or frame-local row refuses with the reason.
 
 Record the run under `bench-runs/` as usual.
 

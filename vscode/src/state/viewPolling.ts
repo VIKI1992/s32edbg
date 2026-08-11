@@ -1,13 +1,16 @@
 import * as vscode from "vscode";
 
-/** The five sidebar views that generate probe traffic. Session, Breakpoints
- * and Watchpoints render local state only, so they carry no toggle. */
+/** The sidebar views that generate probe traffic. Session renders local
+ * state only, so it carries no toggle; Breakpoints and Watchpoints gate the
+ * hardware-comparator verification sweep. */
 export type PolledView =
   | "cores"
   | "variables"
   | "callStack"
   | "registers"
-  | "memory";
+  | "memory"
+  | "breakpoints"
+  | "watchpoints";
 
 const KEY = "s32e.viewPolling";
 
@@ -18,6 +21,8 @@ const DEFAULTS: Record<PolledView, boolean> = {
   registers: true,
   // A dump per open region per stop -- opt-in rather than a surprise.
   memory: false,
+  breakpoints: true,
+  watchpoints: true,
 };
 
 /** What each checkbox gates, shown as the row's description. */
@@ -27,6 +32,8 @@ const GATES: Record<PolledView, string> = {
   callStack: "on-stop unwind",
   registers: "on-stop read",
   memory: "re-read regions on stop",
+  breakpoints: "verify hardware comparators",
+  watchpoints: "verify hardware comparators",
 };
 
 /** Per-view auto-refresh switches, persisted in workspaceState.

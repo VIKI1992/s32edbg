@@ -10,8 +10,10 @@ import {
 import { DISASM_SCHEME, DisasmProvider } from "./editor/disasmProvider";
 import { MEM_SCHEME, MemProvider } from "./editor/memProvider";
 import { PcDecorations } from "./editor/sourceDecorations";
+import { PlotPanels } from "./plot/plotPanel";
 import { Poller } from "./poll/poller";
 import { BreakpointStore } from "./state/breakpoints";
+import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
 import { DebugState } from "./state/session";
 import { VariablesLive, VariablesState } from "./state/variables";
@@ -45,6 +47,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const mem = new MemProvider(state);
   const pcDecor = new PcDecorations(context.extensionUri);
   const poller = new Poller(state, output, viewPolling);
+  const comparators = new ComparatorReconciler(
+    state, bpStore, wpStore, viewPolling, output,
+  );
+  const plots = new PlotPanels(state, output);
   const statusBar = new StatusBar(state, elf);
   bpStore.disasmLineToAddr = (uri, line) => disasm.lineToAddr(uri, line);
 
@@ -73,6 +79,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const memTree = vscode.window.createTreeView("s32e.memory", {
     treeDataProvider: memoryView,
   });
+  const bpTree = vscode.window.createTreeView("s32e.breakpoints", {
+    treeDataProvider: new BreakpointsView(bpStore, viewPolling, comparators),
+  });
+  const wpTree = vscode.window.createTreeView("s32e.watchpoints", {
+    treeDataProvider: new WatchpointsView(wpStore, viewPolling, comparators),
+  });
   const varLive = new VariablesLive(
     state, variables, output,
     () => varsTree.visible,
@@ -95,6 +107,8 @@ export function activate(context: vscode.ExtensionContext): void {
     ["callStack", stackTree],
     ["registers", regsTree],
     ["memory", memTree],
+    ["breakpoints", bpTree],
+    ["watchpoints", wpTree],
   ];
   const applyPauseHints = () => {
     for (const [key, tree] of polledTrees) {
@@ -118,18 +132,17 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     output, state, elf, bpStore, wpStore, disasm, mem, pcDecor, poller,
-    statusBar, stackTree, regsTree, varsTree, coresTree, memTree,
-    variables, varLive, viewPolling,
+    comparators, plots, statusBar, stackTree, regsTree, varsTree, coresTree,
+    memTree, bpTree, wpTree, variables, varLive, viewPolling,
     vscode.window.registerTreeDataProvider("s32e.session", new SessionView(state, elf)),
-    vscode.window.registerTreeDataProvider("s32e.breakpoints", new BreakpointsView(bpStore)),
-    vscode.window.registerTreeDataProvider("s32e.watchpoints", new WatchpointsView(wpStore)),
     vscode.workspace.registerTextDocumentContentProvider(DISASM_SCHEME, disasm),
     vscode.workspace.registerTextDocumentContentProvider(MEM_SCHEME, mem),
   );
 
   const deps: Deps = {
     state, elf, output, poller, bpStore, wpStore, disasm, mem, pcDecor,
-    statusBar, stackView, variables, varLive, viewPolling,
+    statusBar, stackView, variables, varLive, viewPolling, comparators,
+    plots,
     variablesTreeVisible: () => varsTree.visible,
     refreshTitles,
   };
@@ -148,6 +161,11 @@ export function activate(context: vscode.ExtensionContext): void {
         void poller.tick(true);
       } else if (view === "memory") {
         void mem.refreshAll();
+      } else if (view === "breakpoints" || view === "watchpoints") {
+        // Revive the interval (a 10-failure stop may have killed it) and
+        // verify immediately.
+        comparators.start();
+        void comparators.tick();
       } else if (state.focusInfo?.halted === true) {
         void refreshFocusData(deps, new Set([view]));
       }
@@ -244,6 +262,12 @@ export function activate(context: vscode.ExtensionContext): void {
         state.connected
       ) {
         varLive.start();
+      }
+      if (
+        ev.affectsConfiguration("s32e.comparators.verifyMs") &&
+        state.connected
+      ) {
+        comparators.start();
       }
     }),
   );

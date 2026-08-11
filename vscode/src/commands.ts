@@ -15,8 +15,10 @@ import { backendConfig, setting } from "./config";
 import { DISASM_SCHEME, DisasmProvider, disasmUri } from "./editor/disasmProvider";
 import { MemProvider, memUri } from "./editor/memProvider";
 import { PcDecorations } from "./editor/sourceDecorations";
+import { PlotPanels } from "./plot/plotPanel";
 import { Poller } from "./poll/poller";
 import { BreakpointStore, S32Breakpoint } from "./state/breakpoints";
+import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
 import { CoreInfo, DebugState, familyOf, M33_NAMES } from "./state/session";
 import { VariablesLive, VariablesState } from "./state/variables";
@@ -47,6 +49,8 @@ export interface Deps {
   variables: VariablesState;
   varLive: VariablesLive;
   viewPolling: ViewPolling;
+  comparators: ComparatorReconciler;
+  plots: PlotPanels;
   variablesTreeVisible: () => boolean;
   refreshTitles: () => void;
 }
@@ -95,6 +99,8 @@ async function connect(deps: Deps): Promise<void> {
       }
       poller.stop();
       deps.varLive.stop();
+      deps.comparators.stop();
+      deps.comparators.clear();
       deps.variables.reset();
       bpStore.markAllPending();
       wpStore.markAllPending();
@@ -148,6 +154,7 @@ async function connect(deps: Deps): Promise<void> {
     }
     poller.start();
     deps.varLive.start();
+    deps.comparators.start();
     state.fireChange();
     statusBar.refresh();
     deps.refreshTitles();
@@ -168,6 +175,8 @@ async function disconnect(deps: Deps): Promise<void> {
   }
   poller.stop();
   deps.varLive.stop();
+  deps.comparators.stop();
+  deps.comparators.clear();
   deps.variables.reset();
   bpStore.markAllPending();
   wpStore.markAllPending();
@@ -295,6 +304,9 @@ export async function refreshFocusData(
   }
   deps.stackView.refresh();
   state.fireChange();
+  // One comparator verification per stop, on top of the slow interval; it
+  // gates itself on the Breakpoints/Watchpoints checkboxes.
+  void deps.comparators.tick();
 }
 
 /** Standard debugger feel after any halt: refresh + reveal source or disasm. */
@@ -739,12 +751,41 @@ export function registerCommands(
     wpStore.add(core, Number.parseInt(addrText.trim(), 16), Number.parseInt(size, 10), on);
   });
   reg("s32e.removeWatchpoint", (node) => {
-    const wp = node as S32Watchpoint;
+    // The view wraps rows as { kind: "wp", wp } since the hardware-verify
+    // work; accept the bare model too for safety.
+    const wp = (node as { wp?: S32Watchpoint })?.wp ?? (node as S32Watchpoint);
     if (wp?.id) {
       return wpStore.remove(wp);
     }
   });
   reg("s32e.clearAllWatchpoints", () => wpStore.clearAll());
+  reg("s32e.clearOrphanComparator", async (node) => {
+    const orphan = node as {
+      unit?: "bp" | "wp"; core?: string; index?: number; address?: string;
+    };
+    if (!orphan?.core || orphan.index === undefined || !orphan.unit) {
+      return;
+    }
+    const what = orphan.unit === "bp" ? "breakpoint" : "watchpoint";
+    const go = await confirmDestructive(
+      `Clear hardware ${what} comparator ${orphan.index} on ${orphan.core}?`,
+      `The comparator is armed at ${orphan.address} but no ${what} in this ` +
+        "session claims it -- clearing removes whatever set it (another " +
+        "tool, a previous session, or target-side code).",
+      "Clear comparator",
+    );
+    if (!go) {
+      return;
+    }
+    const m33 = familyOf(orphan.core) === "m33";
+    const base = orphan.unit;
+    await state.requireClient().run(
+      m33
+        ? `m33 ${base} clear ${orphan.index} --core ${orphan.core}`
+        : `${base} clear ${orphan.index} --core ${orphan.core}`,
+    );
+    void deps.comparators.tick();
+  });
 
   // -- views / data --
   reg("s32e.refreshStack", () => refreshFocusData(deps, new Set(["callStack"])));
@@ -852,6 +893,20 @@ export function registerCommands(
     if (watchPath) {
       await variables.removeWatch(watchPath);
     }
+  });
+  reg("s32e.plotVariable", (node) => {
+    const row = (node as { row?: VarRow })?.row;
+    if (!row) {
+      throw new Error("pick a variable row to plot");
+    }
+    if (row.address === null || row.error) {
+      throw new Error(
+        "this row cannot be sampled: it has no memory address (a register " +
+          "value or an error row). Plot a global, a static, or a watch path.",
+      );
+    }
+    const core = requireFocusCore(state);
+    deps.plots.open(core, row);
   });
   reg("s32e.editVariable", async (node) => {
     const row = (node as { row?: VarRow })?.row;
