@@ -2200,7 +2200,9 @@ one session, on a board with the known-good app in flash:
     - 16d. Checkbox states survive a VS Code reload (per workspace).
     - 16e. The yellow gutter arrow sits on the PC line after every stop, in
       the source editor AND an open disassembly tab simultaneously, tracks
-      each step, and disappears on continue.
+      each step, and disappears on continue — including on a manual halt
+      (F6 / the row button), which previously cleared the arrow and
+      revealed nothing on R52 cores (their halt payload carries no PC).
     - 16f. A halted Cores row shows inline step-into, step-over (source
       line) and step-instruction buttons next to continue; on a NON-focused
       halted row they focus that core first (⦿ moves, views follow) and

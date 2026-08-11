@@ -305,7 +305,11 @@ async function afterHalt(deps: Deps, core: string, pcHint?: string | null): Prom
     return;
   }
   await refreshFocusData(deps);
-  const pc = pcHint !== undefined ? state.notePc(core, pcHint) : (state.lastPc.get(core) ?? null);
+  // A null hint means the command's payload had no PC (the R52 `core halt`
+  // result, unlike the M33's) -- fall back to lastPc, which the refresh
+  // above just renewed. Taking null literally used to skip the reveal and
+  // leave manual R52 halts arrow-less.
+  const pc = pcHint != null ? state.notePc(core, pcHint) : (state.lastPc.get(core) ?? null);
   // A new stop: drop every stale PC marker, even if this one's PC is unknown
   // -- an arrow at the previous stop's line would be a lie.
   pcDecor.beginStop();
