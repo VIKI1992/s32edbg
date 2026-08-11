@@ -88,6 +88,9 @@ class DebugSession:
     #: machine-mode halt monitor sweeps for the running->halted transition.
     #: M33 names carry an "m33:" prefix. Owned by note_resumed/note_halted.
     monitor_watch: set[str] = field(default_factory=set)
+    #: The machine-mode streaming sampler (cli._SampleStreamer), present only
+    #: inside `debug --machine`; `var sample` commands configure it.
+    sampler: Any = None
 
     #: Read caches, valid only for _cache_key == the current generations.
     #: An IDE stop refreshes registers three to five times (regs, stack,

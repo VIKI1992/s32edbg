@@ -155,6 +155,7 @@ async function connect(deps: Deps): Promise<void> {
     poller.start();
     deps.varLive.start();
     deps.comparators.start();
+    deps.plots.resync();
     state.fireChange();
     statusBar.refresh();
     deps.refreshTitles();
@@ -899,14 +900,13 @@ export function registerCommands(
     if (!row) {
       throw new Error("pick a variable row to plot");
     }
-    if (row.address === null || row.error) {
-      throw new Error(
-        "this row cannot be sampled: it has no memory address (a register " +
-          "value or an error row). Plot a global, a static, or a watch path.",
-      );
-    }
     const core = requireFocusCore(state);
-    deps.plots.open(core, row);
+    deps.plots.resync();
+    deps.plots.addFromRow(core, row);
+  });
+  reg("s32e.newPlotPanel", () => {
+    deps.plots.resync();
+    deps.plots.newPanel();
   });
   reg("s32e.editVariable", async (node) => {
     const row = (node as { row?: VarRow })?.row;

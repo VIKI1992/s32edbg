@@ -37,6 +37,15 @@ The stream on stdout:
 
   These arrive between envelopes, never inside one, and old readers can
   ignore them; a frontend without event handling falls back to polling.
+- While `var sample` streaming is active, batches of raw memory reads arrive
+  the same way, ~20 events/s::
+
+      {"event":"samples", "t0_ms":<epoch ms>, "signals":[
+          {"name":"TEST_cnt", "dt":[0.0, 2.1, ...], "v":[311, 312, ...]}, ...]}
+
+  ``dt`` are millisecond offsets from ``t0_ms``, stamped per read in the
+  backend. Five consecutive failed batches end the stream with
+  ``{"event":"sample-stopped", "reason":"..."}``.
 - On close: ``{"event":"bye", "restore_notes":[...], "kept":false}`` and exit.
 
 ``seq`` is the 1-based count of non-empty input lines. The session dispatch is

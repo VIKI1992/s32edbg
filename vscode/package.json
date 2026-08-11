@@ -387,6 +387,12 @@
         "icon": "$(graph-line)"
       },
       {
+        "command": "s32e.newPlotPanel",
+        "title": "New Plot Panel",
+        "category": "S32E",
+        "icon": "$(graph-line)"
+      },
+      {
         "command": "s32e.toggleHexVariables",
         "title": "Toggle Hex Display (Variables)",
         "category": "S32E",
@@ -886,10 +892,10 @@
         },
         "s32e.plot.sampleHz": {
           "type": "number",
-          "default": 10,
+          "default": 100,
           "minimum": 1,
-          "maximum": 50,
-          "description": "Initial sampling frequency for Plot Variable panels. Each sample is one probe round trip; the achieved rate shown in the panel may be lower under load."
+          "maximum": 1000,
+          "description": "Initial TOTAL streaming rate for the scope (samples/s shared across all plotted signals; backend `var sample` streaming). The panel shows the achieved rate; the wire tops out near ~500/s for one signal."
         },
         "s32e.variables.childrenCap": {
           "type": "number",

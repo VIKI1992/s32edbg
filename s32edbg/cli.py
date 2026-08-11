@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import struct
 import sys
@@ -4290,6 +4291,118 @@ def _var_parse_value(tinfo: symvars.TypeInfo, text: str) -> int:
         ) from None
 
 
+_SIGNAL_RE = re.compile(
+    r"^(?P<name>.+)@(?P<addr>0x[0-9A-Fa-f]+):(?P<bits>8|16|32)"
+    r"(?:@(?P<ap>[A-Za-z0-9_-]+))?$"
+)
+
+
+def _require_sampler(ctx: Ctx) -> _SampleStreamer:
+    session = ctx.session
+    sampler = getattr(session, "sampler", None) if session is not None else None
+    if sampler is None:
+        raise UnsafeOperation(
+            "var sample streams asynchronous event lines, which only exist in "
+            "`debug --machine`; the interactive REPL has no channel for them."
+        )
+    return sampler
+
+
+@var.group("sample")
+def var_sample() -> None:
+    """Stream raw memory samples of variables as asynchronous events.
+
+    The kHz-class path behind the IDE's plot: addresses are read in batches
+    under the session lock and pushed as `{"event":"samples",...}` lines
+    between envelopes. Addresses, not handles -- statics and globals do not
+    move, so streams survive run-state changes untouched.
+    """
+
+
+@var_sample.command("start")
+@click.option("--signal", "specs", multiple=True, required=True,
+              help='One streamed address: "name@0xADDR:bits[@ap]" '
+                   "(bits 8/16/32; ap defaults to axi). Repeatable, up to 6; "
+                   "the set replaces any active one atomically.")
+@click.option("--rate", type=click.IntRange(1, 1000), default=None,
+              help="Total samples/s shared by ALL signals (default: keep the "
+                   "current rate, initially 100).")
+@click.pass_obj
+def var_sample_start(ctx: Ctx, specs: tuple[str, ...], rate: int | None) -> None:
+    """Start (or reconfigure) streaming for up to 6 signals."""
+    sampler = _require_sampler(ctx)
+    if len(specs) > 6:
+        raise click.ClickException(
+            "at most 6 signals: the ~1000 transactions/s wire budget is "
+            "shared, and a 7th slice stops being a waveform."
+        )
+    signals: list[_SampleSignal] = []
+    with open_transport(ctx) as (_t, dap):
+        assert dap is not None
+        seen_aps: set[int] = set()
+        for spec in specs:
+            m = _SIGNAL_RE.match(spec)
+            if m is None:
+                raise click.ClickException(
+                    f"{spec!r} is not name@0xADDR:bits[@ap] (bits 8/16/32)"
+                )
+            ap_base = memaccess.resolve_ap(m.group("ap") or "axi")
+            if ap_base not in seen_aps:
+                memaccess.preflight(dap, ap_base, write=False)
+                seen_aps.add(ap_base)
+            signals.append(_SampleSignal(
+                name=m.group("name"),
+                ap_base=ap_base,
+                address=int(m.group("addr"), 16),
+                bits=int(m.group("bits")),
+            ))
+    sampler.configure(signals, rate)
+    payload = sampler.snapshot()
+    console.print(
+        f"[green]streaming[/green] {len(signals)} signal(s) at "
+        f"{payload['rate']} samples/s total"
+    )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, payload)
+
+
+@var_sample.command("rate")
+@click.argument("hz", type=click.IntRange(1, 1000))
+@click.pass_obj
+def var_sample_rate(ctx: Ctx, hz: int) -> None:
+    """Change the total sample rate without touching the signal set."""
+    sampler = _require_sampler(ctx)
+    applied = sampler.set_rate(hz)
+    console.print(f"sample rate: {applied}/s total")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, sampler.snapshot())
+
+
+@var_sample.command("stop")
+@click.pass_obj
+def var_sample_stop(ctx: Ctx) -> None:
+    """Stop streaming."""
+    sampler = _require_sampler(ctx)
+    sampler.configure([])
+    console.print("streaming stopped")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, sampler.snapshot())
+
+
+@var_sample.command("status")
+@click.pass_obj
+def var_sample_status(ctx: Ctx) -> None:
+    """What is streaming, at what configured and achieved rate."""
+    sampler = _require_sampler(ctx)
+    payload = sampler.snapshot()
+    console.print(
+        ("streaming " if payload["streaming"] else "idle ")
+        + f"rate={payload['rate']}/s achieved={payload['achieved_hz']}"
+    )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, payload)
+
+
 @var.command("refresh")
 @click.argument("handles", nargs=-1, required=True)
 @click.pass_obj
@@ -4714,6 +4827,158 @@ class _HaltMonitor(threading.Thread):
                 session.monitor_watch.discard(f"m33:{mc.name}")
 
 
+@dataclass
+class _SampleSignal:
+    """One streamed address: what to read and what to call it."""
+
+    name: str
+    ap_base: int
+    address: int
+    bits: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "address": f"0x{self.address:08X}",
+            "bits": self.bits,
+            "ap": f"0x{self.ap_base:08X}",
+        }
+
+
+class _SampleStreamer(threading.Thread):
+    """Streams raw memory reads as asynchronous ``samples`` events.
+
+    The kHz path: per-request sampling costs a whole protocol round trip
+    (~13 ms); this thread instead reads a BATCH of addresses under the
+    session lock -- plain single reads inside one checked span, the
+    programmed-access cache collapsing a repeated address to ~2 transactions
+    -- then emits one event per batch and yields the lock so queued commands
+    (a step, a poll) interleave with at most one batch of added latency.
+
+    Addresses, not variable handles: statics and globals do not move, so a
+    run-state change needs no re-resolution, and a `load` simply blocks the
+    thread for its whole duration (the command holds the lock).
+
+    The total rate budget is shared by every signal. Five consecutive
+    failing batches stop the stream with a ``sample-stopped`` event rather
+    than spamming a broken bus.
+    """
+
+    BATCH_S = 0.05
+    YIELD_S = 0.005
+
+    def __init__(
+        self, ctx: Ctx, mio: machine_mod.MachineIO, lock: threading.Lock
+    ) -> None:
+        super().__init__(name="s32edbg-sampler", daemon=True)
+        self.ctx = ctx
+        self.mio = mio
+        self.lock = lock
+        self.stop_flag = threading.Event()
+        self._config_lock = threading.Lock()
+        self._signals: list[_SampleSignal] = []
+        self._rate = 100
+        self._failures = 0
+        self.emitted = 0
+        self.started_at: float | None = None
+
+    def configure(
+        self, signals: list[_SampleSignal], rate: int | None = None
+    ) -> None:
+        """Replace the signal set atomically; empty list stops streaming."""
+        with self._config_lock:
+            self._signals = list(signals)
+            if rate is not None:
+                self._rate = max(1, min(1000, int(rate)))
+            self._failures = 0
+            self.emitted = 0
+            self.started_at = time.monotonic() if signals else None
+
+    def set_rate(self, rate: int) -> int:
+        with self._config_lock:
+            self._rate = max(1, min(1000, int(rate)))
+            return self._rate
+
+    def snapshot(self) -> dict[str, object]:
+        with self._config_lock:
+            elapsed = (
+                time.monotonic() - self.started_at
+                if self.started_at is not None
+                else None
+            )
+            return {
+                "streaming": bool(self._signals),
+                "signals": [s.as_dict() for s in self._signals],
+                "rate": self._rate,
+                "samples_emitted": self.emitted,
+                "achieved_hz": (
+                    round(self.emitted / elapsed, 1) if elapsed else None
+                ),
+            }
+
+    def run(self) -> None:
+        while not self.stop_flag.is_set():
+            with self._config_lock:
+                signals = self._signals
+                rate = self._rate
+            if not signals:
+                if self.stop_flag.wait(0.1):
+                    return
+                continue
+            per_signal = max(1, round(rate * self.BATCH_S / len(signals)))
+            total = per_signal * len(signals)
+            t_start = time.perf_counter()
+            dts: list[list[float]] = [[] for _ in signals]
+            values: list[list[int]] = [[] for _ in signals]
+            epoch_ms = 0.0
+            try:
+                with self.lock:
+                    session = self.ctx.session
+                    if session is None:
+                        return
+                    dap = session.dap
+                    epoch_ms = time.time() * 1000.0
+                    base = time.perf_counter()
+                    with dap.checked_span():
+                        # Per-signal RUNS, not interleaved: consecutive reads
+                        # of one address ride the programmed-access memo (~2
+                        # transactions each); alternating addresses would pay
+                        # the CSW+TAR re-program on every single read.
+                        for i, sig in enumerate(signals):
+                            for _ in range(per_signal):
+                                v = dap.mem_read(
+                                    sig.ap_base, sig.address, size=sig.bits
+                                )
+                                dts[i].append(
+                                    round((time.perf_counter() - base) * 1000.0, 3)
+                                )
+                                values[i].append(v)
+                self.mio.emit({
+                    "event": "samples",
+                    "t0_ms": round(epoch_ms, 3),
+                    "signals": [
+                        {"name": sig.name, "dt": dts[i], "v": values[i]}
+                        for i, sig in enumerate(signals)
+                    ],
+                })
+                self.emitted += total
+                self._failures = 0
+            except Exception as exc:  # noqa: BLE001 -- the thread must survive
+                self._failures += 1
+                if self._failures >= 5:
+                    with self._config_lock:
+                        self._signals = []
+                    self.mio.emit({
+                        "event": "sample-stopped",
+                        "reason": str(exc),
+                    })
+                    continue
+            elapsed = time.perf_counter() - t_start
+            pause = max(self.YIELD_S, total / rate - elapsed)
+            if self.stop_flag.wait(pause):
+                return
+
+
 def _machine_loop(
     ctx: Ctx, mio: machine_mod.MachineIO, lock: threading.Lock
 ) -> None:
@@ -4871,13 +5136,20 @@ def debug_cmd(
                     session_lock = threading.Lock()
                     monitor = _HaltMonitor(ctx, mio, session_lock)
                     monitor.start()
+                    sampler = _SampleStreamer(ctx, mio, session_lock)
+                    session.sampler = sampler
+                    sampler.start()
                     try:
                         _machine_loop(ctx, mio, session_lock)
                     finally:
                         # Joined before restore(): the close-out sequence must
-                        # not race a monitor sweep for the probe.
+                        # not race a monitor sweep or a sample batch for the
+                        # probe.
                         monitor.stop_flag.set()
+                        sampler.stop_flag.set()
                         monitor.join(timeout=2.0)
+                        sampler.join(timeout=2.0)
+                        session.sampler = None
                 elif batch:
                     for line in batch:
                         if not _session_dispatch(ctx, line):

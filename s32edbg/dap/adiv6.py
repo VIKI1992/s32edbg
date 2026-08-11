@@ -173,6 +173,17 @@ class Dap:
         #: dap.gates (status(cached=True) / invalidate_status_cache); lives
         #: here because the report describes this connection's target.
         self.gates_report_cache = None
+        #: The (ap_base, CSW value, TAR address) of the most recent
+        #: non-incrementing access. The streaming sampler re-reads the same
+        #: address at rate; re-writing an unchanged CSW+TAR would double the
+        #: cost of every sample. Deliberately a SINGLE slot, not per-AP:
+        #: architecturally each MEM-AP keeps its own TAR, but trusting that
+        #: across interleaved APs buys nothing for the streamer (whose hot
+        #: case is consecutive same-address reads) and assumes more than the
+        #: bench has proven. Cleared whenever any other AP is programmed,
+        #: auto-increment moves TAR, TAR is set directly, or the DLL may
+        #: have touched the AP (invalidate_select_cache).
+        self._access_cache: tuple[int, int, int] | None = None
 
     # ---------------------------------------------------------------- DP ---
 
@@ -206,6 +217,8 @@ class Dap:
         in dp_read/dp_write cannot trust it either."""
         self._select_valid = False
         self._bank = -1
+        # Anything that moved SELECT may equally have moved CSW/TAR.
+        self._access_cache = None
 
     def dp_read(self, addr: int, bank: int = BANK_DPIDR) -> int:
         """Read a DP register at ``addr`` (0x0/0x4/0x8/0xC) in ``bank``."""
@@ -278,6 +291,14 @@ class Dap:
 
     def clear_sticky(self) -> None:
         """Clear the sticky error flags by writing 1 to them (ADIv6 p58)."""
+        # The programmed-access memo lives at most from one sticky clear to
+        # the next: every checked access and every span entry re-programs the
+        # AP honestly. Measured necessity, not caution -- a memo that spanned
+        # the load flow's SoC reset skipped a CSW/TAR program the reset had
+        # wiped and faulted the MC_ME bring-up. The streamer keeps its full
+        # win: one clear at batch entry, then every consecutive same-address
+        # read inside the span skips.
+        self._access_cache = None
         self.write_ctrl_stat(self.read_ctrl_stat() | STICKYERR | STICKYCMP | STICKYORUN)
 
     @contextmanager
@@ -477,12 +498,26 @@ class Dap:
         else:
             self._csw_cache.pop(ap_base, None)
             self._cfg_cache.pop(ap_base, None)
+        self._access_cache = None
 
     def _program_access(self, ap_base: int, addr: int, *, size: int, autoinc: int) -> None:
         if size not in CSW_SIZE_FOR_BITS:
             raise ValueError(f"access size must be one of 8, 16, 32 bits, not {size}")
-        self.ap_write(ap_base, AP_CSW, self._csw_base(ap_base) | CSW_SIZE_FOR_BITS[size] | autoinc)
+        csw = self._csw_base(ap_base) | CSW_SIZE_FOR_BITS[size] | autoinc
+        if (
+            autoinc == CSW_ADDRINC_OFF
+            and self._access_cache == (ap_base, csw, addr)
+        ):
+            # Same AP, same CSW, same TAR, no auto-increment: already aimed.
+            # This is what makes repeated same-address sampling ~2
+            # transactions instead of ~4-5.
+            return
+        self.ap_write(ap_base, AP_CSW, csw)
         self._set_tar(ap_base, addr)
+        if autoinc == CSW_ADDRINC_OFF:
+            self._access_cache = (ap_base, csw, addr)
+        # else: auto-increment advances TAR underneath us -- _set_tar already
+        # dropped the memo.
 
     def _set_tar(self, ap_base: int, addr: int) -> None:
         """Point the AP at ``addr``, writing TAR_HI first when it applies.
@@ -491,6 +526,9 @@ class Dap:
         briefly pair a new low half with a stale high half, aiming the AP at a
         real but unintended address.
         """
+        # Whoever moves TAR invalidates the programmed-access memo; a caller
+        # that goes through _program_access re-establishes it afterwards.
+        self._access_cache = None
         if addr > 0xFFFF_FFFF:
             if not self.read_ap_cfg(ap_base).large_address:
                 raise DapError(

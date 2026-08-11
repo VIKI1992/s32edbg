@@ -7,6 +7,8 @@ import {
   Envelope,
   ProgressEvent,
   ReadyEvent,
+  SampleStoppedEvent,
+  SamplesEvent,
   StoppedEvent,
 } from "./types";
 
@@ -52,6 +54,12 @@ export class SessionClient implements vscode.Disposable {
   private readonly stoppedEmitter = new vscode.EventEmitter<StoppedEvent>();
   /** The backend pushed a stopped event: a resumed core halted on its own. */
   readonly onStopped = this.stoppedEmitter.event;
+  private readonly samplesEmitter = new vscode.EventEmitter<SamplesEvent>();
+  /** A `var sample` streaming batch (not logged per event -- ~20/s). */
+  readonly onSamples = this.samplesEmitter.event;
+  private readonly sampleStoppedEmitter =
+    new vscode.EventEmitter<SampleStoppedEvent>();
+  readonly onSampleStopped = this.sampleStoppedEmitter.event;
   private expectingExit = false;
 
   private constructor(private readonly output: Output) {}
@@ -178,6 +186,16 @@ export class SessionClient implements vscode.Disposable {
         `stopped: ${ev.core}${ev.status ? ` (${ev.status})` : ""}`,
       );
       this.stoppedEmitter.fire(ev);
+      return;
+    }
+    if (obj.event === "samples") {
+      this.samplesEmitter.fire(obj as unknown as SamplesEvent);
+      return;
+    }
+    if (obj.event === "sample-stopped") {
+      const ev = obj as unknown as SampleStoppedEvent;
+      this.output.line(`!! sampling stopped: ${ev.reason}`);
+      this.sampleStoppedEmitter.fire(ev);
       return;
     }
     if (obj.event === "bye") {

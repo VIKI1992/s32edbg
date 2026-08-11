@@ -2216,13 +2216,22 @@ one session, on a board with the known-good app in flash:
       Clear action disarms it. Unchecking stops the `bp list`/`wp list`
       traffic in the output channel; an OS-locked core shows
       `hw: unreadable` and the local rows survive.
-    - 16h. Plot Variable on a free-running counter global: saw-tooth at the
-      default 10 Hz; raising Hz to 25 raises the achieved-rate readout;
-      the window selector rescales; hover shows a crosshair with the
-      sample's value/age; step + continue while plotting — the trace
-      continues (handle re-resolved across the generation bump); pause
-      freezes it; Export CSV writes timestamp_ms,value rows; plotting a
-      register-located or frame-local row refuses with the reason.
+    - 16h. The Scope (streaming, benched 2026-08-11 under
+      `bench-runs/20260811-plotstream/`: **754.9 Hz achieved single-signal**
+      at rate 1000, median inter-sample 0.963 ms; two signals 365.8 Hz
+      each; four 172.4 Hz each; a mid-stream `stepline` took 580 ms and the
+      stream resumed at full rate): plot a free-running counter — the
+      saw-tooth draws live; add the second TEST_cnt from the sidebar's
+      add-by-path box; toggle lanes ⇄ overlay; hide a signal (its budget
+      share moves to the others); place cursors A and B one saw period
+      apart — Δt reads 1.000 s and Δvalue ~0; drag a cursor; Esc clears;
+      pause freezes the display while recording stops; Export CSV writes
+      long-format timestamp_ms,signal,value; plotting a register-located
+      or frame-local row refuses with the reason; 64-bit scalars refuse
+      (8/16/32-bit reads only). The 1 kHz target is ~75 % met on the
+      CoreSight path — the remainder is inter-batch overhead plus the
+      ~0.96 ms/read wire floor; if true 1 kHz becomes necessary, the next
+      step is a bench spike on the J-Link DLL's HSS probe-side sampler.
 
 Record the run under `bench-runs/` as usual.
 

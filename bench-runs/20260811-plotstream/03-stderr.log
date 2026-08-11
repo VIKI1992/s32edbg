@@ -1,0 +1,153 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! no Cortex-R52 debug frames answered. The debug clocks are off by default (RM 
+135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+session open with no cores discovered yet -- run `gates apply`, then `core 
+list`.
+error: no Cortex-R52 debug frames answered. The debug clocks are off by default
+(RM 135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+  MDM-AP (APB debug-enable  
+           gate)            
+┌─────────────┬────────────┐
+│ Register    │ Value      │
+├─────────────┼────────────┤
+│ IDR         │ 0x001DE040 │
+│ STATUS      │ 0xF00001C0 │
+│ CONTROL     │ 0x00800000 │
+│ STATUS2     │ 0x00000000 │
+│ CONTROL2    │ 0x000F0000 │
+│ CONTROL3    │ 0x000F0000 │
+│ DBGENCNTRL  │ 0x3CF3CF00 │
+│ DBGENCNTRL2 │ 0x3CF3CF00 │
+│ DBGENCNTRL3 │ 0xFFF03CF0 │
+└─────────────┴────────────┘
+STATUS: system_reset=no, cdbgpwrupreq=yes, csyspwrupreq=yes, 
+aux_tap_trst_released=yes
+Debug-enable gate: open
+       SDA-AP (HSE security gate, read-only)       
+┌────────────────────────────┬────────────────────┐
+│ Field                      │ Value              │
+├────────────────────────────┼────────────────────┤
+│ IDR                        │ 0x001DE001         │
+│ AUTHSTTS                   │ 0x40000005         │
+│ APPDBGEN                   │ yes                │
+│ CHALRDY                    │ yes                │
+│ SDASYSRSTS                 │ 0x00000000         │
+│ functional_reset_asserted  │ no                 │
+│ destructive_reset_asserted │ no                 │
+│ SDARSTCTRL                 │ 0xF0F30000         │
+│ UID                        │ 0x1E09300B5563B9BC │
+└────────────────────────────┴────────────────────┘
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+debug-enable gate is open (sticky until power loss)
+                               Cortex-R52 cores                                
+┌───┬────────┬─────────┬────────┬─────────┬────────┬───────┬─────────┬────────┐
+│   │        │ Debug   │        │         │        │       │         │        │
+│ # │ Name   │ frame   │ CTI    │ Part    │ Ident… │ BP/WP │ Invasi… │ State  │
+├───┼────────┼─────────┼────────┼─────────┼────────┼───────┼─────────┼────────┤
+│ 0 │ rtu0.0 │ 0x0041… │ 0x004… │ Cortex… │ ok     │ 8/8   │ granted │ locked │
+│ 1 │ rtu0.1 │ 0x0051… │ 0x005… │ Cortex… │ ok     │ 8/8   │ granted │ locked │
+│ 2 │ rtu1.0 │ 0x00C1… │ 0x00C… │ Cortex… │ ok     │ 8/8   │ granted │ locked │
+│ 3 │ rtu1.1 │ 0x00D1… │ 0x00D… │ Cortex… │ ok     │ 8/8   │ granted │ locked │
+└───┴────────┴─────────┴────────┴─────────┴────────┴───────┴─────────┴────────┘
+rtu0.0: core-domain debug registers unreadable -- the core is held in reset 
+(never released)
+rtu0.1: core-domain debug registers unreadable -- the core is held in reset 
+(never released)
+rtu1.0: core-domain debug registers unreadable -- the core is held in reset 
+(never released)
+rtu1.1: core-domain debug registers unreadable -- the core is held in reset 
+(never released)
+symbols: 11204 function(s), 652208 line row(s), CFI debug_frame (11155 FDEs), 
+entry 0x32100020
+! `load` resets the whole SoC: every core reboots. Image: br1_rear.elf, 
+3,677,850 bytes in 11 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+load: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: smu halted
+load: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce0 halted
+load: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce1 halted
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+load: SRAMC D0/D1/D2 ECC init verified (witness words read 0)
+load: parking rtu0.0 on a `b .` loop and releasing it into the halt
+load: RTU0 GPR CFG_CORE: split-lock (optional; lockstep default on denial): 
+skipped -- XRDC denies the debugger 0x76120000 (the access to 0x76120000 via 
+the AXI-AP faulted. XRDC can deny the debugger a region the cores reach freely;
+the 0x76xxxxxx RTU peripheral slice is one such region on this part.); the 
+register keeps its reset default
+rtu0.0: cleared the OS lock
+load: registered the AXI-AP with the DLL for WriteMem
+load: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+load: WriteMem fast path proven by full read-back of the first block (512 
+words)
+load: wrote 0x32100000      2,048 bytes    1.73s       1.2 KB/s
+load: wrote 0x32101200        128 bytes    0.01s       8.9 KB/s
+load: wrote 0x32101300         50 bytes    0.01s       3.5 KB/s
+load: wrote 0x32101500         68 bytes    0.01s       4.7 KB/s
+load: wrote 0x32101580     44,968 bytes    0.38s     115.7 KB/s
+load: wrote 0x3210C528          4 bytes    0.01s       0.5 KB/s
+load: wrote 0x3210C580    781,560 bytes    6.56s     116.4 KB/s
+load: wrote 0x321CB280     20,880 bytes    0.19s     109.1 KB/s
+load: wrote 0x321D0480  2,421,072 bytes   20.24s     116.8 KB/s
+load: wrote 0x3241F5D0     95,876 bytes    0.81s     115.1 KB/s
+load: wrote 0x32680000    311,196 bytes    2.65s     114.7 KB/s
+load: entry word at 0x32100020 verified (0x0000F04F)
+                loaded br1_rear.elf                
+┌────────────┬───────────┬──────┬────────┬────────┐
+│ LMA        │     Bytes │ Path │ Verify │   Time │
+├────────────┼───────────┼──────┼────────┼────────┤
+│ 0x32100000 │     2,048 │ dll  │ edges  │  1.73s │
+│ 0x32101200 │       128 │ dll  │ edges  │  0.01s │
+│ 0x32101300 │        50 │ dll  │ edges  │  0.01s │
+│ 0x32101500 │        68 │ dll  │ edges  │  0.01s │
+│ 0x32101580 │    44,968 │ dll  │ edges  │  0.38s │
+│ 0x3210C528 │         4 │ dll  │ edges  │  0.01s │
+│ 0x3210C580 │   781,560 │ dll  │ edges  │  6.56s │
+│ 0x321CB280 │    20,880 │ dll  │ edges  │  0.19s │
+│ 0x321D0480 │ 2,421,072 │ dll  │ edges  │ 20.24s │
+│ 0x3241F5D0 │    95,876 │ dll  │ edges  │  0.81s │
+│ 0x32680000 │   311,196 │ dll  │ edges  │  2.65s │
+└────────────┴───────────┴──────┴────────┴────────┘
+total 3,677,850 bytes in 32.63s (110 KB/s), fast path used, verify sampled
+rtu0.0 halted at the entry  PC 0x32100020  DSPSR 0x000001FA
+focus: rtu0.0 -- set breakpoints, then `resume` (or `continue`) when ready. 
+Quitting the session resumes the core unless --keep-on-exit.
+rtu0.0 running -- running (non-debug state)
+streaming 1 signal(s) at 1000 samples/s total
+streaming 2 signal(s) at 1000 samples/s total
+streaming 4 signal(s) at 1000 samples/s total
+streaming 1 signal(s) at 1000 samples/s total
+! halting stops the application on this core, and its lockstep partner stops 
+with it in hardware. Peripherals may keep running: the MDM-AP IP_DBG controls 
+decide what freezes and this tool does not touch them, so a watchdog can expire
+and reset the board while the core is stopped.
+rtu0.0 halted -- halted: external debug request (EDSCR 0x03054113, EDPRSR 
+0x00000011)
+rtu0.0: 0x321D2EE6 -> 0x321D2EE6 in 2 step(s) (loop)  
+C:\br1_rear_ecu\Sip\Components\Os\Implementation\Os_Hal_Core.h:409
+  this source line loops back to 0x321D2EE6 -- a source step can never leave 
+it. Use 'continue', 'stepout', or set a breakpoint past the loop. Pass 
+--no-loop-guard to step the full budget anyway.
+rtu0.0 running -- running (non-debug state)
+streaming stopped
+session closed

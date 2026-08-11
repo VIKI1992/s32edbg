@@ -46,6 +46,20 @@ export interface ByeEvent {
   kept: boolean;
 }
 
+/** One `var sample` streaming batch: raw memory reads, ~20 events/s.
+ * `dt` are millisecond offsets from `t0_ms`, stamped per read backend-side. */
+export interface SamplesEvent {
+  event: "samples";
+  t0_ms: number;
+  signals: { name: string; dt: number[]; v: number[] }[];
+}
+
+/** The stream gave up (five consecutive failing batches). */
+export interface SampleStoppedEvent {
+  event: "sample-stopped";
+  reason: string;
+}
+
 /** Pushed by the backend's halt monitor the moment a session-resumed core
  * halts on its own (breakpoint/watchpoint). Arrives between envelopes. */
 export interface StoppedEvent {
