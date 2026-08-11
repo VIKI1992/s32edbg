@@ -2,7 +2,13 @@ import { ChildProcess, spawn } from "child_process";
 import * as vscode from "vscode";
 import { BackendConfig, globalArgs } from "../config";
 import { Output } from "../ui/output";
-import { ByeEvent, Envelope, ProgressEvent, ReadyEvent } from "./types";
+import {
+  ByeEvent,
+  Envelope,
+  ProgressEvent,
+  ReadyEvent,
+  StoppedEvent,
+} from "./types";
 
 interface Pending {
   line: string;
@@ -43,6 +49,9 @@ export class SessionClient implements vscode.Disposable {
     stderrTail: string;
   }>();
   readonly onExit = this.exitEmitter.event;
+  private readonly stoppedEmitter = new vscode.EventEmitter<StoppedEvent>();
+  /** The backend pushed a stopped event: a resumed core halted on its own. */
+  readonly onStopped = this.stoppedEmitter.event;
   private expectingExit = false;
 
   private constructor(private readonly output: Output) {}
@@ -163,6 +172,14 @@ export class SessionClient implements vscode.Disposable {
       this.pending[0]?.onProgress?.(ev.message);
       return;
     }
+    if (obj.event === "stopped") {
+      const ev = obj as unknown as StoppedEvent;
+      this.output.envelope(
+        `stopped: ${ev.core}${ev.status ? ` (${ev.status})` : ""}`,
+      );
+      this.stoppedEmitter.fire(ev);
+      return;
+    }
     if (obj.event === "bye") {
       this.bye = obj as unknown as ByeEvent;
       return;
@@ -173,8 +190,10 @@ export class SessionClient implements vscode.Disposable {
       this.output.line(`?? unmatched envelope seq ${env.seq}`);
       return;
     }
+    const cost =
+      env.ms !== undefined ? ` ${env.ms}ms/${env.ops ?? 0}op` : "";
     this.output.envelope(
-      `${env.seq} ${env.ok ? "ok" : `${env.error?.kind}: ${env.error?.message}`} (${env.cmd})`,
+      `${env.seq} ${env.ok ? "ok" : `${env.error?.kind}: ${env.error?.message}`} (${env.cmd})${cost}`,
     );
     p.resolve(env);
   }

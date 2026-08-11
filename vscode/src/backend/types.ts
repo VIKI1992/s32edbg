@@ -17,6 +17,10 @@ export interface Envelope {
   cmd: string;
   result: unknown;
   error?: EnvelopeError;
+  /** Backend wall time for the command, milliseconds. */
+  ms?: number;
+  /** DP/AP transactions the command issued -- each is one USB round trip. */
+  ops?: number;
 }
 
 export interface ReadyEvent {
@@ -40,6 +44,16 @@ export interface ByeEvent {
   event: "bye";
   restore_notes: string[];
   kept: boolean;
+}
+
+/** Pushed by the backend's halt monitor the moment a session-resumed core
+ * halts on its own (breakpoint/watchpoint). Arrives between envelopes. */
+export interface StoppedEvent {
+  event: "stopped";
+  family: "r52" | "m33";
+  core: string;
+  status?: string;
+  location?: { known?: boolean; address?: string; source?: string };
 }
 
 export interface R52Row {
@@ -88,6 +102,72 @@ export interface DisasmRow {
   func?: string;
   file?: string;
   line?: number;
+}
+
+export interface VarValue {
+  display: string;
+  hex: string;
+}
+
+export interface VarRow {
+  handle: string | null;
+  name: string;
+  path: string;
+  type: string;
+  kind: string;
+  value: VarValue | null;
+  address: string | null;
+  register: string | null;
+  size: number | null;
+  expandable: boolean;
+  count: number | null;
+  static: boolean;
+  error: string | null;
+}
+
+export interface VarLocalsResult {
+  core: string;
+  frame: number;
+  func: string | null;
+  frame_pc: string;
+  cfa: string | null;
+  cfa_source: string | null;
+  generation: number;
+  variables: VarRow[];
+  note: string | null;
+}
+
+export interface VarGlobalsResult {
+  core: string;
+  generation: number;
+  total: number;
+  shown: number;
+  variables: VarRow[];
+}
+
+export interface VarExpandResult {
+  generation: number;
+  parent: string;
+  children: VarRow[];
+  more_from: number | null;
+  note: string | null;
+}
+
+export interface VarWatchResult {
+  generation: number;
+  row: VarRow;
+}
+
+export interface VarWriteResult {
+  wrote: string;
+  readback: string;
+  match: boolean;
+  row: VarRow;
+}
+
+export interface VarRefreshResult {
+  generation: number;
+  rows: VarRow[];
 }
 
 export function hexToInt(text: string | null | undefined): number | null {

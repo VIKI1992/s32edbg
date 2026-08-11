@@ -8,6 +8,8 @@ import {
   PollResult,
   StackFrame,
   toHex,
+  VarRow,
+  VarWriteResult,
 } from "./backend/types";
 import { backendConfig, setting } from "./config";
 import { DISASM_SCHEME, DisasmProvider, disasmUri } from "./editor/disasmProvider";
@@ -17,12 +19,18 @@ import { Poller } from "./poll/poller";
 import { BreakpointStore, S32Breakpoint } from "./state/breakpoints";
 import { ElfState } from "./state/elf";
 import { CoreInfo, DebugState, familyOf, M33_NAMES } from "./state/session";
+import { VariablesLive, VariablesState } from "./state/variables";
+import { PolledView, ViewPolling } from "./state/viewPolling";
 import { S32Watchpoint, WatchpointStore } from "./state/watchpoints";
 import { confirmDestructive } from "./ui/confirm";
 import { Output } from "./ui/output";
 import { StatusBar } from "./ui/statusBar";
 import { coreArg } from "./views/coresView";
 import { StackView } from "./views/stackView";
+import {
+  isStaleHandleError,
+  validateWatchPath,
+} from "./views/variablesFormat";
 
 export interface Deps {
   state: DebugState;
@@ -36,6 +44,10 @@ export interface Deps {
   pcDecor: PcDecorations;
   statusBar: StatusBar;
   stackView: StackView;
+  variables: VariablesState;
+  varLive: VariablesLive;
+  viewPolling: ViewPolling;
+  variablesTreeVisible: () => boolean;
   refreshTitles: () => void;
 }
 
@@ -73,11 +85,17 @@ async function connect(deps: Deps): Promise<void> {
     state.connected = true;
     state.connecting = false;
     state.backendVersion = ready.version;
+    // Pushed halts: the backend's monitor notices a breakpoint hit within
+    // ~50 ms and this fires the same reaction chain the poller's transition
+    // detection would -- the poller remains only as a slow fallback.
+    client.onStopped((ev) => state.noteStopped(ev));
     client.onExit(({ expected }) => {
       if (expected) {
         return;
       }
       poller.stop();
+      deps.varLive.stop();
+      deps.variables.reset();
       bpStore.markAllPending();
       wpStore.markAllPending();
       deps.pcDecor.clear();
@@ -129,6 +147,7 @@ async function connect(deps: Deps): Promise<void> {
       await wpStore.applyAll();
     }
     poller.start();
+    deps.varLive.start();
     state.fireChange();
     statusBar.refresh();
     deps.refreshTitles();
@@ -148,6 +167,8 @@ async function disconnect(deps: Deps): Promise<void> {
     return;
   }
   poller.stop();
+  deps.varLive.stop();
+  deps.variables.reset();
   bpStore.markAllPending();
   wpStore.markAllPending();
   deps.pcDecor.clear();
@@ -188,44 +209,89 @@ async function symLoad(deps: Deps): Promise<boolean> {
 // focused-core data refresh + on-halt behavior
 // ---------------------------------------------------------------------------
 
-async function refreshFocusData(deps: Deps): Promise<void> {
-  const { state } = deps;
+export async function refreshFocusData(
+  deps: Deps, force?: Set<PolledView>,
+): Promise<void> {
+  const { state, viewPolling } = deps;
   const core = state.focus;
   if (!core || !state.connected || state.cores.get(core)?.halted !== true) {
     return;
   }
+  // Each view's Auto-refresh checkbox gates its block; a view's own refresh
+  // button passes itself in `force` so a one-shot always works.
+  const wants = (view: PolledView) =>
+    viewPolling.on(view) || (force?.has(view) ?? false);
   const client = state.requireClient();
   const family = familyOf(core);
-  try {
-    if (family === "r52") {
-      const regs = (await client.run(`core regs --core ${core}`)) as {
-        registers: Record<string, string>;
-        pc: string | null;
-      };
-      const merged = { ...regs.registers, pc: regs.pc ?? "?" };
-      state.prevRegs.set(core, state.lastRegs.get(core) ?? {});
-      state.lastRegs.set(core, merged);
-      state.notePc(core, regs.pc);
-    } else {
-      const regs = (await client.run(`m33 regs --core ${core}`)) as {
-        registers: Record<string, string>;
-      };
-      state.prevRegs.set(core, state.lastRegs.get(core) ?? {});
-      state.lastRegs.set(core, regs.registers);
-      state.notePc(core, regs.registers.pc);
+  if (wants("registers")) {
+    try {
+      if (family === "r52") {
+        const regs = (await client.run(`core regs --core ${core}`)) as {
+          registers: Record<string, string>;
+          pc: string | null;
+        };
+        const merged = { ...regs.registers, pc: regs.pc ?? "?" };
+        state.prevRegs.set(core, state.lastRegs.get(core) ?? {});
+        state.lastRegs.set(core, merged);
+        state.notePc(core, regs.pc);
+      } else {
+        const regs = (await client.run(`m33 regs --core ${core}`)) as {
+          registers: Record<string, string>;
+        };
+        state.prevRegs.set(core, state.lastRegs.get(core) ?? {});
+        state.lastRegs.set(core, regs.registers);
+        state.notePc(core, regs.registers.pc);
+      }
+    } catch (err) {
+      deps.output.line(`!! regs: ${message(err)}`);
     }
-  } catch (err) {
-    deps.output.line(`!! regs: ${message(err)}`);
+  } else {
+    // The register read doubled as the PC source for the source reveal and
+    // the gutter arrow; with it unchecked, fetch just the PC (one register).
+    try {
+      const result = (await client.run(
+        family === "r52"
+          ? `core reg pc --core ${core}`
+          : `m33 reg pc --core ${core}`,
+      )) as { value: string };
+      state.notePc(core, result.value);
+    } catch (err) {
+      deps.output.line(`!! pc: ${message(err)}`);
+    }
   }
-  try {
-    const stack = (await client.run(
-      `stack --core ${core} --max-frames ${setting<number>("maxStackFrames", 32)}`,
-    )) as { frames: StackFrame[]; stopped: string };
-    state.lastStack = stack.frames;
-    state.lastStackReason = stack.stopped;
-  } catch (err) {
-    state.lastStack = [];
-    state.lastStackReason = message(err);
+  if (wants("callStack")) {
+    try {
+      const stack = (await client.run(
+        `stack --core ${core} --max-frames ${setting<number>("maxStackFrames", 32)}`,
+      )) as { frames: StackFrame[]; stopped: string };
+      state.lastStack = stack.frames;
+      state.lastStackReason = stack.stopped;
+    } catch (err) {
+      state.lastStack = [];
+      state.lastStackReason = message(err);
+    }
+  }
+  deps.variables.selectedFrame = 0;
+  deps.variables.noteHalt();
+  if (deps.variablesTreeVisible() && wants("variables")) {
+    // One render for the whole variables refresh instead of one per fetch.
+    // The backend serves the repeats from its per-stop caches, so the
+    // watches after locals cost tens of transactions, not a re-unwind each.
+    await deps.variables.batch(async () => {
+      await deps.variables.fetchLocals(client, core, 0);
+      await deps.variables.fetchWatches(client, core, 0);
+      if (deps.variables.globalsOpened) {
+        await deps.variables.fetchGlobals(client, core);
+      }
+    });
+  }
+  if (wants("memory")) {
+    // Opt-in: re-read every open memory region at the stop.
+    try {
+      await deps.mem.refreshAll();
+    } catch (err) {
+      deps.output.line(`!! memory refresh: ${message(err)}`);
+    }
   }
   deps.stackView.refresh();
   state.fireChange();
@@ -240,6 +306,9 @@ async function afterHalt(deps: Deps, core: string, pcHint?: string | null): Prom
   }
   await refreshFocusData(deps);
   const pc = pcHint !== undefined ? state.notePc(core, pcHint) : (state.lastPc.get(core) ?? null);
+  // A new stop: drop every stale PC marker, even if this one's PC is unknown
+  // -- an arrow at the previous stop's line would be a lie.
+  pcDecor.beginStop();
   if (pc === null) {
     return;
   }
@@ -279,10 +348,15 @@ async function afterHalt(deps: Deps, core: string, pcHint?: string | null): Prom
       deps.output.line(`!! disasm reveal: ${message(err)}`);
     }
   } else if (disasm.isOpen(core)) {
-    // Keep an already-open disasm tab in step with the source view.
+    // Keep an already-open disasm tab in step with the source view -- arrow
+    // included: source and disassembly both mark the same PC.
     try {
       await disasm.render(core, pc);
       disasm.revealAddr(core, pc);
+      const line = disasm.addrToLine(core, pc);
+      if (line !== null) {
+        pcDecor.set(disasmUri(core), line + 1);
+      }
     } catch {
       /* non-fatal */
     }
@@ -403,7 +477,7 @@ export function registerCommands(
     state.sync = target === "on";
     state.fireChange();
   });
-  reg("s32e.refreshCores", () => deps.poller.tick());
+  reg("s32e.refreshCores", () => deps.poller.tick(true));
   reg("s32e.unlockCore", async (item) => {
     const core = coreArg(state, item as CoreInfo);
     await state.requireClient().run(`core unlock --core ${core}`);
@@ -411,8 +485,24 @@ export function registerCommands(
   });
 
   // -- stepping --
-  reg("s32e.stepLineIn", () => stepLine(deps, false));
-  reg("s32e.stepLineOver", () => stepLine(deps, true));
+  // The Cores-view row buttons pass the clicked item. Stepping acts on the
+  // focus, so a click on a DIFFERENT halted core focuses it first -- the
+  // same thing clicking the row does -- and then steps it; the arrow and
+  // every focus-bound view follow. Keyboard/palette pass no item: no-op.
+  const ensureFocusedOn = async (item: unknown): Promise<void> => {
+    const target = coreArg(state, item as CoreInfo | undefined);
+    if (target && target !== state.focus) {
+      await focusCore(deps, target);
+    }
+  };
+  reg("s32e.stepLineIn", async (item) => {
+    await ensureFocusedOn(item);
+    await stepLine(deps, false);
+  });
+  reg("s32e.stepLineOver", async (item) => {
+    await ensureFocusedOn(item);
+    await stepLine(deps, true);
+  });
   reg("s32e.stepOut", async () => {
     const core = requireHaltedFocus(state);
     const result = (await state
@@ -423,14 +513,21 @@ export function registerCommands(
     } else {
       state.markHalted(core, false);
       deps.pcDecor.clear();
+      deps.variables.invalidate();
       void vscode.window.showWarningMessage(
         `S32E: ${core} did not return within the timeout -- it is RUNNING ` +
           "(the temporary breakpoint was removed). Halt it manually when ready.",
       );
     }
   });
-  reg("s32e.stepInstrIn", () => stepInstr(deps, false));
-  reg("s32e.stepInstrOver", () => stepInstr(deps, true));
+  reg("s32e.stepInstrIn", async (item) => {
+    await ensureFocusedOn(item);
+    await stepInstr(deps, false);
+  });
+  reg("s32e.stepInstrOver", async (item) => {
+    await ensureFocusedOn(item);
+    await stepInstr(deps, true);
+  });
   reg("s32e.runToCursor", async () => {
     const core = requireHaltedFocus(state);
     const editor = vscode.window.activeTextEditor;
@@ -465,6 +562,7 @@ export function registerCommands(
     } else {
       state.markHalted(core, false);
       deps.pcDecor.clear();
+      deps.variables.invalidate();
       void vscode.window.showWarningMessage(
         `S32E: ${core} did not reach ${toHex(addr)} within the timeout -- ` +
           "it is RUNNING (the temporary breakpoint was removed).",
@@ -645,8 +743,164 @@ export function registerCommands(
   reg("s32e.clearAllWatchpoints", () => wpStore.clearAll());
 
   // -- views / data --
-  reg("s32e.refreshStack", () => refreshFocusData(deps));
-  reg("s32e.refreshRegisters", () => refreshFocusData(deps));
+  reg("s32e.refreshStack", () => refreshFocusData(deps, new Set(["callStack"])));
+  reg("s32e.refreshRegisters", () => refreshFocusData(deps, new Set(["registers"])));
+
+  // -- variables --
+  const { variables } = deps;
+  reg("s32e.selectFrame", async (frameIndex, file, line) => {
+    const core = requireHaltedFocus(state);
+    await variables.fetchLocals(state.requireClient(), core, frameIndex as number);
+    if (typeof file === "string" && typeof line === "number") {
+      await vscode.commands.executeCommand("s32e.openFrameSource", file, line);
+    }
+  });
+  reg("s32e.refreshGlobalsSection", async () => {
+    if (state.connected && state.focus) {
+      await variables.fetchGlobals(state.requireClient(), state.focus);
+    }
+  });
+  reg("s32e.expandMoreChildren", async (node) => {
+    const more = node as { parentHandle: string; from: number };
+    await variables.expand(state.requireClient(), more.parentHandle, more.from);
+  });
+  reg("s32e.refreshVariables", async () => {
+    if (!state.connected || !state.focus) {
+      return;
+    }
+    const client = state.requireClient();
+    const halted = state.focusInfo?.halted === true;
+    variables.noteHalt();
+    if (halted) {
+      await variables.fetchLocals(client, state.focus, variables.selectedFrame);
+      await variables.fetchWatches(client, state.focus, variables.selectedFrame);
+    } else {
+      await variables.fetchWatches(client, state.focus, null);
+    }
+    if (variables.globalsOpened) {
+      await variables.fetchGlobals(client, state.focus);
+    }
+  });
+  reg("s32e.toggleHexVariables", () => {
+    variables.hexMode = !variables.hexMode;
+    variables.fire();
+  });
+  reg("s32e.toggleVariablesLive", () => {
+    variables.livePaused = !variables.livePaused;
+    void vscode.commands.executeCommand(
+      "setContext", "s32e.varsLivePaused", variables.livePaused,
+    );
+    variables.fire();
+  });
+  reg("s32e.filterGlobals", async () => {
+    const text = await vscode.window.showInputBox({
+      title: "Globals filter (substring; empty shows the first page unfiltered)",
+      value: variables.globalsFilter,
+    });
+    if (text === undefined) {
+      return;
+    }
+    variables.globalsFilter = text.trim();
+    variables.globalsOpened = true;
+    if (state.connected && state.focus) {
+      await variables.fetchGlobals(state.requireClient(), state.focus);
+    }
+  });
+  reg("s32e.addWatch", async () => {
+    const text = await vscode.window.showInputBox({
+      title: "Add watch: a variable path",
+      placeHolder: "counter · cfg.limits[2].max · *ptr · p->x",
+      validateInput: (v) => validateWatchPath(v),
+    });
+    if (!text) {
+      return;
+    }
+    await variables.addWatch(text.trim());
+    if (state.connected && state.focus) {
+      const halted = state.focusInfo?.halted === true;
+      await variables.fetchWatches(
+        state.requireClient(), state.focus,
+        halted ? variables.selectedFrame : null,
+      );
+    }
+  });
+  reg("s32e.addToWatchFromSelection", async () => {
+    const editor = vscode.window.activeTextEditor;
+    const text = editor?.document.getText(editor.selection).trim();
+    if (!text) {
+      throw new Error("select a variable path first");
+    }
+    const invalid = validateWatchPath(text);
+    if (invalid) {
+      throw new Error(`not a watchable path: ${invalid}`);
+    }
+    await variables.addWatch(text);
+    if (state.connected && state.focus) {
+      const halted = state.focusInfo?.halted === true;
+      await variables.fetchWatches(
+        state.requireClient(), state.focus,
+        halted ? variables.selectedFrame : null,
+      );
+    }
+  });
+  reg("s32e.removeWatch", async (node) => {
+    const watchPath = (node as { watchPath?: string })?.watchPath;
+    if (watchPath) {
+      await variables.removeWatch(watchPath);
+    }
+  });
+  reg("s32e.editVariable", async (node) => {
+    const row = (node as { row?: VarRow })?.row;
+    const section = (node as { section?: string })?.section ?? "";
+    if (!row || row.handle === null) {
+      return;
+    }
+    const focus = state.focusInfo;
+    if (section === "locals" && focus?.halted !== true) {
+      throw new Error("locals are editable only while the core is halted");
+    }
+    if (section !== "locals" && focus?.halted === false) {
+      const go = await confirmDestructive(
+        `Write ${row.path} while ${state.focus} is RUNNING?`,
+        "The write lands mid-execution -- the application sees the new " +
+          "value immediately.",
+        "Write",
+      );
+      if (!go) {
+        return;
+      }
+    }
+    const text = await vscode.window.showInputBox({
+      title: `${row.path}  (${row.type})`,
+      value: row.value?.display ?? "",
+      prompt: "decimal, 0x hex, 'c' for chars, true/false, or an enumerator name",
+    });
+    if (!text) {
+      return;
+    }
+    try {
+      const result = (await state
+        .requireClient()
+        .run(`var write ${row.handle} "${text.trim()}"`)) as VarWriteResult;
+      if (!result.match) {
+        void vscode.window.showInformationMessage(
+          `S32E: wrote ${result.wrote}, reads back ${result.readback} ` +
+            "(differs -- volatile or hardware-written?)",
+        );
+      }
+      variables.applyRefresh({ generation: variables.generation, rows: [result.row] });
+    } catch (err) {
+      if (isStaleHandleError(message(err))) {
+        void vscode.window.showWarningMessage(
+          "S32E: the target ran since this row was fetched -- the view was " +
+            "refreshed, try again.",
+        );
+        await vscode.commands.executeCommand("s32e.refreshVariables");
+        return;
+      }
+      throw err;
+    }
+  });
   reg("s32e.editRegister", async (item) => {
     const name = (item as { regName?: string })?.regName ?? (item as { name?: string })?.name;
     if (!name) {
@@ -925,6 +1179,7 @@ async function resumeCore(deps: Deps, core: string | null): Promise<void> {
     return;
   }
   state.markHalted(core, false, "running");
+  deps.variables.invalidate();
   if (core === state.focus) {
     deps.pcDecor.clear();
   }
@@ -961,6 +1216,16 @@ async function stepLine(deps: Deps, over: boolean): Promise<void> {
     void vscode.window.setStatusBarMessage(
       `S32E: still on the same line after ${result.steps} steps`,
       4000,
+    );
+  } else if (result.stopped === "breakpoint") {
+    void vscode.window.setStatusBarMessage(
+      "S32E: a breakpoint inside the stepped line fired — stopped there",
+      4000,
+    );
+  } else if (result.stopped === "timeout") {
+    void vscode.window.showWarningMessage(
+      "S32E: the line step stalled mid-run; the core was halted where it " +
+        "stood. The line may wait on an interrupt or a peripheral.",
     );
   }
   await afterHalt(deps, core, result.pc_after);
@@ -1059,4 +1324,4 @@ async function pickCore(
   return pick ?? null;
 }
 
-export { afterHalt, connect, disconnect, refreshFocusData, symLoad };
+export { afterHalt, connect, disconnect, symLoad };

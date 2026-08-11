@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { PollResult } from "../backend/types";
 import { setting } from "../config";
 import { DebugState } from "../state/session";
+import { ViewPolling } from "../state/viewPolling";
 import { Output } from "../ui/output";
 
 /** The 1 Hz heartbeat: `poll` while connected and idle, diff into the state.
@@ -18,6 +19,7 @@ export class Poller implements vscode.Disposable {
   constructor(
     private readonly state: DebugState,
     private readonly output: Output,
+    private readonly polling?: ViewPolling,
   ) {}
 
   start(): void {
@@ -36,12 +38,15 @@ export class Poller implements vscode.Disposable {
     }
   }
 
-  async tick(): Promise<void> {
+  async tick(force = false): Promise<void> {
     if (
       !this.state.connected ||
       this.state.busyOp ||
       this.inFlight ||
-      (this.state.client?.busy ?? true)
+      (this.state.client?.busy ?? true) ||
+      // The Cores view's Auto-refresh checkbox; the manual refresh button
+      // passes force. Pushed stopped events keep arriving either way.
+      (!force && this.polling !== undefined && !this.polling.on("cores"))
     ) {
       return;
     }

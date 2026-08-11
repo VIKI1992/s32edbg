@@ -1,5 +1,13 @@
 import * as vscode from "vscode";
 import { CoreInfo, DebugState } from "../state/session";
+import {
+  AutoRefreshNode,
+  autoRefreshItem,
+  isAutoRefreshNode,
+  ViewPolling,
+} from "../state/viewPolling";
+
+type CoresNode = CoreInfo | AutoRefreshNode;
 
 export class CoreItem extends vscode.TreeItem {
   constructor(info: CoreInfo, focused: boolean) {
@@ -49,22 +57,41 @@ export class CoreItem extends vscode.TreeItem {
   }
 }
 
-export class CoresView implements vscode.TreeDataProvider<CoreInfo> {
+export class CoresView implements vscode.TreeDataProvider<CoresNode> {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
-  constructor(private readonly state: DebugState) {
+  constructor(
+    private readonly state: DebugState,
+    private readonly polling: ViewPolling,
+  ) {
     state.onDidChange(() => this.changeEmitter.fire());
+    polling.onDidChange((view) => {
+      if (view === "cores") {
+        this.changeEmitter.fire();
+      }
+    });
   }
 
-  getTreeItem(info: CoreInfo): vscode.TreeItem {
-    return new CoreItem(info, info.name === this.state.focus);
+  getTreeItem(node: CoresNode): vscode.TreeItem {
+    if (isAutoRefreshNode(node)) {
+      return autoRefreshItem("cores", this.polling.on("cores"));
+    }
+    return new CoreItem(node, node.name === this.state.focus);
   }
 
-  getChildren(): CoreInfo[] {
+  getChildren(node?: CoresNode): CoresNode[] {
+    if (node) {
+      return [];
+    }
     const r52 = [...this.state.cores.values()].filter((c) => c.family === "r52");
     const m33 = [...this.state.cores.values()].filter((c) => c.family === "m33");
-    return [...r52, ...m33];
+    // The checkbox only once connected: an empty tree shows the welcome
+    // content (the Connect button), which any row would suppress.
+    const toggle: CoresNode[] = this.state.connected
+      ? [{ autoRefresh: "cores" }]
+      : [];
+    return [...toggle, ...r52, ...m33];
   }
 }
 

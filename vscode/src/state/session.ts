@@ -4,6 +4,7 @@ import {
   hexToInt,
   PollResult,
   StackFrame,
+  StoppedEvent,
 } from "../backend/types";
 
 export type Family = "r52" | "m33";
@@ -126,6 +127,30 @@ export class DebugState implements vscode.Disposable {
     for (const info of freshHalts) {
       this.haltEmitter.fire(info);
     }
+  }
+
+  /** Ingest a pushed stopped event; fires onCoreHalted unless the slow poll
+   * already marked this core halted (never react to one stop twice). */
+  noteStopped(ev: StoppedEvent): void {
+    const prev = this.cores.get(ev.core);
+    if (prev?.halted === true) {
+      return;
+    }
+    const info: CoreInfo = {
+      name: ev.core,
+      family: ev.family,
+      halted: true,
+      detail:
+        ev.location?.known && ev.location.address
+          ? `halted at ${ev.location.address}`
+          : ev.status ?? "halted",
+      location: ev.location,
+      unreachable: null,
+      catchArmed: prev?.catchArmed ?? false,
+    };
+    this.cores.set(ev.core, info);
+    this.fireChange();
+    this.haltEmitter.fire(info);
   }
 
   notePc(core: string, pcHex: string | null | undefined): number | null {

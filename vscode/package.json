@@ -54,6 +54,11 @@
           "icon": "media/icon.svg"
         },
         {
+          "id": "s32e.variables",
+          "name": "Variables",
+          "icon": "media/icon.svg"
+        },
+        {
           "id": "s32e.callStack",
           "name": "Call Stack",
           "icon": "media/icon.svg"
@@ -230,7 +235,7 @@
         "command": "s32e.stepInstrIn",
         "title": "Step Instruction",
         "category": "S32E",
-        "icon": "$(debug-step-into)"
+        "icon": "$(arrow-small-down)"
       },
       {
         "command": "s32e.stepInstrOver",
@@ -347,6 +352,58 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "s32e.addWatch",
+        "title": "Add Watch...",
+        "category": "S32E",
+        "icon": "$(add)"
+      },
+      {
+        "command": "s32e.addToWatchFromSelection",
+        "title": "S32E: Add to Watch",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.removeWatch",
+        "title": "Remove Watch",
+        "category": "S32E",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "s32e.editVariable",
+        "title": "Edit Variable Value",
+        "category": "S32E",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "s32e.toggleHexVariables",
+        "title": "Toggle Hex Display (Variables)",
+        "category": "S32E",
+        "icon": "$(symbol-number)"
+      },
+      {
+        "command": "s32e.filterGlobals",
+        "title": "Filter Globals...",
+        "category": "S32E",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "s32e.toggleVariablesLive",
+        "title": "Pause/Resume Live Variable Refresh",
+        "category": "S32E",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "s32e.refreshVariables",
+        "title": "Refresh Variables",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "s32e.selectFrame",
+        "title": "Select Stack Frame",
+        "category": "S32E"
+      },
+      {
         "command": "s32e.doctor",
         "title": "Diagnostics: Doctor (board diagnosis)",
         "category": "S32E"
@@ -417,6 +474,18 @@
           "when": "false"
         },
         {
+          "command": "s32e.selectFrame",
+          "when": "false"
+        },
+        {
+          "command": "s32e.removeWatch",
+          "when": "false"
+        },
+        {
+          "command": "s32e.editVariable",
+          "when": "false"
+        },
+        {
           "command": "s32e.connect",
           "when": "!s32e.connected"
         },
@@ -474,6 +543,31 @@
           "group": "navigation@1"
         },
         {
+          "command": "s32e.addWatch",
+          "when": "view == s32e.variables && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.filterGlobals",
+          "when": "view == s32e.variables && s32e.connected",
+          "group": "navigation@2"
+        },
+        {
+          "command": "s32e.toggleHexVariables",
+          "when": "view == s32e.variables && s32e.connected",
+          "group": "navigation@3"
+        },
+        {
+          "command": "s32e.toggleVariablesLive",
+          "when": "view == s32e.variables && s32e.connected",
+          "group": "navigation@4"
+        },
+        {
+          "command": "s32e.refreshVariables",
+          "when": "view == s32e.variables && s32e.connected",
+          "group": "navigation@5"
+        },
+        {
           "command": "s32e.refreshRegisters",
           "when": "view == s32e.registers && s32e.connected",
           "group": "navigation@1"
@@ -526,9 +620,24 @@
           "group": "inline@2"
         },
         {
+          "command": "s32e.stepLineIn",
+          "when": "view == s32e.cores && viewItem =~ /halted/",
+          "group": "inline@3"
+        },
+        {
+          "command": "s32e.stepLineOver",
+          "when": "view == s32e.cores && viewItem =~ /halted/",
+          "group": "inline@4"
+        },
+        {
+          "command": "s32e.stepInstrIn",
+          "when": "view == s32e.cores && viewItem =~ /halted/",
+          "group": "inline@5"
+        },
+        {
           "command": "s32e.openDisasm",
           "when": "view == s32e.cores && viewItem =~ /core/",
-          "group": "inline@3"
+          "group": "inline@6"
         },
         {
           "command": "s32e.catchCore",
@@ -579,6 +688,16 @@
           "command": "s32e.editRegister",
           "when": "view == s32e.registers && viewItem == register",
           "group": "inline@1"
+        },
+        {
+          "command": "s32e.editVariable",
+          "when": "view == s32e.variables && viewItem =~ /editable/",
+          "group": "inline@1"
+        },
+        {
+          "command": "s32e.removeWatch",
+          "when": "view == s32e.variables && viewItem =~ /watchRoot/",
+          "group": "inline@2"
         }
       ],
       "editor/context": [
@@ -586,6 +705,11 @@
           "command": "s32e.runToCursor",
           "when": "s32e.connected && s32e.focusHalted && resourceScheme == file",
           "group": "s32e@1"
+        },
+        {
+          "command": "s32e.addToWatchFromSelection",
+          "when": "s32e.connected && editorHasSelection && resourceScheme == file",
+          "group": "s32e@3"
         },
         {
           "command": "s32e.toggleDisasmBreakpoint",
@@ -678,9 +802,9 @@
         },
         "s32e.pollIntervalMs": {
           "type": "number",
-          "default": 1000,
+          "default": 2000,
           "minimum": 0,
-          "description": "Core-status poll interval while connected (0 disables polling; views then refresh only on your actions)."
+          "description": "Core-status poll interval while connected (0 disables polling; views then refresh only on your actions). Breakpoint hits are pushed by the backend within ~50 ms regardless -- this poll is the liveness sweep and fallback, so it can be slow."
         },
         "s32e.confirmDestructive": {
           "type": "boolean",
@@ -712,6 +836,17 @@
           "type": "boolean",
           "default": false,
           "description": "Full word-for-word verify after Load to RAM (sampled verification always runs)."
+        },
+        "s32e.variables.liveRefreshMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 0,
+          "description": "Refresh interval for Globals/Watch while the focused core RUNS (0 disables live refresh). Locals refresh only on halt."
+        },
+        "s32e.variables.childrenCap": {
+          "type": "number",
+          "default": 100,
+          "description": "Children per expansion (array page size) and the globals page size."
         },
         "s32e.load.core1": {
           "type": "string",
