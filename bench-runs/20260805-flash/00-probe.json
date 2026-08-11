@@ -1,0 +1,20 @@
+{
+  "serial": null,
+  "hardware_version": "V13.00",
+  "firmware": "J-Link V13 compiled Jun 25 2026 10:24:04",
+  "dll_version": "V9.62",
+  "vtref_mv": 3303,
+  "pins": {
+    "TCK": 0,
+    "TDI": 1,
+    "TDO": 0,
+    "TMS": 1,
+    "TRES": 1,
+    "TRST": 1
+  },
+  "capabilities": [],
+  "notes": [
+    "J-Link install: C:\\Program Files\\SEGGER\\JLink_V962 (v9.62)",
+    "VTREF and pin states come from JLINK_GetHWStatus, whose struct layout is not documented on this machine; treat them as best-effort and cross-check with the commander transport."
+  ]
+}

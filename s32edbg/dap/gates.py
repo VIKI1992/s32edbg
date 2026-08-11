@@ -195,7 +195,21 @@ def read_hse(dap: Dap, ap_base: int = AP_SDA) -> HseState:
     return state
 
 
-def status(dap: Dap) -> GateReport:
+def status(dap: Dap, *, cached: bool = False) -> GateReport:
+    """Read the debug gates. ``cached=True`` reuses the last report.
+
+    The full read is ~15 AP transactions, and memaccess.preflight runs it in
+    front of every stack/variables/disassembly command -- five to eight times
+    per IDE stop for a value that only `gates apply`, a reset or a power cycle
+    can change. Those paths pass ``cached=True``; anything user-facing keeps
+    the fresh read. The cache lives on the Dap (exactly the connection's
+    lifetime) and is dropped by invalidate_status_cache(), which the reset
+    and `gates apply` paths call.
+    """
+    if cached:
+        hit = getattr(dap, "gates_report_cache", None)
+        if hit is not None:
+            return hit
     mdm = read_mdm(dap)
     hse = read_hse(dap)
     report = GateReport(mdm=mdm, hse=hse)
@@ -238,7 +252,16 @@ def status(dap: Dap) -> GateReport:
             "or memory via the AXI-AP now can leave them inaccessible until a destructive "
             "reset; AXI-AP traffic is blocked while this holds."
         )
+    dap.gates_report_cache = report
     return report
+
+
+def invalidate_status_cache(dap: Dap | None) -> None:
+    """Forget the cached gate report -- after `gates apply`, a reset, or any
+    flow that may have moved the enables underneath it. None-tolerant so a
+    session that never connected can still run its reset bookkeeping."""
+    if dap is not None:
+        dap.gates_report_cache = None
 
 
 def apply_ladder1(dap: Dap, ap_base: int = AP_MDM, *, verify: bool = True) -> GateReport:

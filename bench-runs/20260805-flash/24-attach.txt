@@ -1,0 +1,12 @@
+﻿attached and holding on attempt 1 (SDASYSRSTC 0x00000020)
+The cores are stopped and the JTAGC stays up -- RM Table 301: a functional 
+reset does not reset the JTAGC.
+debug-enable gate: open
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+! Functional reset is asserted. RM Table 957 warns that accessing peripherals 
+or memory via the AXI-AP now can leave them inaccessible until a destructive 
+reset; AXI-AP traffic is blocked while this holds.
+Release with `s32edbg release` when done. The gate bits are sticky across 
+functional resets and are lost only on power loss.

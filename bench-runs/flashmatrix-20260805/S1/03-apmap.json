@@ -1,0 +1,123 @@
+{
+  "baseptr": null,
+  "rom_base_used": "0x01C00000",
+  "walk_error": null,
+  "notes": [
+    "BASEPTR0.VALID is clear, so the top-level ROM address was assumed to be 0x01C00000 from RM Table 957."
+  ],
+  "aps": [
+    {
+      "base": "0x01C10000",
+      "idr": "0x001DE040",
+      "kind": "reserved(0b1111), JTAG connection, NXP (Freescale), rev 0",
+      "expected_role": "MDM-AP (miscellaneous debug module)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01C20000",
+      "idr": "0x34770017",
+      "kind": "MEM-AP, AMBA AXI5, Arm, rev 3",
+      "expected_role": "AXI-AP (system interconnect)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01C30000",
+      "idr": "0x24770006",
+      "kind": "MEM-AP, AMBA AHB5 or APB4, Arm, rev 2",
+      "expected_role": "APB-AP (debug APB -> APBIC2)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01C70000",
+      "idr": "0x001DE001",
+      "kind": "reserved(0b1111), AMBA AHB3, NXP (Freescale), rev 0",
+      "expected_role": "SDA-AP (secure debug authenticate)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01C80000",
+      "idr": "0x34770008",
+      "kind": "MEM-AP, AMBA AHB5 (SoC-600, observed), Arm, rev 3",
+      "expected_role": "AHB-AP (SMU Cortex-M33)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01C90000",
+      "idr": "0x34770008",
+      "kind": "MEM-AP, AMBA AHB5 (SoC-600, observed), Arm, rev 3",
+      "expected_role": "AHB-AP (CE Cortex-M33 core 0)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01C92000",
+      "idr": "0x34770008",
+      "kind": "MEM-AP, AMBA AHB5 (SoC-600, observed), Arm, rev 3",
+      "expected_role": "AHB-AP (CE Cortex-M33 core 1)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01CA0000",
+      "idr": "0x34770008",
+      "kind": "MEM-AP, AMBA AHB5 (SoC-600, observed), Arm, rev 3",
+      "expected_role": "AHB-AP (reserved)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    },
+    {
+      "base": "0x01CA2000",
+      "idr": "0x34770008",
+      "kind": "MEM-AP, AMBA AHB5 (SoC-600, observed), Arm, rev 3",
+      "expected_role": "AHB-AP (reserved)",
+      "idr_matches_rm": true,
+      "found_by": [
+        "direct",
+        "walk"
+      ],
+      "error": null
+    }
+  ],
+  "diff_against_rm": {
+    "missing": [],
+    "unexpected": [],
+    "mismatched": []
+  }
+}

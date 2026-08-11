@@ -2068,8 +2068,22 @@ JSON payloads follow the existing `if ctx.json_out:` pattern, so one-shot
 - **`DebugSession.symbols`**: the index cache; deliberately survives
   `note_system_reset` (a `load` does not change which ELF is being
   debugged).
+- **Variables layer** (added 2026-08-10): `s32edbg/symbols/variables.py` --
+  the lazily-built VariableIndex (globals incl. statics and function-local
+  statics, per-function params/locals with lexical-block scopes, the type
+  graph), a closed-table location evaluator (DW_OP_addr / fbreg / regN /
+  bregN + .debug_loc lists; everything else is a named "unsupported
+  location"), `frame_cfa` with the honest FP fallback, the watch-path
+  grammar (`cfg.limits[2].max`, `*ptr`, `p->x`), and value formatting with
+  reads confined to the known RAM windows. CLI: `var
+  locals/globals/expand/watch/write/refresh` with generation-stamped session
+  handles (`session.bump_var_generation` in every run-state note_*; a stale
+  handle is refused with the `stale-handle:` prefix the frontend keys on).
+  Verified against the production ELF: 32,404 globals indexed in 0.8 s,
+  25k loclist-located locals.
 - **`vscode/`**: TypeScript extension, own Activity Bar container (Session /
-  Cores / Call Stack / Registers / Breakpoints / Watchpoints / Memory),
+  Cores / Variables / Call Stack / Registers / Breakpoints / Watchpoints /
+  Memory),
   status-bar focused-core selector, native gutter breakpoints armed on the
   focused core, per-core disassembly documents, Load-to-RAM with streamed
   progress and breakpoint re-arm, catch-arm with automatic `--wait`
@@ -2080,7 +2094,8 @@ JSON payloads follow the existing `if ctx.json_out:` pattern, so one-shot
 
 ### Evidence
 
-Offline (tier 0/1): 761 tests green, including `tests/test_machine.py`
+Offline (tier 0/1): 805 tests green, including `tests/test_machine.py`,
+`tests/test_variables.py` and `tests/test_variables_cli.py`
 (envelope-per-line, error-kind mapping, restore-on-EOF, poll shape, load
 progress ordering, machine-mode `--json` file suppression) and
 `tests/test_symbols.py` (DWARF round-trips against the committed
@@ -2111,6 +2126,17 @@ one session, on a board with the known-good app in flash:
    notification lands at the expected reset PC (compare Finding 7 bench).
 9. Watchpoint on `counter`-class data → hit shows the EDWAR address in
    the Cores view detail.
+   - 9a. Variables shows frame-0 locals with values that agree with the map
+     file / a `mem read` of the same addresses; clicking Call Stack frame #1
+     switches the view to the caller's locals (`cfa_source` honest about
+     cfi vs fp).
+   - 9b. Edit a scalar local → read-back matches and the Memory viewer
+     agrees at the variable's address.
+   - 9c. A watch on a global updates at ~1 Hz while the core RUNS; the
+     pause button stops it; a struct path (`x.y[i].z`) evaluates to the
+     address the map file predicts.
+   - 9d. Globals with a filter shows a truthful `shown of total`; the page
+     cap holds against the ~32k-static production image.
 10. Memory viewer reads app RAM over AXI; a guarded write reads back.
 11. PC profiling on a running core resolves hot addresses to functions.
 12. `sync on` → any halt stops all cores; Continue restarts the group.
@@ -2120,7 +2146,75 @@ one session, on a board with the known-good app in flash:
 14. Kill the backend process mid-session (Task Manager) → the extension
     reports the unexpected end, warns that restore did not run, offers
     reconnect; reconnect + disconnect cleans the target.
+15. **Interactive-latency bench** (added 2026-08-11 with the stepping/continue
+    performance work; **benched on silicon 2026-08-11** — headless via
+    `tools/bench-idelatency.py`, results under `bench-runs/20260811-idelatency/`:
+    continue-to-stop ~0.37 s perceived (pushed; `rehalted` in the resume
+    envelope when the breakpoint re-hits instantly), instruction step 0.25 s,
+    stop refresh regs 0.30 s cold / 0.018 s warm + stack 0.077 s + locals
+    0.016 s warm + watch 0.014 s, stepline 0.28–0.51 s on 1–3-instruction RTD
+    lines. The IDE-side feel pass — F10/F11/viewing in VS Code itself — is
+    still open). Every machine-mode
+    envelope now carries `ms` (backend wall time) and `ops` (DP/AP
+    transactions — one USB round trip each), and the S32E output channel
+    prints them per request, so the numbers below come straight from the log.
+    With the known-good app halted at a breakpoint in ordinary C code:
+    - 15a. `regs` twice in a row (press the Registers refresh twice): the
+      second must be an order of magnitude cheaper in `ops` — the per-stop
+      register cache. A step between them makes it expensive again.
+    - 15b. F11 a line of ≥5 straight-line instructions: the `stepline`
+      envelope reports `steps` well below the instruction count (comparator
+      range-stepping) and single-digit-× fewer `ops` than the same line via
+      the Command Palette with `--no-range-step`. Target: a typical line
+      step lands **well under 1 s** end to end (was 3–12 s).
+    - 15c. F11 the AUTOSAR one-line idle loop: still reports `loop`
+      immediately (range mode single-steps every branch, so the guard sees
+      the same PCs the legacy loop saw).
+    - 15d. F11 with a second breakpoint armed INSIDE the stepped line:
+      stepline stops there and reports `breakpoint` — a user comparator is
+      honoured, never run through.
+    - 15e. Continue to the next breakpoint: the halt reaction (source
+      reveal + views) starts within ~100 ms of the hit — the backend's
+      `stopped` push event, visible as `stopped: <core>` in the output
+      channel *before* any poll envelope. Pull the `s32e.pollIntervalMs`
+      slider to 10 s and repeat: detection latency must NOT change.
+    - 15f. Alt+F11 instruction step: full round trip (step + registers +
+      stack + locals refresh) **well under 1 s** with the Variables view
+      open on a frame with a struct local.
+    - 15g. Record per-op `ms/ops` lines for: `core step`, `stepline` (both
+      modes), `core resume`, `regs` (cold/warm), `stack`, `var locals`,
+      one `var watch`, `poll`. Compare against the pre-optimisation cost
+      model (§ this plan, 2026-08-11: step ≈ 0.5 s, stepline ≈ 0.4 s ×
+      instructions, stop refresh ≈ 3–6 s serialized).
+
+16. **Per-tab Auto-refresh + PC arrow** (added 2026-08-11; offline-proven,
+    IDE feel pass pending). Cores/Variables/Call Stack/Registers/Memory each
+    lead with an Auto-refresh checkbox (Memory defaults off):
+    - 16a. Uncheck Cores → the output channel shows no periodic `poll`;
+      breakpoint hits still land (pushed). Uncheck Variables → the stop
+      refresh runs no `var` commands; the tab shows `paused` and its stale
+      values stay visible. The refresh buttons still one-shot while unchecked.
+    - 16b. Uncheck Registers → stops still reveal source (the PC arrives via
+      a single `core reg pc` instead of the full dump).
+    - 16c. Check Memory with a region open → every stop re-reads it.
+    - 16d. Checkbox states survive a VS Code reload (per workspace).
+    - 16e. The yellow gutter arrow sits on the PC line after every stop, in
+      the source editor AND an open disassembly tab simultaneously, tracks
+      each step, and disappears on continue.
+    - 16f. A halted Cores row shows inline step-into, step-over (source
+      line) and step-instruction buttons next to continue; on a NON-focused
+      halted row they focus that core first (⦿ moves, views follow) and
+      then step it. Running rows show none of them.
 
 Record the run under `bench-runs/` as usual.
 
-The next finding number is **17**.
+**Finding 17** (2026-08-11, `bench-runs/20260811-idelatency/`): with the
+probe-side latency fixed, session start is dominated by host-side symbol
+parsing — `sym load` of the 29 MB production ELF takes **36 s** (pyelftools
+DWARF line/function walk, zero probe transactions) and the first `var locals`
+pays **+1.1 s** building the variable index. Both are once per session and
+both block the extension's connect/first-stop flow. Remedy when it hurts
+enough: persist the parsed index to disk keyed on the ELF's identity
+(size+mtime+build-id) and load it back in milliseconds.
+
+The next finding number is **18**.

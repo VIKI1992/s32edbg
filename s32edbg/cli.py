@@ -7,6 +7,7 @@ import os
 import shlex
 import struct
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from . import machine as machine_mod
 from .symbols import disasm as symdisasm
 from .symbols import dwarf as symdwarf
 from .symbols import unwind as symunwind
+from .symbols import variables as symvars
 from .dap import adiv6
 from .dap import apmap as apmap_mod
 from .dap import flasher as flasher_mod
@@ -1054,6 +1056,8 @@ def mem_write(ctx: Ctx, addr: str, value: str, ap_spec: str, size: str, yes: boo
             console.print(f"[yellow]![/yellow] {note}")
 
         memaccess.write_word(dap, ap_base, target, data, size=width)
+        if ctx.session is not None:
+            ctx.session.note_target_written()
         readback = dap.mem_read(ap_base, target, size=width)
         console.print(f"0x{target:08X}  wrote 0x{data:0{width // 4}X}, "
                       f"reads back 0x{readback:0{width // 4}X}")
@@ -1099,44 +1103,67 @@ def core() -> None:
     """
 
 
-def _discover_cores(ctx: Ctx, dap: Dap) -> list[runcontrol.Core]:
+def _refresh_core_state(ctx: Ctx, dap: Dap, c: runcontrol.Core) -> None:
+    """Re-read one cached core's run state, with the session bookkeeping.
+
+    Identity is stable for the life of the connection; run state is not, and
+    serving it stale made `status` report a core as running that the previous
+    session command had halted.
+    """
+    session = ctx.session
+    assert session is not None
+    c.state = runcontrol.read_state(dap, c.debug_base)
+    # A core this session already unlocked cannot legitimately read
+    # OS-locked or in-reset again except through a core-local cold
+    # reset (the application cycling its RGM reset -- guide §3.6:
+    # comparators wiped, OS lock back). The session's records about it
+    # describe a machine that no longer exists; drop them so the next
+    # touch re-unlocks and re-sanitises (§5.7).
+    if (
+        c.name in session.sanitized
+        and c.state.edprsr is not None
+        and c.state.edprsr & (r52debug.EDPRSR_R | r52debug.EDPRSR_OSLK)
+    ):
+        session.note_core_reset(c.name)
+        c.reg_path_ok = False
+        # The cold reset wiped the comparators (guide §3.6); the shadow now
+        # describes registers that no longer hold those values.
+        c.comparator_shadow = runcontrol.ComparatorShadow()
+        console.print(
+            f"[yellow]![/yellow] {c.name} was reset since this session "
+            "last touched it (identity cache kept; frame addresses are "
+            "stable). Its session breakpoint/halt records were dropped; "
+            "it will be re-unlocked and re-sanitised on next touch."
+        )
+    if (
+        session.sync
+        and c.state.halted is True
+        and c.name not in session.halted_r52
+    ):
+        # A hardware-initiated stop (a breakpoint hit propagated by
+        # the armed group) with nobody watching: take ownership so
+        # restore-on-close resumes everything sync stopped.
+        session.note_halted(c.name)
+        console.print(
+            f"[dim]sync:[/dim] {c.name} halted by the cross-trigger group"
+        )
+
+
+def _discover_cores(
+    ctx: Ctx, dap: Dap, *, refresh_states: bool = True
+) -> list[runcontrol.Core]:
+    """Discovered cores, from the session cache when there is one.
+
+    ``refresh_states=False`` skips the per-core state re-read (two DP/AP
+    transactions per core, every command) for callers that go on to select a
+    single core and refresh just that one -- see _one_core. Commands that
+    report or act on *all* cores keep the default.
+    """
     session = ctx.session
     if session is not None and session.cores is not None:
-        # Identity is stable for the life of the connection; run state is not.
-        # Serving the cache with stale state made `status` report a core as
-        # running that the previous session command had halted.
-        for c in session.cores:
-            c.state = runcontrol.read_state(dap, c.debug_base)
-            # A core this session already unlocked cannot legitimately read
-            # OS-locked or in-reset again except through a core-local cold
-            # reset (the application cycling its RGM reset -- guide §3.6:
-            # comparators wiped, OS lock back). The session's records about it
-            # describe a machine that no longer exists; drop them so the next
-            # touch re-unlocks and re-sanitises (§5.7).
-            if (
-                c.name in session.sanitized
-                and c.state.edprsr is not None
-                and c.state.edprsr & (r52debug.EDPRSR_R | r52debug.EDPRSR_OSLK)
-            ):
-                session.note_core_reset(c.name)
-                console.print(
-                    f"[yellow]![/yellow] {c.name} was reset since this session "
-                    "last touched it (identity cache kept; frame addresses are "
-                    "stable). Its session breakpoint/halt records were dropped; "
-                    "it will be re-unlocked and re-sanitised on next touch."
-                )
-            if (
-                session.sync
-                and c.state.halted is True
-                and c.name not in session.halted_r52
-            ):
-                # A hardware-initiated stop (a breakpoint hit propagated by
-                # the armed group) with nobody watching: take ownership so
-                # restore-on-close resumes everything sync stopped.
-                session.note_halted(c.name)
-                console.print(
-                    f"[dim]sync:[/dim] {c.name} halted by the cross-trigger group"
-                )
+        if refresh_states:
+            for c in session.cores:
+                _refresh_core_state(ctx, dap, c)
         return session.cores
 
     for note in _prepare_dap(dap, ctx=ctx):
@@ -1445,6 +1472,14 @@ def core_resume(ctx: Ctx, core_spec: str | None, all_cores: bool, sync: bool) ->
             if ctx.session is not None and not state.rehalted:
                 ctx.session.note_resumed(name)
             if state.rehalted:
+                if ctx.session is not None:
+                    # The stop already happened inside this resume (measured:
+                    # a breakpoint in the idle loop re-hits before the restart
+                    # is even confirmed). halted_r52 must keep the name -- the
+                    # close-out restore still owes this core a resume -- but
+                    # the halt monitor should push the stop so a frontend
+                    # reacts without waiting for its fallback poll.
+                    ctx.session.monitor_watch.add(name)
                 c = runcontrol.resolve(name, cores)
                 where = runcontrol.halt_location(dap, c)
                 console.print(
@@ -1845,11 +1880,10 @@ def core_regs(ctx: Ctx, core_spec: str | None) -> None:
     """
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        cores = _discover_cores(ctx, dap)
-        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
+        c = _select_one_core(ctx, dap, core_spec)
         runcontrol.preflight(c, write=True)
 
-        regs = runcontrol.read_registers(dap, c)
+        regs = _cached_registers(ctx, dap, c)
         if not regs.path_verified:
             for note in regs.notes:
                 console.print(f"[red]![/red] {note}")
@@ -1912,6 +1946,8 @@ def core_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> N
             if data is not None:
                 writer(dap, c, data)
             got = reader(dap, c)
+        if data is not None and ctx.session is not None:
+            ctx.session.note_target_written()
         console.print(f"{c.name}  {label} = 0x{got:08X}")
         if ctx.json_out:
             _emit_json(ctx.json_out, {"core": c.name, "register": label, "value": f"0x{got:08X}"})
@@ -1952,12 +1988,20 @@ def _one_m33(ctx: Ctx, core_spec: str | None, *, write: bool = True):
         assert dap is not None
         for note in _prepare_dap(dap, ctx=ctx):
             console.print(f"[dim]note:[/dim] {note}")
-        cores = m33_mod.discover(dap)
-        if ctx.session is not None:
-            # The session's restore-on-close needs live core objects.
-            ctx.session.m33_cores = cores
-            if core_spec is None:
-                core_spec = ctx.session.m33_focus
+        session = ctx.session
+        cached = session is not None and session.m33_cores is not None
+        if cached:
+            # Identity is stable for the life of the connection; only the
+            # selected core's run state is re-read below. Re-discovering all
+            # three subsystems on every command cost tens of transactions.
+            cores = session.m33_cores
+        else:
+            cores = m33_mod.discover(dap)
+            if session is not None:
+                # The session's restore-on-close needs live core objects.
+                session.m33_cores = cores
+        if session is not None and core_spec is None:
+            core_spec = session.m33_focus
         if core_spec is None:
             raise click.ClickException(
                 "say which core: --core " + "|".join(m33_mod.M33_APS)
@@ -1966,6 +2010,8 @@ def _one_m33(ctx: Ctx, core_spec: str | None, *, write: bool = True):
             c = m33_mod.resolve(core_spec, cores)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+        if cached:
+            m33_mod.quick_status(dap, c)
         for note in m33_mod.preflight(c, write=write):
             console.print(f"[yellow]![/yellow] {c.name}: {note}")
         if write:
@@ -2086,7 +2132,7 @@ def m33_regs(ctx: Ctx, core_spec: str | None) -> None:
     the context you halted to inspect.
     """
     with _one_m33(ctx, core_spec) as (dap, c):
-        values = m33_mod.read_registers(dap, c)
+        values = _cached_m33_registers(ctx, dap, c)
         emit.print_m33_registers(c.name, values, console)
         if ctx.json_out:
             _emit_json(
@@ -2114,6 +2160,8 @@ def m33_reg(ctx: Ctx, name: str, value: str | None, core_spec: str | None) -> No
         try:
             if data is not None:
                 m33_mod.write_register(dap, c, key, data)
+                if ctx.session is not None:
+                    ctx.session.note_target_written()
             result = m33_mod.read_register(dap, c, key)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from None
@@ -2359,13 +2407,26 @@ def _attach_core(ctx: Ctx, dap: Dap, c: runcontrol.Core, *, write: bool = True) 
         _session_touch(ctx, dap, c)
 
 
+def _select_one_core(ctx: Ctx, dap: Dap, core_spec: str | None) -> runcontrol.Core:
+    """Select one core by identity, refreshing only that core's run state.
+
+    Selection needs identity alone, which the session cache serves without
+    target traffic; the state re-read of every *other* core (two transactions
+    each, on every single command) is what this exists to avoid.
+    """
+    cores = _discover_cores(ctx, dap, refresh_states=False)
+    c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
+    if ctx.session is not None and ctx.session.cores is not None:
+        _refresh_core_state(ctx, dap, c)
+    return c
+
+
 @contextmanager
 def _one_core(ctx: Ctx, core_spec: str | None, *, write: bool = True):
     """Open a session, discover, select one core, preflight it via _attach_core."""
     with open_transport(ctx) as (_t, dap):
         assert dap is not None
-        cores = _discover_cores(ctx, dap)
-        c = _select_cores(core_spec, False, cores, default=_focus(ctx))[0]
+        c = _select_one_core(ctx, dap, core_spec)
         _attach_core(ctx, dap, c, write=write)
         yield dap, c
 
@@ -2658,19 +2719,96 @@ def _ide_target(ctx: Ctx, core_spec: str | None) -> tuple[str, str]:
     return family, spec
 
 
-def _ap_word_reader(dap: Dap, ap_base: int):
-    """A cached word reader over one AP for the unwinder. Faults become None."""
-    cache: dict[int, int | None] = {}
+def _cached_registers(ctx: Ctx, dap: Dap, c: runcontrol.Core) -> runcontrol.Registers:
+    """R52 read_registers through the session's per-stop cache.
+
+    Registers cannot move while a core stays halted, and every path that does
+    move them -- step, resume, reset, a register or memory write -- bumps a
+    session generation that drops this cache. One IDE stop asks for them up
+    to five times (regs, stack, locals, every watch); one hardware read
+    (~100 transactions) serves them all.
+    """
+    session = ctx.session
+    if session is None:
+        return runcontrol.read_registers(dap, c)
+    reg_cache, _ = session.read_caches()
+    regs = reg_cache.get(c.name)
+    if regs is None:
+        regs = runcontrol.read_registers(dap, c)
+        reg_cache[c.name] = regs
+    return regs
+
+
+def _cached_m33_registers(ctx: Ctx, dap: Dap, c) -> dict[str, int]:
+    """M33 read_registers through the same per-stop cache as the R52s."""
+    session = ctx.session
+    if session is None:
+        return m33_mod.read_registers(dap, c)
+    reg_cache, _ = session.read_caches()
+    key = f"m33:{c.name}"
+    values = reg_cache.get(key)
+    if values is None:
+        values = m33_mod.read_registers(dap, c)
+        reg_cache[key] = values
+    return values
+
+
+def _ap_word_reader(ctx: Ctx, dap: Dap, ap_base: int, *, live: bool = False):
+    """A cached word reader over one AP for the unwinder. Faults become None.
+
+    The cache lives on the session, keyed by the run/data generations: the
+    unwinder re-walks the same stack words for `stack`, then for `var locals`,
+    then for every `var watch` of one stop, and nothing a halted core owns
+    changes in between. ``live=True`` is for reads of a RUNNING core (the
+    ~1 Hz watch refresh), whose memory moves under the debugger -- those get
+    a per-call cache only. Without a session (one-shot CLI) it is per-call.
+    """
+    session = ctx.session
+    cache: dict[tuple[int, int], int | None]
+    if session is None or live:
+        cache = {}
+    else:
+        _, cache = session.read_caches()
 
     def read_word(addr: int) -> int | None:
         a = addr & ~3 & 0xFFFFFFFF
-        if a not in cache:
+        key = (ap_base, a)
+        if key not in cache:
             try:
-                cache[a] = memaccess.read_words(dap, ap_base, a, 1)[0]
+                cache[key] = memaccess.read_words(dap, ap_base, a, 1)[0]
             except S32EError:
-                cache[a] = None
-        return cache[a]
+                cache[key] = None
+        return cache[key]
 
+    def prefetch(addr: int, count: int) -> None:
+        """Pull a window into the cache with one auto-increment block read --
+        ~1 transaction per word instead of ~7 for checked singles.
+
+        Best effort by design: clipped to the known RAM/flash windows, shrunk
+        when a block faults (a latched sticky error poisons the whole block,
+        so a faulting window cannot be kept), silent when it cannot help.
+        read_word's per-word path stays the truth and localises any fault.
+        """
+        a = addr & ~3 & 0xFFFFFFFF
+        for lo, hi in symunwind.SANE_RANGES:
+            if lo <= a < hi:
+                count = min(count, (hi - a) // 4)
+                break
+        else:
+            return
+        while count >= 4:
+            if all((ap_base, a + 4 * i) in cache for i in range(count)):
+                return
+            try:
+                values = memaccess.read_words(dap, ap_base, a, count)
+            except S32EError:
+                count //= 2
+                continue
+            for i, w in enumerate(values):
+                cache[(ap_base, a + 4 * i)] = w
+            return
+
+    read_word.prefetch = prefetch  # type: ignore[attr-defined]
     return read_word
 
 
@@ -2814,15 +2952,20 @@ def stack_cmd(ctx: Ctx, core_spec: str | None, max_frames: int) -> None:
     if family == "r52":
         with _one_core(ctx, spec, write=False) as (dap, c):
             _require_halted_r52(c)
-            regs = runcontrol.read_registers(dap, c)
+            regs = _cached_registers(ctx, dap, c)
             pc, values, thumb = _r52_unwind_inputs(regs)
             _report, _notes = memaccess.preflight(dap, AP_AXI, write=False)
+            read_word = _ap_word_reader(ctx, dap, AP_AXI)
+            sp = values.get("r13")
+            if sp is not None:
+                # One burst fills the window the unwinder walks word-by-word.
+                read_word.prefetch(sp, min(16 * max_frames, 256))
             frames, reason = symunwind.unwind(
                 pc=pc,
-                sp=values.get("r13"),
+                sp=sp,
                 fp=values.get("r7" if thumb else "r11"),
                 lr=values.get("r14"),
-                read_word=_ap_word_reader(dap, AP_AXI),
+                read_word=read_word,
                 index=index,
                 max_frames=max_frames,
                 thumb_r7=thumb,
@@ -2833,13 +2976,17 @@ def stack_cmd(ctx: Ctx, core_spec: str | None, max_frames: int) -> None:
             m33_mod.quick_status(dap, c)
             if c.halted is not True:
                 raise click.ClickException(f"{c.name} is not halted -- halt it first")
-            values = m33_mod.read_registers(dap, c)
+            values = _cached_m33_registers(ctx, dap, c)
+            read_word = _ap_word_reader(ctx, dap, c.ap_base)
+            sp = values.get("sp")
+            if sp is not None:
+                read_word.prefetch(sp, min(16 * max_frames, 256))
             frames, reason = symunwind.unwind(
                 pc=values["pc"],
-                sp=values.get("sp"),
+                sp=sp,
                 fp=values.get("r7"),
                 lr=values.get("lr"),
-                read_word=_ap_word_reader(dap, c.ap_base),
+                read_word=read_word,
                 index=index,
                 max_frames=max_frames,
                 thumb_r7=True,
@@ -3045,6 +3192,205 @@ def _step_to_next_line(
     return pc, steps, "max-steps", None
 
 
+#: Condition suffixes a branch mnemonic may carry ("beq", "blls", ...).
+_ARM_CONDS = frozenset((
+    "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc",
+    "hi", "ls", "ge", "lt", "gt", "le", "al",
+))
+
+#: Mnemonics a range-run may never run through: anything that moves the PC
+#: somewhere a comparator at the next line boundary would not catch, plus
+#: blocking/mode-changing instructions.
+_FLOW_MNEMONICS = frozenset((
+    "b", "bl", "bx", "blx", "bxj", "cbz", "cbnz", "tbb", "tbh",
+    "wfi", "wfe", "svc", "hvc", "smc", "bkpt", "udf", "eret", "rfe",
+    "rfeia", "rfeib", "rfeda", "rfedb", "hlt",
+))
+
+
+def _is_control_flow(insn: symdisasm.Insn) -> bool:
+    """Whether a range-run must stop BEFORE this instruction and step it."""
+    m = insn.mnemonic.split(".")[0].lower()
+    if m in _FLOW_MNEMONICS or m.startswith("it"):
+        return True
+    for base in ("b", "bl", "bx", "blx"):
+        if m.startswith(base) and m[len(base):] in _ARM_CONDS:
+            return True
+    ops = insn.op_str.lower()
+    if "pc" in ops:
+        # pop {..., pc}, ldm ... {..., pc}, ldr pc / mov pc / add pc -- any
+        # write to the PC. "pc" as a plain operand of a non-writing
+        # instruction (add r0, pc, #x) is over-matched, which only costs a
+        # single-step where a run was possible: safe, never wrong.
+        return True
+    if m.startswith(".") or m == "udf":
+        return True  # capstone skipdata: bytes it could not decode
+    return False
+
+
+def _it_extra_steps(insn: symdisasm.Insn) -> int:
+    """How many predicated slots an IT instruction opens (itte -> 3)."""
+    m = insn.mnemonic.split(".")[0].lower()
+    if not m.startswith("it"):
+        return 0
+    return max(1, len(m) - 1)
+
+
+def _stepline_hop(
+    ctx: Ctx,
+    dap: Dap,
+    c: runcontrol.Core,
+    target: int,
+    index,
+    *,
+    timeout_s: float = 2.0,
+) -> tuple[str, int | None]:
+    """One comparator run to ``target``: ("reached"|"elsewhere"|"timeout"|
+    "no-slot", pc-after). Interrupt masking is the CALLER's (held across the
+    whole stepline); a timeout halts the core -- a source step may never
+    leave it running. resume() itself decides from the comparator shadow
+    whether a step-off is really owed at the current PC.
+    """
+    session = ctx.session
+    thumb = symdisasm.pick_mode(index, target) != "arm"
+    try:
+        entry = runcontrol.set_breakpoint(dap, c, target, thumb=thumb)
+    except S32EError:
+        return "no-slot", None
+    slot = int(entry["index"])
+    try:
+        runcontrol.resume(dap, c)
+        if session is not None:
+            session.note_resumed(c.name)
+        halted = _wait_halt_r52(dap, c, timeout_s)
+        timed_out = not halted
+        if timed_out:
+            runcontrol.halt(dap, c)
+    finally:
+        runcontrol.clear_breakpoint(dap, c, slot)
+    if session is not None:
+        session.note_halted(c.name)
+    pc = runcontrol.read_pc(dap, c)
+    if timed_out:
+        return "timeout", pc
+    if (pc & ~1) != (target & ~1):
+        # Something else stopped the run first -- a user breakpoint or
+        # watchpoint inside the line. That is a legitimate stop to honour.
+        return "elsewhere", pc
+    return "reached", pc
+
+
+def _step_line_ranged(
+    ctx: Ctx,
+    dap: Dap,
+    c: runcontrol.Core,
+    index,
+    pc0: int,
+    start_hit,
+    max_steps: int,
+    loop_guard: bool,
+    over: bool,
+) -> tuple[int, int, str, int | None] | None:
+    """Range-stepping `_step_to_next_line`: comparator-run the straight-line
+    stretches, hardware-step only actual control flow.
+
+    Same contract and stop reasons as the legacy loop, plus "breakpoint"
+    (a user comparator fired inside the line -- honoured, not skipped) and
+    "timeout" (a run stalled; the core was halted). The budget counts UNITS
+    of work -- one hop or one step each -- so it bounds wall time exactly as
+    before. Returns None when range mode cannot even start (no ELF bytes at
+    the PC); the caller falls back to the legacy loop.
+
+    Interrupts are masked across the WHOLE walk -- the same EDSCR.INTdis
+    masking `step` applies per instruction, held once instead of toggled per
+    unit -- so the semantics match today's stepping exactly.
+    """
+    if index.bytes_at(pc0 & ~1, 4) is None:
+        return None
+    dis = symdisasm.Disassembler()
+    pc = pc0
+    units = 0
+    seen = {pc0}
+    predicated_left = 0
+    hops_usable = True
+
+    def line_changed(at: int) -> bool:
+        hit = index.addr_to_line(at)
+        return hit is not None and (hit.file, hit.line) != (
+            start_hit.file, start_hit.line
+        )
+
+    masked = runcontrol.set_interrupt_mask_for_run(dap, c)
+    try:
+        while units < max_steps:
+            mode = symdisasm.pick_mode(index, pc)
+            data = index.bytes_at(pc & ~1, 8)
+            insn = dis.first(data, pc & ~1, mode) if data is not None else None
+            boundary = index.next_line_boundary(
+                pc, file=start_hit.file, line=start_hit.line
+            )
+
+            hop_target: int | None = None
+            if (
+                hops_usable
+                and predicated_left == 0
+                and insn is not None
+                and not _is_control_flow(insn)
+                and boundary is not None
+            ):
+                # Scan the straight-line stretch: the run may extend to the
+                # first control-flow instruction or the line boundary,
+                # whichever comes first.
+                span = index.bytes_at(pc & ~1, boundary - (pc & ~1))
+                if span is not None:
+                    hop_target = boundary
+                    for scanned in dis.disassemble(span, pc & ~1, mode):
+                        if _is_control_flow(scanned):
+                            hop_target = scanned.addr
+                            break
+                if hop_target is not None and hop_target <= (pc & ~1) + insn.size:
+                    hop_target = None  # one instruction away: a step is cheaper
+
+            if hop_target is not None:
+                outcome, new_pc = _stepline_hop(ctx, dap, c, hop_target, index)
+                if outcome == "no-slot":
+                    # Every comparator is armed (the operator's breakpoints):
+                    # keep stepping -- correct, just slower.
+                    hops_usable = False
+                    continue
+                units += 1
+                assert new_pc is not None
+                if outcome == "timeout":
+                    return new_pc, units, "timeout", None
+                if outcome == "elsewhere":
+                    return new_pc, units, "breakpoint", None
+            else:
+                if over:
+                    runcontrol.step_over(dap, c)
+                else:
+                    runcontrol.step(dap, c)
+                units += 1
+                if predicated_left > 0:
+                    predicated_left -= 1
+                elif insn is not None:
+                    predicated_left = _it_extra_steps(insn)
+                new_pc = runcontrol.read_pc(dap, c)
+
+            if new_pc == pc:
+                return new_pc, units, "no-progress", None
+            pc = new_pc
+            if line_changed(pc):
+                return pc, units, "line-change", None
+            # Checked after the line test so a cycle that leaves the line on
+            # this very unit is still reported as the line-change it is.
+            if loop_guard and pc in seen:
+                return pc, units, "loop", pc
+            seen.add(pc)
+        return pc, units, "max-steps", None
+    finally:
+        runcontrol.restore_interrupt_mask(dap, c, masked)
+
+
 @main.command("stepline")
 @_core_option
 @click.option("--over", is_flag=True, help="Treat calls as one step (uses the "
@@ -3055,14 +3401,23 @@ def _step_to_next_line(
                    "the line (an infinite loop on one source line, e.g. the "
                    "AUTOSAR idle task). Disable to step the full --max-steps "
                    "budget, which is what a one-line data-dependent loop needs.")
+@click.option("--range-step/--no-range-step", default=True, show_default=True,
+              help="Comparator range-stepping: run straight-line stretches at "
+                   "silicon speed with a temporary hardware breakpoint at the "
+                   "next boundary, single-stepping only actual control flow. "
+                   "Interrupts stay masked exactly as with plain stepping. "
+                   "Falls back to the instruction-step loop when the ELF does "
+                   "not cover the PC or no comparator is free.")
 @click.pass_obj
 def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int,
-                 loop_guard: bool) -> None:
+                 loop_guard: bool, range_step: bool) -> None:
     """Step one SOURCE line: instruction-step until the line table row changes.
 
     Instructions with no line info (compiler glue) are stepped through. Stops
     with a reason: line-change, loop, max-steps, no-line-info (started outside
-    the line table; one instruction step is taken), or no-progress.
+    the line table; one instruction step is taken), no-progress, breakpoint
+    (a user comparator fired inside the line), or timeout (a range-run
+    stalled; the core was halted).
     """
     index = _require_symbols(ctx)
     family, spec = _ide_target(ctx, core_spec)
@@ -3077,12 +3432,21 @@ def stepline_cmd(ctx: Ctx, core_spec: str | None, over: bool, max_steps: int,
             loop_at = None
             pc = pc0
             if start_hit is not None:
-                pc, steps, stopped, loop_at = _step_to_next_line(
-                    (lambda: runcontrol.step_over(dap, c)) if over
-                    else (lambda: runcontrol.step(dap, c)),
-                    lambda: runcontrol.read_pc(dap, c),
-                    index, pc0, start_hit, max_steps, loop_guard,
-                )
+                ranged = None
+                if range_step:
+                    ranged = _step_line_ranged(
+                        ctx, dap, c, index, pc0, start_hit, max_steps,
+                        loop_guard, over,
+                    )
+                if ranged is not None:
+                    pc, steps, stopped, loop_at = ranged
+                else:
+                    pc, steps, stopped, loop_at = _step_to_next_line(
+                        (lambda: runcontrol.step_over(dap, c)) if over
+                        else (lambda: runcontrol.step(dap, c)),
+                        lambda: runcontrol.read_pc(dap, c),
+                        index, pc0, start_hit, max_steps, loop_guard,
+                    )
             else:
                 runcontrol.step(dap, c)
                 steps = 1
@@ -3248,14 +3612,14 @@ def stepout_cmd(ctx: Ctx, core_spec: str | None, timeout_s: float) -> None:
     if family == "r52":
         with _one_core(ctx, spec) as (dap, c):
             _require_halted_r52(c)
-            regs = runcontrol.read_registers(dap, c)
+            regs = _cached_registers(ctx, dap, c)
             pc, values, thumb = _r52_unwind_inputs(regs)
             frames, reason = symunwind.unwind(
                 pc=pc,
                 sp=values.get("r13"),
                 fp=values.get("r7" if thumb else "r11"),
                 lr=values.get("r14"),
-                read_word=_ap_word_reader(dap, AP_AXI),
+                read_word=_ap_word_reader(ctx, dap, AP_AXI),
                 index=index,
                 max_frames=2,
                 thumb_r7=thumb,
@@ -3268,13 +3632,13 @@ def stepout_cmd(ctx: Ctx, core_spec: str | None, timeout_s: float) -> None:
             name = c.name
     else:
         with _one_m33(ctx, spec) as (dap, c):
-            values = m33_mod.read_registers(dap, c)
+            values = _cached_m33_registers(ctx, dap, c)
             frames, reason = symunwind.unwind(
                 pc=values["pc"],
                 sp=values.get("sp"),
                 fp=values.get("r7"),
                 lr=values.get("lr"),
-                read_word=_ap_word_reader(dap, c.ap_base),
+                read_word=_ap_word_reader(ctx, dap, c.ap_base),
                 index=index,
                 max_frames=2,
                 thumb_r7=True,
@@ -3330,6 +3694,655 @@ def runto_cmd(ctx: Ctx, address: str, core_spec: str | None, timeout_s: float) -
         )
     if ctx.json_out:
         _emit_json(ctx.json_out, {"core": name, **result})
+
+
+# ---------------------------------------------------------------------------
+# var -- the Variables-view backend
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VarHandle:
+    """What a variables-view handle resolves to: enough to re-read or write.
+
+    Stored on the session keyed by id; the public handle text is
+    ``"<generation>:<id>"`` and dies with the generation (session.py)."""
+
+    family: str  # "r52" | "m33"
+    core: str
+    name: str
+    path: str
+    type_die: object
+    loc: symvars.Location
+    frame: int = 0
+    static: bool = False
+
+
+def _var_new_handle(ctx: Ctx, vh: VarHandle) -> str | None:
+    session = ctx.session
+    if session is None:
+        return None  # one-shot invocations have nothing to hang a handle on
+    hid = len(session.var_rows) + 1
+    session.var_rows[hid] = vh
+    return f"{session.var_generation}:{hid}"
+
+
+def _var_get_handle(ctx: Ctx, text: str) -> VarHandle:
+    session = ctx.session
+    if session is None:
+        raise click.ClickException("variable handles need a debug session")
+    try:
+        gen_s, id_s = text.split(":", 1)
+        gen, hid = int(gen_s), int(id_s)
+    except ValueError:
+        raise click.ClickException(f"malformed handle {text!r}") from None
+    if gen != session.var_generation or hid not in session.var_rows:
+        raise click.ClickException(
+            "stale-handle: the target ran since this row was fetched -- "
+            "re-fetch the view"
+        )
+    return session.var_rows[hid]
+
+
+def _var_generation(ctx: Ctx) -> int:
+    return ctx.session.var_generation if ctx.session is not None else 0
+
+
+def _var_row(
+    ctx: Ctx,
+    vindex,
+    vh: VarHandle,
+    read_word,
+    reg_file: dict[int, int] | None,
+    *,
+    existing_handle: str | None = None,
+) -> dict[str, object]:
+    tinfo = vindex.type_of(vh.type_die)
+    value, error = symvars.read_value(vh.loc, tinfo, read_word, reg_file)
+    expandable = (
+        tinfo.expandable and vh.loc.kind == "memory" and error is None
+    )
+    if tinfo.kind == "pointer" and symvars.is_char_elem(tinfo):
+        expandable = False  # char* previews instead of expanding
+    handle = existing_handle
+    if handle is None and vh.loc.kind != "unavailable":
+        handle = _var_new_handle(ctx, vh)
+    return {
+        "handle": handle,
+        "name": vh.name,
+        "path": vh.path,
+        "type": tinfo.name,
+        "kind": tinfo.kind,
+        "value": value,
+        "address": (
+            f"0x{vh.loc.address:08X}" if vh.loc.kind == "memory" else None
+        ),
+        "register": f"r{vh.loc.reg}" if vh.loc.kind == "register" else None,
+        "size": tinfo.size,
+        "expandable": expandable,
+        "count": tinfo.count,
+        "static": vh.static,
+        "error": error if error is not None else vh.loc.reason,
+    }
+
+
+def _var_reader(ctx: Ctx, dap: Dap, c, family: str):
+    # A halted core's memory is stable until a run-state change or a write
+    # bumps the session generations; a running core's is not, so its reads
+    # must stay live (globals/expand can be asked for while running).
+    if family == "r52":
+        memaccess.preflight(dap, AP_AXI, write=False)
+        return _ap_word_reader(ctx, dap, AP_AXI, live=c.state.halted is not True)
+    memaccess.preflight(dap, c.ap_base, write=False)
+    return _ap_word_reader(ctx, dap, c.ap_base, live=c.halted is not True)
+
+
+def _var_frame_inputs(
+    ctx: Ctx, dap: Dap, c, family: str, frame_n: int, index, read_word
+):
+    """(frame, reg_file {dwarf num: value}, thumb) for locals/watch scope."""
+    if family == "r52":
+        regs = _cached_registers(ctx, dap, c)
+        pc, values, thumb = _r52_unwind_inputs(regs)
+        sp = values.get("r13")
+        fp = values.get("r7" if thumb else "r11")
+        lr = values.get("r14")
+    else:
+        values = _cached_m33_registers(ctx, dap, c)
+        pc = values["pc"] & ~1
+        sp, fp, lr = values.get("sp"), values.get("r7"), values.get("lr")
+        thumb = True
+    if sp is not None:
+        # Frame 0's saves and most of its locals live just above SP; one
+        # burst warms the shared per-stop cache for the unwind and the
+        # variable reads that follow.
+        prefetch = getattr(read_word, "prefetch", None)
+        if prefetch is not None:
+            prefetch(sp, min(64 * (frame_n + 1), 256))
+    frames, reason = symunwind.unwind(
+        pc=pc, sp=sp, fp=fp, lr=lr, read_word=read_word, index=index,
+        max_frames=max(frame_n + 1, 1), thumb_r7=thumb,
+    )
+    if len(frames) <= frame_n:
+        raise click.ClickException(
+            f"frame {frame_n} not available (unwind stopped: {reason})"
+        )
+    frame = frames[frame_n]
+    reg_file: dict[int, int] = {}
+    if frame_n == 0:
+        if family == "r52":
+            for i in range(15):
+                v = values.get(f"r{i}")
+                if v is not None:
+                    reg_file[i] = v
+            reg_file[15] = pc
+        else:
+            for i in range(13):
+                v = values.get(f"r{i}")
+                if v is not None:
+                    reg_file[i] = v
+            reg_file.update({13: values["sp"], 14: values["lr"], 15: pc})
+    else:
+        # Callee-saved registers beyond the frame pointer are not restored by
+        # the v1 unwinder: outer frames only know sp and fp.
+        if frame.sp is not None:
+            reg_file[13] = frame.sp
+        if frame.fp is not None:
+            reg_file[7 if thumb else 11] = frame.fp
+    return frame, reg_file, thumb
+
+
+def _var_scope(
+    ctx: Ctx, index, vindex, frame, reg_file: dict[int, int], thumb: bool
+):
+    """(FrameScope | None, cfa, cfa_source, FuncVars | None) for a frame."""
+    f = index.func_at(frame.pc)
+    fv = vindex.by_func_low.get(f.low) if f is not None else None
+    if fv is None:
+        return None, None, None, None
+    cfa, cfa_source = symvars.frame_cfa(
+        index, frame.pc, reg_file.get(13), reg_file.get(7 if thumb else 11),
+        thumb,
+    )
+    reg_value = lambda n: reg_file.get(n)  # noqa: E731
+    frame_base = symvars.make_frame_base(fv, cfa, cfa_source, reg_value)
+    scope = symvars.FrameScope(
+        func=fv, pc=frame.pc, frame_base=frame_base, reg_value=reg_value,
+        cu_file=fv.cu_name,
+    )
+    return scope, cfa, cfa_source, fv
+
+
+@main.group("var")
+def var() -> None:
+    """Variables: locals, globals and watch paths out of the loaded symbols.
+
+    The Variables-view backend. Rows carry session handles the frontend uses
+    for lazy expansion, batched live refresh and writes; a handle dies the
+    moment the target's run state changes (the addresses it described may no
+    longer exist), and a stale handle is refused rather than read. Needs
+    `sym load` and the ide extras.
+    """
+
+
+@var.command("locals")
+@_core_option
+@click.option("--frame", "frame_n", type=int, default=0, show_default=True,
+              help="Stack frame: 0 = innermost; deeper frames evaluate "
+                   "against the unwound frame base.")
+@click.pass_obj
+def var_locals(ctx: Ctx, core_spec: str | None, frame_n: int) -> None:
+    """A halted core's parameters, locals and function statics for one frame."""
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    family, spec = _ide_target(ctx, core_spec)
+    with (
+        _one_core(ctx, spec, write=False) if family == "r52"
+        else _one_m33(ctx, spec, write=False)
+    ) as (dap, c):
+        if family == "r52":
+            _require_halted_r52(c)
+        else:
+            m33_mod.quick_status(dap, c)
+            if c.halted is not True:
+                raise click.ClickException(f"{c.name} is not halted -- halt it first")
+        read_word = _var_reader(ctx, dap, c, family)
+        frame, reg_file, thumb = _var_frame_inputs(
+            ctx, dap, c, family, frame_n, index, read_word
+        )
+        scope, cfa, cfa_source, fv = _var_scope(
+            ctx, index, vindex, frame, reg_file, thumb
+        )
+        rows: list[dict[str, object]] = []
+        note: str | None = None
+        if fv is None:
+            note = f"no variable info for the code at 0x{frame.pc:08X}"
+        else:
+            reg_value = lambda n: reg_file.get(n)  # noqa: E731
+            for decl in [*fv.params, *fv.locals]:
+                if not decl.in_scope(frame.pc):
+                    continue
+                if decl.loc_attr is None:
+                    loc = symvars.Location(
+                        "unavailable", reason="no location (optimized out)"
+                    )
+                else:
+                    ops = symvars.location_ops(index._dwarf, decl, frame.pc)
+                    loc = symvars.evaluate(
+                        ops, frame_base=scope.frame_base, reg_value=reg_value
+                    )
+                rows.append(_var_row(
+                    ctx, vindex,
+                    VarHandle(family, c.name, decl.name, decl.name,
+                              decl.type_die, loc, frame_n),
+                    read_word, reg_file,
+                ))
+            for decl in fv.statics:
+                loc = symvars.Location("memory", address=decl.static_addr)
+                rows.append(_var_row(
+                    ctx, vindex,
+                    VarHandle(family, c.name, decl.name, decl.name,
+                              decl.type_die, loc, frame_n, static=True),
+                    read_word, reg_file,
+                ))
+        for row in rows:
+            value = row["value"]
+            shown = value["display"] if isinstance(value, dict) else row["error"]
+            console.print(f"{row['name']:<20} {row['type']:<24} {shown}")
+        if note:
+            console.print(f"[yellow]![/yellow] {note}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "core": c.name,
+                "frame": frame_n,
+                "func": fv.name if fv is not None else None,
+                "frame_pc": f"0x{frame.pc:08X}",
+                "cfa": f"0x{cfa:08X}" if cfa is not None else None,
+                "cfa_source": cfa_source,
+                "generation": _var_generation(ctx),
+                "variables": rows,
+                "note": note,
+            })
+
+
+@var.command("globals")
+@_core_option
+@click.option("--filter", "filter_s", default=None,
+              help="Case-insensitive substring filter on the name.")
+@click.option("--limit", type=int, default=100, show_default=True)
+@click.pass_obj
+def var_globals(
+    ctx: Ctx, core_spec: str | None, filter_s: str | None, limit: int
+) -> None:
+    """Program globals (external and static), filtered and paged.
+
+    Values are read for the shown page only -- a production image carries
+    tens of thousands of statics. Works against a running core: these are
+    plain memory reads, the same traffic the memory viewer generates.
+    """
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    family, spec = _ide_target(ctx, core_spec)
+    needle = (filter_s or "").lower()
+    matched = [
+        g for g in vindex.globals
+        if not needle or needle in g.name.lower()
+    ]
+    shown = matched[: max(limit, 1)]
+    with (
+        _one_core(ctx, spec, write=False) if family == "r52"
+        else _one_m33(ctx, spec, write=False)
+    ) as (dap, c):
+        read_word = _var_reader(ctx, dap, c, family)
+        rows = []
+        for g in shown:
+            if g.decl.static_addr is not None:
+                loc = symvars.Location("memory", address=g.decl.static_addr)
+            else:
+                ops = symvars.location_ops(index._dwarf, g.decl, None)
+                loc = symvars.evaluate(
+                    ops,
+                    frame_base=lambda: (None, "no frame"),
+                    reg_value=lambda n: None,
+                )
+            rows.append(_var_row(
+                ctx, vindex,
+                VarHandle(family, c.name, g.name, g.name, g.decl.type_die,
+                          loc, static=not g.external),
+                read_word, None,
+            ))
+        console.print(
+            f"{len(shown)} of {len(matched)} matching global(s)"
+            + (f" (filter: {filter_s})" if filter_s else "")
+        )
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "core": c.name,
+                "generation": _var_generation(ctx),
+                "total": len(matched),
+                "shown": len(shown),
+                "variables": rows,
+            })
+
+
+@var.command("expand")
+@click.argument("handle")
+@click.option("--children-from", "start", type=int, default=0, show_default=True)
+@click.option("--limit", type=int, default=100, show_default=True)
+@click.pass_obj
+def var_expand(ctx: Ctx, handle: str, start: int, limit: int) -> None:
+    """Children of an expandable row: struct members, array pages, pointees."""
+    vh = _var_get_handle(ctx, handle)
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    if vh.loc.kind != "memory" or vh.loc.address is None:
+        raise click.ClickException("only memory-located rows expand")
+    with (
+        _one_core(ctx, vh.core, write=False) if vh.family == "r52"
+        else _one_m33(ctx, vh.core, write=False)
+    ) as (dap, c):
+        read_word = _var_reader(ctx, dap, c, vh.family)
+        tinfo = vindex.type_of(vh.type_die)
+        base_addr = vh.loc.address
+        base_path = vh.path
+        note: str | None = None
+        more_from: int | None = None
+        rows: list[dict[str, object]] = []
+
+        if tinfo.kind == "pointer":
+            data = symvars.read_bytes(base_addr, 4, read_word)
+            if data is None:
+                raise click.ClickException(
+                    f"the pointer at 0x{base_addr:08X} did not read"
+                )
+            target = int.from_bytes(data, "little") & ~1
+            if target == 0:
+                note = "NULL pointer"
+                tinfo = None  # nothing to expand
+            else:
+                elem_info = vindex.type_of(tinfo.elem)
+                if elem_info.kind in ("struct", "union", "array"):
+                    base_addr = target
+                    vh = VarHandle(vh.family, vh.core, vh.name, vh.path,
+                                   tinfo.elem, symvars.Location("memory", address=target),
+                                   vh.frame, vh.static)
+                    tinfo = elem_info
+                else:
+                    rows.append(_var_row(
+                        ctx, vindex,
+                        VarHandle(vh.family, vh.core, f"*{vh.name}",
+                                  f"*{base_path}", tinfo.elem,
+                                  symvars.Location("memory", address=target),
+                                  vh.frame),
+                        read_word, None,
+                    ))
+                    tinfo = None
+
+        if tinfo is not None and tinfo.kind in ("struct", "union"):
+            for m in tinfo.members or []:
+                if m.error is not None or m.offset is None:
+                    loc = symvars.Location("unavailable", reason=m.error or "no offset")
+                else:
+                    loc = symvars.Location(
+                        "memory", address=(base_addr + m.offset) & 0xFFFFFFFF
+                    )
+                rows.append(_var_row(
+                    ctx, vindex,
+                    VarHandle(vh.family, vh.core, m.name,
+                              f"{base_path}.{m.name}", m.type_die, loc,
+                              vh.frame),
+                    read_word, None,
+                ))
+        elif tinfo is not None and tinfo.kind == "array":
+            elem_info = vindex.type_of(tinfo.elem)
+            if elem_info.size is None:
+                raise click.ClickException(
+                    f"element size of {tinfo.name} is unknown"
+                )
+            end = start + max(limit, 1)
+            if tinfo.count is not None:
+                end = min(end, tinfo.count)
+            for i in range(start, end):
+                loc = symvars.Location(
+                    "memory",
+                    address=(base_addr + i * elem_info.size) & 0xFFFFFFFF,
+                )
+                rows.append(_var_row(
+                    ctx, vindex,
+                    VarHandle(vh.family, vh.core, f"[{i}]",
+                              f"{base_path}[{i}]", tinfo.elem, loc, vh.frame),
+                    read_word, None,
+                ))
+            if tinfo.count is None or end < tinfo.count:
+                more_from = end
+        elif tinfo is not None and tinfo.kind not in ("pointer",):
+            raise click.ClickException(f"{tinfo.name} does not expand")
+
+        console.print(f"{len(rows)} child(ren) of {base_path}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "generation": _var_generation(ctx),
+                "parent": handle,
+                "children": rows,
+                "more_from": more_from,
+                "note": note,
+            })
+
+
+@var.command("watch")
+@click.argument("path_text")
+@_core_option
+@click.option("--frame", "frame_n", type=int, default=0, show_default=True)
+@click.pass_obj
+def var_watch(ctx: Ctx, path_text: str, core_spec: str | None, frame_n: int) -> None:
+    """Evaluate one watch path: `counter`, `cfg.limits[2].max`, `*ptr`, `p->x`.
+
+    On a halted core names resolve locals-first in the given frame; on a
+    running core only statics and globals are reachable.
+    """
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    family, spec = _ide_target(ctx, core_spec)
+    try:
+        path = symvars.parse_path(path_text)
+    except symvars.PathError as exc:
+        raise click.ClickException(str(exc)) from None
+    with (
+        _one_core(ctx, spec, write=False) if family == "r52"
+        else _one_m33(ctx, spec, write=False)
+    ) as (dap, c):
+        read_word = _var_reader(ctx, dap, c, family)
+        halted = c.state.halted is True if family == "r52" else (
+            m33_mod.quick_status(dap, c) and c.halted is True
+        )
+        scope = None
+        reg_file: dict[int, int] | None = None
+        if halted:
+            try:
+                frame, reg_file, thumb = _var_frame_inputs(
+                    ctx, dap, c, family, frame_n, index, read_word
+                )
+                scope, _cfa, _src, _fv = _var_scope(
+                    ctx, index, vindex, frame, reg_file, thumb
+                )
+            except (click.ClickException, S32EError):
+                scope = None  # degrade to globals-only resolution
+        try:
+            loc, type_die, _decl = symvars.resolve_path(
+                vindex, index._dwarf, path, scope=scope, read_word=read_word
+            )
+        except symvars.PathError as exc:
+            raise click.ClickException(str(exc)) from None
+        row = _var_row(
+            ctx, vindex,
+            VarHandle(family, c.name, path.text, path.text, type_die, loc,
+                      frame_n),
+            read_word, reg_file,
+        )
+        value = row["value"]
+        shown = value["display"] if isinstance(value, dict) else row["error"]
+        console.print(f"{path.text} = {shown}")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "generation": _var_generation(ctx),
+                "row": row,
+            })
+
+
+@var.command("write")
+@click.argument("handle")
+@click.argument("value_text", metavar="VALUE")
+@click.pass_obj
+def var_write(ctx: Ctx, handle: str, value_text: str) -> None:
+    """Write one scalar variable (memory- or register-located) and read back."""
+    vh = _var_get_handle(ctx, handle)
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    tinfo = vindex.type_of(vh.type_die)
+    if tinfo.kind in ("struct", "union", "array"):
+        raise click.ClickException(
+            f"{tinfo.name} is an aggregate -- edit its scalar members"
+        )
+    size = tinfo.size or 4
+    if size == 8:
+        raise click.ClickException("64-bit scalars are read-only in v1")
+    if size not in (1, 2, 4):
+        raise click.ClickException(f"unsupported scalar size {size}")
+    if vh.loc.kind == "unavailable":
+        raise click.ClickException(f"not writable: {vh.loc.reason}")
+    if vh.loc.kind == "register" and vh.frame != 0:
+        raise click.ClickException(
+            "register-located variables in outer frames are read-only"
+        )
+    raw = _var_parse_value(tinfo, value_text) & ((1 << (size * 8)) - 1)
+
+    with (
+        _one_core(ctx, vh.core) if vh.family == "r52"
+        else _one_m33(ctx, vh.core)
+    ) as (dap, c):
+        if vh.loc.kind == "memory":
+            assert vh.loc.address is not None
+            ap = AP_AXI if vh.family == "r52" else c.ap_base
+            memaccess.preflight(dap, ap, write=True)
+            memaccess.write_word(dap, ap, vh.loc.address, raw, size=size * 8)
+            readback = dap.mem_read(ap, vh.loc.address, size=size * 8)
+            reg_file = None
+        else:
+            assert vh.loc.reg is not None
+            if vh.family == "r52":
+                runcontrol.write_reg(dap, c, vh.loc.reg, raw)
+                readback = runcontrol.read_reg(dap, c, vh.loc.reg)
+            else:
+                name = {13: "sp", 14: "lr", 15: "pc"}.get(
+                    vh.loc.reg, f"r{vh.loc.reg}"
+                )
+                m33_mod.write_register(dap, c, name, raw)
+                readback = m33_mod.read_register(dap, c, name)
+            reg_file = {vh.loc.reg: readback}
+        if ctx.session is not None:
+            # The write moved target state under a halt; drop the read caches
+            # BEFORE building the reader, or the row below would render the
+            # stale pre-write word the locals fetch cached.
+            ctx.session.note_target_written()
+        read_word = _var_reader(ctx, dap, c, vh.family)
+        row = _var_row(
+            ctx, vindex, vh, read_word, reg_file, existing_handle=handle
+        )
+        digits = size * 2
+        console.print(
+            f"{vh.path}: wrote 0x{raw:0{digits}X}, reads back 0x{readback:0{digits}X}"
+        )
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "wrote": f"0x{raw:0{digits}X}",
+                "readback": f"0x{readback:0{digits}X}",
+                "match": readback == raw,
+                "row": row,
+            })
+
+
+def _var_parse_value(tinfo: symvars.TypeInfo, text: str) -> int:
+    s = text.strip()
+    kind = tinfo.kind
+    if kind == "bool":
+        if s.lower() in ("true", "1"):
+            return 1
+        if s.lower() in ("false", "0"):
+            return 0
+        raise click.ClickException(f"{s!r} is not a bool (true/false/1/0)")
+    if kind == "char" and len(s) == 3 and s[0] == s[2] == "'":
+        return ord(s[1])
+    if kind == "float":
+        try:
+            return int.from_bytes(struct.pack("<f", float(s)), "little")
+        except (ValueError, OverflowError):
+            raise click.ClickException(f"{s!r} is not a float") from None
+    if kind == "enum" and tinfo.enum_names:
+        for value, name in tinfo.enum_names.items():
+            if name == s:
+                return value
+    try:
+        return int(s, 0)
+    except ValueError:
+        raise click.ClickException(
+            f"{s!r} is not a number (decimal or 0x hex)"
+            + (" or an enumerator name" if kind == "enum" else "")
+        ) from None
+
+
+@var.command("refresh")
+@click.argument("handles", nargs=-1, required=True)
+@click.pass_obj
+def var_refresh(ctx: Ctx, handles: tuple[str, ...]) -> None:
+    """Batch re-read of live rows -- the frontend's running-core refresh.
+
+    One connection, one cached reader per AP. A row that fails to read
+    carries its error; only a stale generation fails the whole command.
+    """
+    vhs = [_var_get_handle(ctx, h) for h in handles]
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    with open_transport(ctx) as (_t, dap):
+        assert dap is not None
+        for note in _prepare_dap(dap, ctx=ctx):
+            console.print(f"[dim]note:[/dim] {note}")
+        readers: dict[int, object] = {}
+
+        def reader_for(vh: VarHandle):
+            ap = AP_AXI if vh.family == "r52" else m33_mod.M33_APS[vh.core]
+            if ap not in readers:
+                memaccess.preflight(dap, ap, write=False)
+                # Live: this is the running-core refresh path, whose memory
+                # moves under the debugger between (and during) calls.
+                readers[ap] = _ap_word_reader(ctx, dap, ap, live=True)
+            return readers[ap]
+
+        rows = []
+        for text, vh in zip(handles, vhs):
+            if vh.loc.kind != "memory":
+                row = _var_row(
+                    ctx, vindex,
+                    VarHandle(vh.family, vh.core, vh.name, vh.path,
+                              vh.type_die,
+                              symvars.Location(
+                                  "unavailable",
+                                  reason="register rows do not live-refresh",
+                              ),
+                              vh.frame, vh.static),
+                    lambda a: None, None, existing_handle=text,
+                )
+            else:
+                row = _var_row(
+                    ctx, vindex, vh, reader_for(vh), None,
+                    existing_handle=text,
+                )
+            rows.append(row)
+        console.print(f"refreshed {len(rows)} row(s)")
+        if ctx.json_out:
+            _emit_json(ctx.json_out, {
+                "generation": _var_generation(ctx),
+                "rows": rows,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -3624,7 +4637,86 @@ def _session_repl(ctx: Ctx) -> None:
             break
 
 
-def _machine_loop(ctx: Ctx, mio: machine_mod.MachineIO) -> None:
+class _HaltMonitor(threading.Thread):
+    """Watches session-resumed cores and pushes ``stopped`` events.
+
+    Without this, a frontend discovers a breakpoint hit only by polling --
+    the reference extension polled at 1 Hz, so every continue paid up to a
+    second of pure detection latency. The watch list is precise: exactly the
+    cores the session resumed (session.monitor_watch, maintained by
+    note_resumed/note_halted), so a session with everything halted costs no
+    probe traffic at all. Each sweep takes the same lock as the command loop
+    -- the DLL, the DAP's SELECT/ops state and the Core objects are all
+    single-threaded by construction.
+    """
+
+    def __init__(
+        self,
+        ctx: Ctx,
+        mio: machine_mod.MachineIO,
+        lock: threading.Lock,
+        interval_s: float = 0.05,
+    ) -> None:
+        super().__init__(name="s32edbg-halt-monitor", daemon=True)
+        self.ctx = ctx
+        self.mio = mio
+        self.lock = lock
+        self.interval_s = interval_s
+        self.stop_flag = threading.Event()
+
+    def run(self) -> None:
+        while not self.stop_flag.wait(self.interval_s):
+            try:
+                with self.lock:
+                    if not self.stop_flag.is_set():
+                        self._sweep()
+            except Exception:
+                # The monitor must never take the session down; a failed
+                # sweep is dropped and the slow frontend poll still exists.
+                continue
+
+    def _sweep(self) -> None:
+        session = self.ctx.session
+        if session is None or not session.monitor_watch:
+            return
+        dap = session.dap
+        for c in list(session.cores or []):
+            if c.name not in session.monitor_watch:
+                continue
+            state = runcontrol.read_state(dap, c.debug_base)
+            c.state = state
+            if state.halted is True:
+                session.monitor_watch.discard(c.name)
+                location: dict[str, object] = {}
+                try:
+                    location = runcontrol.halt_location(dap, c)
+                except S32EError:
+                    pass
+                self.mio.emit({
+                    "event": "stopped",
+                    "family": "r52",
+                    "core": c.name,
+                    "status": r52debug.edscr_status_name(state.edscr or 0),
+                    "location": location,
+                })
+            elif state.halted is None:
+                # Unreachable (reset/locked): not a stop this thread can
+                # attribute; the frontend's slow poll owns exotic states.
+                session.monitor_watch.discard(c.name)
+        for mc in list(session.m33_cores or []):
+            if f"m33:{mc.name}" not in session.monitor_watch:
+                continue
+            m33_mod.quick_status(dap, mc)
+            if mc.halted is True:
+                session.monitor_watch.discard(f"m33:{mc.name}")
+                self.mio.emit({"event": "stopped", "family": "m33", "core": mc.name})
+            elif mc.halted is None:
+                session.monitor_watch.discard(f"m33:{mc.name}")
+
+
+def _machine_loop(
+    ctx: Ctx, mio: machine_mod.MachineIO, lock: threading.Lock
+) -> None:
     """Read protocol lines until EOF or `quit`, one envelope per line."""
     for raw in sys.stdin:
         line = raw.strip()
@@ -3632,7 +4724,20 @@ def _machine_loop(ctx: Ctx, mio: machine_mod.MachineIO) -> None:
             continue
         mio.seq += 1
         mio.take_payloads()  # drop anything a broken command left behind
-        outcome = _dispatch_outcome(ctx, line)
+        # Wall time and DP/AP transaction count per command, stamped on the
+        # envelope. One transaction is one USB round trip (~1 ms), so `ops` is
+        # the cost model: a command that took 900 ms and 850 ops is USB-bound;
+        # 900 ms and 40 ops is waiting on the target or the host.
+        #
+        # The lock serialises against the halt monitor: commands own the
+        # probe (and the ops counter) for their whole duration.
+        with lock:
+            dap = ctx.session.dap if ctx.session is not None else None
+            ops_before = getattr(dap, "ops", 0)
+            started = time.perf_counter()
+            outcome = _dispatch_outcome(ctx, line)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            ops_spent = getattr(dap, "ops", ops_before) - ops_before
         payloads = mio.take_payloads()
         result: object = payloads[0] if len(payloads) == 1 else (payloads or None)
         if outcome.kind == "quit":
@@ -3643,6 +4748,8 @@ def _machine_loop(ctx: Ctx, mio: machine_mod.MachineIO) -> None:
             "ok": outcome.kind == "ok",
             "cmd": outcome.cmd,
             "result": result,
+            "ms": round(elapsed_ms, 1),
+            "ops": ops_spent,
         }
         if outcome.kind != "ok":
             envelope["error"] = {"kind": outcome.kind, "message": outcome.message}
@@ -3761,7 +4868,16 @@ def debug_cmd(
                         m33_focus=session.m33_focus,
                         discovery_error=discovery_error,
                     )
-                    _machine_loop(ctx, mio)
+                    session_lock = threading.Lock()
+                    monitor = _HaltMonitor(ctx, mio, session_lock)
+                    monitor.start()
+                    try:
+                        _machine_loop(ctx, mio, session_lock)
+                    finally:
+                        # Joined before restore(): the close-out sequence must
+                        # not race a monitor sweep for the probe.
+                        monitor.stop_flag.set()
+                        monitor.join(timeout=2.0)
                 elif batch:
                     for line in batch:
                         if not _session_dispatch(ctx, line):

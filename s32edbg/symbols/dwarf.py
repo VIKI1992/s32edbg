@@ -70,6 +70,12 @@ class SymbolIndex:
     _fdes: list[tuple[int, int, Any]] = field(default_factory=list)
     _decoded_fde: dict[int, Any] = field(default_factory=dict)
     cfi_source: str = "none"
+    #: The pyelftools DWARFInfo, retained for the lazily-built variable index.
+    #: _load_functions already materialized every DIE in pyelftools' per-CU
+    #: cache, so keeping this extends that cache's lifetime rather than
+    #: adding a new peak.
+    _dwarf: Any = None
+    _variables: Any = None
 
     # -- construction --------------------------------------------------------
 
@@ -92,6 +98,7 @@ class SymbolIndex:
         index._load_symtab(elffile)
         if elffile.has_dwarf_info():
             dwarf = elffile.get_dwarf_info()
+            index._dwarf = dwarf
             index._load_lines(dwarf)
             index._load_functions(dwarf)
             index._load_cfi(dwarf)
@@ -196,6 +203,20 @@ class SymbolIndex:
             self._fdes.append((low, low + header["address_range"], entry))
         self._fdes.sort(key=lambda t: t[0])
 
+    def variables(self):
+        """The lazily-built variable/type index (see symbols/variables.py)."""
+        if self._variables is None:
+            from ..errors import S32EError
+
+            if self._dwarf is None:
+                raise S32EError(
+                    f"{self.path} carries no DWARF info -- no variables to show"
+                )
+            from .variables import VariableIndex
+
+            self._variables = VariableIndex.build(self._dwarf, self)
+        return self._variables
+
     # -- queries -------------------------------------------------------------
 
     def summary(self) -> dict[str, object]:
@@ -228,6 +249,25 @@ class SymbolIndex:
         if path is None or line is None:
             return None  # inside an end_sequence gap
         return LineHit(path, line)
+
+    def next_line_boundary(self, addr: int, *, file: str, line: int) -> int | None:
+        """First line-row start above ``addr`` whose (file, line) differs.
+
+        This is the nearest address where a source-line step could complete:
+        between here and there every instruction belongs to the same line (or
+        the same end_sequence gap), so a range-stepper may run straight
+        through. A gap row (path None) counts as a boundary -- code the line
+        table does not chart must be stepped, not run through blind.
+        """
+        addr &= ~1
+        rows = self.line_rows
+        i = bisect.bisect_right(rows, addr, key=lambda r: r[0])
+        while i < len(rows):
+            row_addr, path, row_line = rows[i]
+            if (path, row_line) != (file, line):
+                return row_addr
+            i += 1
+        return None
 
     def line_to_addrs(self, file: str, line: int) -> tuple[int | None, list[int]]:
         """Nearest following line with code: (actual line, its addresses)."""

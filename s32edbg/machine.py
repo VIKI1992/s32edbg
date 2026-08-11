@@ -26,6 +26,17 @@ The stream on stdout:
 
       {"seq":N, "event":"progress", "message":"..."}
 
+- Result envelopes carry ``"ms"`` (backend wall time) and ``"ops"`` (DP/AP
+  transactions -- one USB round trip each), so a slow command names its cost.
+- While a session-resumed core is running, a monitor thread watches it and
+  emits an asynchronous event line the moment it halts on its own (a
+  breakpoint or watchpoint firing)::
+
+      {"event":"stopped", "family":"r52", "core":"rtu0.1",
+       "status":"breakpoint", "location":{...}}
+
+  These arrive between envelopes, never inside one, and old readers can
+  ignore them; a frontend without event handling falls back to polling.
 - On close: ``{"event":"bye", "restore_notes":[...], "kept":false}`` and exit.
 
 ``seq`` is the 1-based count of non-empty input lines. The session dispatch is
@@ -46,6 +57,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from typing import Any, TextIO
 
 #: Placed in Ctx.json_out while machine mode runs. Truthy -- commands take
@@ -65,10 +77,16 @@ class MachineIO:
         #: stamped on progress events and the result envelope.
         self.seq = 0
         self._payloads: list[Any] = []
+        #: Serialises writes: the halt monitor thread emits asynchronous
+        #: `stopped` events between the command loop's envelopes, and an
+        #: interleaved half-line would break the one-JSON-per-line contract.
+        self._emit_lock = threading.Lock()
 
     def emit(self, obj: dict[str, Any]) -> None:
-        self.out.write(json.dumps(obj, default=str, separators=(",", ":")) + "\n")
-        self.out.flush()
+        line = json.dumps(obj, default=str, separators=(",", ":")) + "\n"
+        with self._emit_lock:
+            self.out.write(line)
+            self.out.flush()
 
     def event(self, name: str, **fields: Any) -> None:
         self.emit({"event": name, **fields})

@@ -1,0 +1,459 @@
+﻿note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! no Cortex-R52 debug frames answered. The debug clocks are off by default (RM 
+135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+session open with no cores discovered yet -- run `gates apply`, then `core 
+list`.
+error: no Cortex-R52 debug frames answered. The debug clocks are off by default
+(RM 135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+! `load` resets the whole SoC: every core reboots. Image: br1_rear.elf, 
+3,677,786 bytes in 11 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+load: smu: could not quiesce before the reset (smu: every identity register 
+read as zero. That is a poisoned debug port or an AP that answers with nothing,
+not a processor.) -- expected on a blank-flash board sitting in the BootROM 
+fail cascade (docs/virgin-board.md); proceeding, the reset with EDBGREQ latched
+catches it out of reset
+load: ce0: could not halt (ce0: every identity register read as zero. That is a
+poisoned debug port or an AP that answers with nothing, not a processor.) -- 
+continuing; the EDBGREQ latched over the reset will hold it anyway
+load: ce1: could not halt (ce1: every identity register read as zero. That is a
+poisoned debug port or an AP that answers with nothing, not a processor.) -- 
+continuing; the EDBGREQ latched over the reset will hold it anyway
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+load: SRAMC D0/D1/D2 ECC init verified (witness words read 0)
+load: parking rtu0.0 on a `b .` loop and releasing it into the halt
+load: RTU0 GPR CFG_CORE: split-lock (optional; lockstep default on denial): 
+skipped -- XRDC denies the debugger 0x76120000 (the access to 0x76120000 via 
+the AXI-AP faulted. XRDC can deny the debugger a region the cores reach freely;
+the 0x76xxxxxx RTU peripheral slice is one such region on this part.); the 
+register keeps its reset default
+rtu0.0: cleared the OS lock
+load: registered the AXI-AP with the DLL for WriteMem
+load: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+load: WriteMem failed at 0x32100000 (JLINK_WriteMem(0x32100000, 2048) returned 
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#1)
+load: wrote 0x32100000      2,048 bytes    1.80s       1.1 KB/s
+load: WriteMem failed at 0x32101200 (JLINK_WriteMem(0x32101200, 128) returned 
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#2)
+load: wrote 0x32101200        128 bytes    0.12s       1.1 KB/s
+load: WriteMem failed at 0x32101300 (JLINK_WriteMem(0x32101300, 52) returned -1
+-- not an unambiguous success under either return convention) -- rewriting this
+block via ADIv6; the fast path stays on for the next block (block fallback #3)
+load: wrote 0x32101300         50 bytes    0.10s       0.5 KB/s
+load: WriteMem failed at 0x32101500 (JLINK_WriteMem(0x32101500, 68) returned -1
+-- not an unambiguous success under either return convention) -- rewriting this
+block via ADIv6; the fast path stays on for the next block (block fallback #4)
+load: wrote 0x32101500         68 bytes    0.10s       0.7 KB/s
+load: WriteMem failed at 0x32101580 (JLINK_WriteMem(0x32101580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#5)
+load: WriteMem failed at 0x32105580 (JLINK_WriteMem(0x32105580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#6)
+load: WriteMem failed at 0x32109580 (JLINK_WriteMem(0x32109580, 12200) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#7)
+load: wrote 0x32101580     44,968 bytes   32.47s       1.4 KB/s
+load: WriteMem failed at 0x3210C528 (JLINK_WriteMem(0x3210C528, 4) returned -1 
+-- not an unambiguous success under either return convention) -- rewriting this
+block via ADIv6; the fast path stays on for the next block (block fallback #8)
+load: wrote 0x3210C528          4 bytes    0.08s       0.0 KB/s
+load: WriteMem failed at 0x3210C580 (JLINK_WriteMem(0x3210C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#9)
+load: WriteMem failed at 0x32110580 (JLINK_WriteMem(0x32110580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#10)
+load: WriteMem failed at 0x32114580 (JLINK_WriteMem(0x32114580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#11)
+load: WriteMem failed at 0x32118580 (JLINK_WriteMem(0x32118580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#12)
+load: WriteMem failed at 0x3211C580 (JLINK_WriteMem(0x3211C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#13)
+load: WriteMem failed at 0x32120580 (JLINK_WriteMem(0x32120580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#14)
+load: WriteMem failed at 0x32124580 (JLINK_WriteMem(0x32124580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#15)
+load: WriteMem failed at 0x32128580 (JLINK_WriteMem(0x32128580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#16)
+load: WriteMem failed at 0x3212C580 (JLINK_WriteMem(0x3212C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#17)
+load: WriteMem failed at 0x32130580 (JLINK_WriteMem(0x32130580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#18)
+load: WriteMem failed at 0x32134580 (JLINK_WriteMem(0x32134580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#19)
+load: WriteMem failed at 0x32138580 (JLINK_WriteMem(0x32138580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#20)
+load: WriteMem failed at 0x3213C580 (JLINK_WriteMem(0x3213C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#21)
+load: WriteMem failed at 0x32140580 (JLINK_WriteMem(0x32140580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#22)
+load: WriteMem failed at 0x32144580 (JLINK_WriteMem(0x32144580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#23)
+load: WriteMem failed at 0x32148580 (JLINK_WriteMem(0x32148580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#24)
+load: WriteMem failed at 0x3214C580 (JLINK_WriteMem(0x3214C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#25)
+load: WriteMem failed at 0x32150580 (JLINK_WriteMem(0x32150580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#26)
+load: WriteMem failed at 0x32154580 (JLINK_WriteMem(0x32154580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#27)
+load: WriteMem failed at 0x32158580 (JLINK_WriteMem(0x32158580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#28)
+load: WriteMem failed at 0x3215C580 (JLINK_WriteMem(0x3215C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#29)
+load: WriteMem failed at 0x32160580 (JLINK_WriteMem(0x32160580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#30)
+load: WriteMem failed at 0x32164580 (JLINK_WriteMem(0x32164580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#31)
+load: WriteMem failed at 0x32168580 (JLINK_WriteMem(0x32168580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#32)
+load: WriteMem failed at 0x3216C580 (JLINK_WriteMem(0x3216C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#33)
+load: WriteMem failed at 0x32170580 (JLINK_WriteMem(0x32170580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#34)
+load: WriteMem failed at 0x32174580 (JLINK_WriteMem(0x32174580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#35)
+load: WriteMem failed at 0x32178580 (JLINK_WriteMem(0x32178580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#36)
+load: WriteMem failed at 0x3217C580 (JLINK_WriteMem(0x3217C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#37)
+load: WriteMem failed at 0x32180580 (JLINK_WriteMem(0x32180580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#38)
+load: WriteMem failed at 0x32184580 (JLINK_WriteMem(0x32184580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#39)
+load: WriteMem failed at 0x32188580 (JLINK_WriteMem(0x32188580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#40)
+load: WriteMem failed at 0x3218C580 (JLINK_WriteMem(0x3218C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#41)
+load: WriteMem failed at 0x32190580 (JLINK_WriteMem(0x32190580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#42)
+load: WriteMem failed at 0x32194580 (JLINK_WriteMem(0x32194580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#43)
+load: WriteMem failed at 0x32198580 (JLINK_WriteMem(0x32198580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#44)
+load: WriteMem failed at 0x3219C580 (JLINK_WriteMem(0x3219C580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#45)
+load: WriteMem failed at 0x321A0580 (JLINK_WriteMem(0x321A0580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#46)
+load: WriteMem failed at 0x321A4580 (JLINK_WriteMem(0x321A4580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#47)
+load: WriteMem failed at 0x321A8580 (JLINK_WriteMem(0x321A8580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#48)
+load: WriteMem failed at 0x321AC580 (JLINK_WriteMem(0x321AC580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#49)
+load: WriteMem failed at 0x321B0580 (JLINK_WriteMem(0x321B0580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#50)
+load: WriteMem failed at 0x321B4580 (JLINK_WriteMem(0x321B4580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#51)
+load: WriteMem failed at 0x321B8580 (JLINK_WriteMem(0x321B8580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#52)
+load: WriteMem failed at 0x321BC580 (JLINK_WriteMem(0x321BC580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#53)
+load: WriteMem failed at 0x321C0580 (JLINK_WriteMem(0x321C0580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#54)
+load: WriteMem failed at 0x321C4580 (JLINK_WriteMem(0x321C4580, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#55)
+load: WriteMem failed at 0x321C8580 (JLINK_WriteMem(0x321C8580, 11512) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#56)
+load: wrote 0x3210C580    781,560 bytes  564.35s       1.4 KB/s
+load: WriteMem failed at 0x321CB280 (JLINK_WriteMem(0x321CB280, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#57)
+load: WriteMem failed at 0x321CF280 (JLINK_WriteMem(0x321CF280, 4496) returned 
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#58)
+load: wrote 0x321CB280     20,880 bytes   15.34s       1.3 KB/s
+load: WriteMem failed at 0x321D0480 (JLINK_WriteMem(0x321D0480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#59)
+load: WriteMem failed at 0x321D4480 (JLINK_WriteMem(0x321D4480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#60)
+load: WriteMem failed at 0x321D8480 (JLINK_WriteMem(0x321D8480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#61)
+load: WriteMem failed at 0x321DC480 (JLINK_WriteMem(0x321DC480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#62)
+load: WriteMem failed at 0x321E0480 (JLINK_WriteMem(0x321E0480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#63)
+load: WriteMem failed at 0x321E4480 (JLINK_WriteMem(0x321E4480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#64)
+load: WriteMem failed at 0x321E8480 (JLINK_WriteMem(0x321E8480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#65)
+load: WriteMem failed at 0x321EC480 (JLINK_WriteMem(0x321EC480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#66)
+load: WriteMem failed at 0x321F0480 (JLINK_WriteMem(0x321F0480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#67)
+load: WriteMem failed at 0x321F4480 (JLINK_WriteMem(0x321F4480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#68)
+load: WriteMem failed at 0x321F8480 (JLINK_WriteMem(0x321F8480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#69)
+load: WriteMem failed at 0x321FC480 (JLINK_WriteMem(0x321FC480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#70)
+load: WriteMem failed at 0x32200480 (JLINK_WriteMem(0x32200480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#71)
+load: WriteMem failed at 0x32204480 (JLINK_WriteMem(0x32204480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#72)
+load: WriteMem failed at 0x32208480 (JLINK_WriteMem(0x32208480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#73)
+load: WriteMem failed at 0x3220C480 (JLINK_WriteMem(0x3220C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#74)
+load: WriteMem failed at 0x32210480 (JLINK_WriteMem(0x32210480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#75)
+load: WriteMem failed at 0x32214480 (JLINK_WriteMem(0x32214480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#76)
+load: WriteMem failed at 0x32218480 (JLINK_WriteMem(0x32218480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#77)
+load: WriteMem failed at 0x3221C480 (JLINK_WriteMem(0x3221C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#78)
+load: WriteMem failed at 0x32220480 (JLINK_WriteMem(0x32220480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#79)
+load: WriteMem failed at 0x32224480 (JLINK_WriteMem(0x32224480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#80)
+load: WriteMem failed at 0x32228480 (JLINK_WriteMem(0x32228480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#81)
+load: WriteMem failed at 0x3222C480 (JLINK_WriteMem(0x3222C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#82)
+load: WriteMem failed at 0x32230480 (JLINK_WriteMem(0x32230480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#83)
+load: WriteMem failed at 0x32234480 (JLINK_WriteMem(0x32234480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#84)
+load: WriteMem failed at 0x32238480 (JLINK_WriteMem(0x32238480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#85)
+load: WriteMem failed at 0x3223C480 (JLINK_WriteMem(0x3223C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#86)
+load: WriteMem failed at 0x32240480 (JLINK_WriteMem(0x32240480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#87)
+load: WriteMem failed at 0x32244480 (JLINK_WriteMem(0x32244480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#88)
+load: WriteMem failed at 0x32248480 (JLINK_WriteMem(0x32248480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#89)
+load: WriteMem failed at 0x3224C480 (JLINK_WriteMem(0x3224C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#90)
+load: WriteMem failed at 0x32250480 (JLINK_WriteMem(0x32250480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#91)
+load: WriteMem failed at 0x32254480 (JLINK_WriteMem(0x32254480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#92)
+load: WriteMem failed at 0x32258480 (JLINK_WriteMem(0x32258480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#93)
+load: WriteMem failed at 0x3225C480 (JLINK_WriteMem(0x3225C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#94)
+load: WriteMem failed at 0x32260480 (JLINK_WriteMem(0x32260480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#95)
+load: WriteMem failed at 0x32264480 (JLINK_WriteMem(0x32264480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#96)
+load: WriteMem failed at 0x32268480 (JLINK_WriteMem(0x32268480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#97)
+load: WriteMem failed at 0x3226C480 (JLINK_WriteMem(0x3226C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#98)
+load: WriteMem failed at 0x32270480 (JLINK_WriteMem(0x32270480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#99)
+load: WriteMem failed at 0x32274480 (JLINK_WriteMem(0x32274480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#100)
+load: WriteMem failed at 0x32278480 (JLINK_WriteMem(0x32278480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#101)
+load: WriteMem failed at 0x3227C480 (JLINK_WriteMem(0x3227C480, 16384) returned
+-1 -- not an unambiguous success under either return convention) -- rewriting 
+this block via ADIv6; the fast path stays on for the next block (block fallback
+#102)

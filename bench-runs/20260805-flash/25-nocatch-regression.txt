@@ -1,0 +1,90 @@
+﻿note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! no Cortex-R52 debug frames answered. The debug clocks are off by default (RM 
+135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+session open with no cores discovered yet -- run `gates apply`, then `core 
+list`.
+! `load` resets the whole SoC: every core reboots. Image: br1_rear.elf, 
+3,677,786 bytes in 11 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+! Functional reset is asserted. RM Table 957 warns that accessing peripherals 
+or memory via the AXI-AP now can leave them inaccessible until a destructive 
+reset; AXI-AP traffic is blocked while this holds.
+load: smu: could not quiesce before the reset (smu: every identity register 
+read as zero. That is a poisoned debug port or an AP that answers with nothing,
+not a processor.) -- expected on a blank-flash board sitting in the BootROM 
+fail cascade (docs/virgin-board.md); proceeding, the reset with EDBGREQ latched
+catches it out of reset
+load: ce0: could not halt (ce0: every identity register read as zero. That is a
+poisoned debug port or an AP that answers with nothing, not a processor.) -- 
+continuing; the EDBGREQ latched over the reset will hold it anyway
+load: ce1: could not halt (ce1: every identity register read as zero. That is a
+poisoned debug port or an AP that answers with nothing, not a processor.) -- 
+continuing; the EDBGREQ latched over the reset will hold it anyway
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+load: SRAMC D0/D1/D2 ECC init verified (witness words read 0)
+load: parking rtu0.0 on a `b .` loop and releasing it into the halt
+load: RTU0 GPR CFG_CORE: split-lock (optional; lockstep default on denial): 
+skipped -- XRDC denies the debugger 0x76120000 (the access to 0x76120000 via 
+the AXI-AP faulted. XRDC can deny the debugger a region the cores reach freely;
+the 0x76xxxxxx RTU peripheral slice is one such region on this part.); the 
+register keeps its reset default
+rtu0.0: cleared the OS lock
+load: registered the AXI-AP with the DLL for WriteMem
+load: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+load: WriteMem fast path proven by full read-back of the first block (512 
+words)
+load: wrote 0x32100000      2,048 bytes    1.73s       1.2 KB/s
+load: wrote 0x32101200        128 bytes    0.01s       9.0 KB/s
+load: wrote 0x32101300         50 bytes    0.01s       3.4 KB/s
+load: wrote 0x32101500         68 bytes    0.01s       4.7 KB/s
+load: wrote 0x32101580     44,968 bytes    0.38s     116.3 KB/s
+load: wrote 0x3210C528          4 bytes    0.01s       0.5 KB/s
+load: wrote 0x3210C580    781,560 bytes    6.51s     117.2 KB/s
+load: wrote 0x321CB280     20,880 bytes    0.18s     110.7 KB/s
+load: wrote 0x321D0480  2,421,008 bytes   20.15s     117.3 KB/s
+load: wrote 0x3241F590     95,876 bytes    0.80s     116.6 KB/s
+load: wrote 0x32680000    311,196 bytes    2.59s     117.3 KB/s
+load: entry word at 0x32100020 verified (0x0000F04F)
+                loaded br1_rear.elf                
+┌────────────┬───────────┬──────┬────────┬────────┐
+│ LMA        │     Bytes │ Path │ Verify │   Time │
+├────────────┼───────────┼──────┼────────┼────────┤
+│ 0x32100000 │     2,048 │ dll  │ edges  │  1.73s │
+│ 0x32101200 │       128 │ dll  │ edges  │  0.01s │
+│ 0x32101300 │        50 │ dll  │ edges  │  0.01s │
+│ 0x32101500 │        68 │ dll  │ edges  │  0.01s │
+│ 0x32101580 │    44,968 │ dll  │ edges  │  0.38s │
+│ 0x3210C528 │         4 │ dll  │ edges  │  0.01s │
+│ 0x3210C580 │   781,560 │ dll  │ edges  │  6.51s │
+│ 0x321CB280 │    20,880 │ dll  │ edges  │  0.18s │
+│ 0x321D0480 │ 2,421,008 │ dll  │ edges  │ 20.15s │
+│ 0x3241F590 │    95,876 │ dll  │ edges  │  0.80s │
+│ 0x32680000 │   311,196 │ dll  │ edges  │  2.59s │
+└────────────┴───────────┴──────┴────────┴────────┘
+total 3,677,786 bytes in 32.41s (111 KB/s), fast path used, verify sampled
+rtu0.0 halted at the entry  PC 0x32100020  DSPSR 0x000001FA
+focus: rtu0.0 -- set breakpoints, then `resume` (or `continue`) when ready. 
+Quitting the session resumes the core unless --keep-on-exit.
+rtu0.0 running -- running (non-debug state)
+────────────────────── rtu0.1  (debug frame 0x00510000) ───────────────────────
+EDPRSR  0x000002A9  powered_up=True halted=False os_locked=True in_reset=False
+────────────────────── rtu0.1  (debug frame 0x00510000) ───────────────────────
+EDPRSR  0x000002A1  powered_up=True halted=False os_locked=True in_reset=False
+────────────────────── rtu0.0  (debug frame 0x00410000) ───────────────────────
+EDSCR   0x02054002  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x00000001  powered_up=True halted=False os_locked=False in_reset=False
+session closed

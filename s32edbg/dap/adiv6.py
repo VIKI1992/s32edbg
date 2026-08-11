@@ -25,6 +25,7 @@ addresses 0x0 and 0x4 -- ADIv6 Table B2-6:
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from ..data.expected_apmap import APBIC1_WINDOW, TWIN_AP_L1_OFFSET
@@ -162,6 +163,16 @@ class Dap:
         self.ap_read_pipelined = transport.ap_read_pipelined
         self._csw_cache: dict[int, int] = {}
         self._cfg_cache: dict[int, MemApConfig] = {}
+        #: DP/AP transactions issued through this object since construction.
+        #: One increment is one ReadAPDPReg/WriteAPDPReg call, which on the
+        #: DLL transport is one USB round trip (~1 ms) -- the unit every slow
+        #: operation is made of. Machine mode reports the per-command delta in
+        #: its envelopes, so a slow command names its own cost.
+        self.ops = 0
+        #: Last gates.GateReport read through this connection. Owned by
+        #: dap.gates (status(cached=True) / invalidate_status_cache); lives
+        #: here because the report describes this connection's target.
+        self.gates_report_cache = None
 
     # ---------------------------------------------------------------- DP ---
 
@@ -180,6 +191,7 @@ class Dap:
         ):
             return
         value = (addr & 0xFFFF_FFF0) | (bank & 0xF)
+        self.ops += 1
         self.t.dp_reg_write(DP_REG_SELECT, value)
         self._select_addr = addr & 0xFFFF_FFF0
         self._bank = bank & 0xF
@@ -199,11 +211,13 @@ class Dap:
         """Read a DP register at ``addr`` (0x0/0x4/0x8/0xC) in ``bank``."""
         if addr in (0x0, 0x4) and bank != self._bank:
             self._write_select(self._select_addr, bank)
+        self.ops += 1
         return self.t.dp_reg_read(addr >> 2)
 
     def dp_write(self, addr: int, value: int, bank: int = BANK_DPIDR) -> None:
         if addr in (0x0, 0x4) and bank != self._bank:
             self._write_select(self._select_addr, bank)
+        self.ops += 1
         self.t.dp_reg_write(addr >> 2, value)
 
     #: Why DP address 0x0 is unreadable over JTAG, in the operator's words.
@@ -266,6 +280,36 @@ class Dap:
         """Clear the sticky error flags by writing 1 to them (ADIv6 p58)."""
         self.write_ctrl_stat(self.read_ctrl_stat() | STICKYERR | STICKYCMP | STICKYORUN)
 
+    @contextmanager
+    def checked_span(self):
+        """One sticky clear + one CTRL/STAT check around MANY plain accesses.
+
+        The per-access checked wrappers cost two extra DP transactions per
+        32-bit value -- affordable for a dozen identity reads, ruinous for a
+        register-file sweep of ~50 accesses per stop. Inside a span, use the
+        plain mem_read/mem_write; STICKYERR is latching, so a fault anywhere
+        in the span is still set at the exit check and raises DapError.
+
+        Deliberately coarse: the span cannot say WHICH access faulted, and
+        every value read inside a dirty span is rubbish. Callers must treat
+        the DapError as "throw the whole batch away" and re-run the
+        per-access checked path to localise.
+        """
+        self.clear_sticky()
+        try:
+            yield
+        except BaseException:
+            # The span died mid-flight; a latched sticky error must not leak
+            # into whatever the caller does next.
+            self.clear_sticky()
+            raise
+        if self.read_ctrl_stat() & STICKYERR:
+            self.clear_sticky()
+            raise DapError(
+                "an access inside this checked span faulted; every value read "
+                "in the span is suspect"
+            )
+
     # ------------------------------------------------------- power-up ------
 
     def power_up(self, *, system: bool = False, timeout_s: float = 1.0) -> int:
@@ -319,6 +363,7 @@ class Dap:
         self._bank = 0
         self._select_addr = 0
         self.invalidate_csw_cache()
+        self.ops += 1
         self.t.dp_reg_write(DP_REG_SELECT, 0)
 
         want = CDBGPWRUPREQ | (CSYSPWRUPREQ if system else 0)
@@ -358,16 +403,19 @@ class Dap:
         full = (ap_base + offset) & 0xFFFF_FFFF
         self._write_select(full, BANK_DPIDR)
         index = (full >> 2) & 0x3
+        self.ops += 1
         value = self.t.ap_reg_read(index)
         if self.ap_read_pipelined:
             # ADIv6 JTAG-DP: the APACC read returned the *previous* result; the
             # value we asked for is now in RDBUFF.
+            self.ops += 1
             value = self.t.dp_reg_read(DP_REG_RDBUFF)
         return value & 0xFFFF_FFFF
 
     def ap_write(self, ap_base: int, offset: int, value: int) -> None:
         full = (ap_base + offset) & 0xFFFF_FFFF
         self._write_select(full, BANK_DPIDR)
+        self.ops += 1
         self.t.ap_reg_write((full >> 2) & 0x3, value & 0xFFFF_FFFF)
 
     def calibrate_ap_read(self, ap_base: int, expected_idr: int) -> bool:

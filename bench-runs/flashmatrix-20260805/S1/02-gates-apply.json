@@ -1,0 +1,39 @@
+{
+  "mdm": {
+    "idr": "0x001DE040",
+    "identity_ok": true,
+    "registers": {
+      "STATUS": "0xF00001C0",
+      "CONTROL": "0x00800000",
+      "STATUS2": "0x00000000",
+      "CONTROL2": "0x000F0000",
+      "CONTROL3": "0x000F0000",
+      "DBGENCNTRL": "0x3CF3CF00",
+      "DBGENCNTRL2": "0x3CF3CF00",
+      "DBGENCNTRL3": "0xFFF03CF0"
+    },
+    "status_flags": {
+      "system_reset": false,
+      "cdbgpwrupreq": true,
+      "csyspwrupreq": true,
+      "aux_tap_trst_released": true
+    },
+    "enables_set": true,
+    "error": null
+  },
+  "hse": {
+    "idr": "0x001DE001",
+    "authsts": "0x40000005",
+    "app_debug_enabled": true,
+    "challenge_pending": true,
+    "reset_flags": {
+      "functional_reset_asserted": false,
+      "destructive_reset_asserted": false
+    },
+    "uid": "0x1E09300B5563B9BC",
+    "error": null
+  },
+  "warnings": [
+    "SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication challenge. This tool never answers it -- the RM states only one attempt is ever accepted."
+  ]
+}

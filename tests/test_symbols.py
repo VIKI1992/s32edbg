@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import SyntheticTarget
+from conftest import CORE0_DEBUG, SyntheticTarget
 from rich.console import Console
 
 pytest.importorskip("elftools", reason="pip install -e .[ide]")
@@ -50,16 +50,16 @@ def index() -> SymbolIndex:
 
 def test_summary_shape(index) -> None:
     s = index.summary()
-    assert s["functions"] == 4
+    assert s["functions"] == 5
     assert s["cfi"] == "debug_frame"
-    assert s["fdes"] == 4
+    assert s["fdes"] == 5
     assert s["line_rows"] > 0
     assert s["segments"][0]["vaddr"] == "0x32100000"
 
 
 def test_functions_and_func_at(index) -> None:
     names = {f.name for f in index.funcs}
-    assert names == {"leaf", "middle", "outer", "_start"}
+    assert names == {"leaf", "middle", "outer", "bump", "_start"}
     outer = next(f for f in index.funcs if f.name == "outer")
     assert index.func_at(outer.low).name == "outer"
     assert index.func_at(outer.low + 2).name == "outer"
@@ -248,7 +248,7 @@ def test_sym_load_and_lookups_over_the_protocol(machine) -> None:
     )
     assert code == 0
     assert envs[0]["ok"] is True
-    assert envs[0]["result"]["functions"] == 4
+    assert envs[0]["result"]["functions"] == 5
     assert envs[1]["result"]["line"] == target
     assert envs[1]["result"]["addrs"]
     lookup = envs[2]["result"]["lookups"][0]
@@ -262,6 +262,136 @@ def test_stepline_without_symbols_is_a_usage_error(machine) -> None:
     assert envs[0]["ok"] is False
     assert envs[0]["error"]["kind"] == "usage"
     assert "sym load" in envs[0]["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Comparator range-stepping
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def machine_with_device(monkeypatch):
+    """The machine fixture, with the synthetic target exposed for seeding."""
+    human = io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=human, width=200, no_color=True))
+    monkeypatch.setattr(cli, "err_console", Console(file=human, width=200, no_color=True))
+    device = SyntheticTarget()
+    monkeypatch.setattr(cli, "discover", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "make_transport", lambda kind, **kw: device)
+
+    def invoke(stdin: str):
+        proto = io.StringIO()
+        monkeypatch.setattr(sys, "argv", ["s32edbg", "debug", "--machine"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+        monkeypatch.setattr(sys, "stdout", proto)
+        code = cli.entry()
+        lines = [json.loads(l) for l in proto.getvalue().splitlines() if l.strip()]
+        return code, [l for l in lines if "event" not in l]
+
+    return invoke, device
+
+
+def _seed_fixture_code(device: SyntheticTarget, index: SymbolIndex) -> None:
+    """Mirror the fixture ELF's code bytes into the synthetic memory, so the
+    device's single-step decoder executes the same instructions the range
+    planner reads from the ELF."""
+    for f in index.funcs:
+        for a in range(f.low & ~1, f.high, 2):
+            data = index.bytes_at(a, 4)
+            if data is not None:
+                device.mem[a] = int.from_bytes(data.ljust(4, b"\x00"), "little")
+
+
+def test_stepline_range_step_hops_a_straight_line(machine_with_device) -> None:
+    """One comparator hop replaces the instruction-by-instruction walk.
+
+    The opening line of `leaf` (-O0 prologue) is several instructions; the
+    legacy loop would take one hardware step per instruction, the ranged
+    stepper sets a temporary comparator at the next line boundary and runs.
+    """
+    invoke, device = machine_with_device
+    index = SymbolIndex.load(str(FIXTURE_ELF))
+    _seed_fixture_code(device, index)
+    leaf = next(f for f in index.funcs if f.name == "leaf")
+    device.dlr[CORE0_DEBUG] = leaf.low
+    hit = index.addr_to_line(leaf.low)
+    assert hit is not None
+    boundary = index.next_line_boundary(leaf.low, file=hit.file, line=hit.line)
+    assert boundary is not None
+    span = index.bytes_at(leaf.low, boundary - leaf.low)
+    line_instrs = len(symdisasm.Disassembler().disassemble(span, leaf.low, "thumb"))
+    assert line_instrs >= 2, "fixture changed: leaf's opening line is one instruction"
+
+    code, envs = invoke(
+        "halt --core rtu0.0\n"
+        f'sym load "{FIXTURE_ELF}"\n'
+        "stepline --core rtu0.0\n"
+        "quit\n"
+    )
+    assert code == 0
+    step_env = envs[2]
+    assert step_env["ok"] is True, step_env
+    r = step_env["result"]
+    assert r["stopped"] == "line-change"
+    # 1 unit of work for a multi-instruction line proves the hop happened;
+    # the legacy loop would have reported `line_instrs` steps.
+    assert r["steps"] == 1
+    assert int(r["pc_after"], 16) == boundary
+
+
+def test_stepline_range_step_honours_a_user_breakpoint_inside_the_line(
+    machine_with_device,
+) -> None:
+    """A comparator the operator armed INSIDE the stepped line still fires:
+    the run stops there and stepline reports `breakpoint`, not a silent
+    skip-past."""
+    invoke, device = machine_with_device
+    index = SymbolIndex.load(str(FIXTURE_ELF))
+    _seed_fixture_code(device, index)
+    leaf = next(f for f in index.funcs if f.name == "leaf")
+    device.dlr[CORE0_DEBUG] = leaf.low
+    hit = index.addr_to_line(leaf.low)
+    boundary = index.next_line_boundary(leaf.low, file=hit.file, line=hit.line)
+    span = index.bytes_at(leaf.low, boundary - leaf.low)
+    insns = symdisasm.Disassembler().disassemble(span, leaf.low, "thumb")
+    assert len(insns) >= 2, "fixture changed: leaf's opening line is one instruction"
+    mid = insns[1].addr
+
+    code, envs = invoke(
+        "halt --core rtu0.0\n"
+        f'sym load "{FIXTURE_ELF}"\n'
+        f"bp set 0x{mid:08X} --core rtu0.0\n"
+        "stepline --core rtu0.0\n"
+        "quit\n"
+    )
+    assert code == 0
+    step_env = envs[3]
+    assert step_env["ok"] is True, step_env
+    r = step_env["result"]
+    assert r["stopped"] == "breakpoint"
+    assert int(r["pc_after"], 16) == mid
+
+
+def test_control_flow_classifier() -> None:
+    """The range planner must never run through anything that can move the
+    PC somewhere the boundary comparator would not catch."""
+    from s32edbg.cli import _is_control_flow
+
+    dis = symdisasm.Disassembler()
+
+    def insn_of(data: bytes):
+        out = dis.first(data, 0x1000, "thumb")
+        assert out is not None
+        return out
+
+    assert _is_control_flow(insn_of(b"\xfd\xe7"))      # b.n .-2
+    assert _is_control_flow(insn_of(b"\x70\x47"))      # bx lr
+    assert _is_control_flow(insn_of(b"\x00\xbd"))      # pop {pc}
+    assert _is_control_flow(insn_of(b"\x00\xb1"))      # cbz r0, ...
+    assert _is_control_flow(insn_of(b"\x00\xf0\x00\xf8"))  # bl ...
+    assert not _is_control_flow(insn_of(b"\x00\xbf"))  # nop
+    assert not _is_control_flow(insn_of(b"\x80\xb5"))  # push {r7, lr}
+    assert not _is_control_flow(insn_of(b"\x83\xb0"))  # sub sp, #12
 
 
 def test_stack_requires_a_halted_core(machine) -> None:

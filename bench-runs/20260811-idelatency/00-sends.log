@@ -1,0 +1,38 @@
+8909.745815 >> sym load "C:\br1_rear_ecu\build\bin\br1_rear.elf"
+8945.906844 >> load "C:\br1_rear_ecu\build\bin\br1_rear.elf"
+8981.415856 >> core resume --core rtu0.0
+8984.573912 >> core sample --core rtu0.0 --count 200
+8985.788146 >> sym addr2line 0x321D2EE8
+8985.801012 >> sym addr2line 0x321D2EE6
+8985.801805 >> sym addr2line 0x323E617C
+8985.803535 >> bp set 0x323E617C --core rtu0.0
+8985.877086 >> core resume --core rtu0.0
+8986.266955 >> core resume --core rtu0.0
+8986.653848 >> core resume --core rtu0.0
+8987.042714 >> core resume --core rtu0.0
+8987.431023 >> regs
+8987.732551 >> regs
+8987.751051 >> stack --max-frames 32
+8987.828057 >> var locals --frame 0
+8988.958191 >> var locals --frame 0
+8988.974319 >> var globals --limit 5
+8989.047066 >> var watch "__func__"
+8989.060920 >> disasm
+8989.245952 >> stepline --core rtu0.0
+8989.731431 >> stepline --core rtu0.0
+8990.050457 >> stepline --core rtu0.0
+8990.563922 >> stepline --core rtu0.0
+8990.841129 >> stepline --core rtu0.0
+8991.161265 >> stepline --core rtu0.0
+8991.675534 >> stepline --core rtu0.0 --no-range-step
+8991.924691 >> stepline --core rtu0.0 --no-range-step
+8992.176352 >> stepline --core rtu0.0 --no-range-step
+8992.817676 >> stepline --core rtu0.0 --no-range-step
+8993.067113 >> stepline --core rtu0.0 --no-range-step
+8993.707978 >> stepline --core rtu0.0 --no-range-step
+8993.956942 >> core step --core rtu0.0 --into
+8994.207267 >> core step --core rtu0.0 --into
+8994.456305 >> core step --core rtu0.0 --into
+8994.705686 >> core step --core rtu0.0 --over
+8995.100819 >> poll
+8995.259353 >> quit

@@ -1,0 +1,88 @@
+{
+  "m33": [
+    {
+      "name": "smu",
+      "ap": "0x01C80000",
+      "cpuid": {
+        "raw": "0x410FD214",
+        "implementer": "0x41",
+        "implementer_name": "Arm",
+        "variant": 0,
+        "partno": "0xD21",
+        "part_name": "Cortex-M33",
+        "revision": 4,
+        "is_cortex_m33": true
+      },
+      "dhcsr": {
+        "raw": "0x02030003",
+        "halted": true,
+        "debug_enabled": true,
+        "sleeping": false,
+        "locked_up": false,
+        "secure_debug_enabled": false,
+        "reset_since_last_read": true,
+        "register_ready": true
+      },
+      "breakpoints": 8,
+      "watchpoints": 4,
+      "halted": true,
+      "error": null
+    },
+    {
+      "name": "ce0",
+      "ap": "0x01C90000",
+      "cpuid": {
+        "raw": "0x00000000",
+        "implementer": "0x00",
+        "implementer_name": "unknown",
+        "variant": 0,
+        "partno": "0x000",
+        "part_name": "unknown",
+        "revision": 0,
+        "is_cortex_m33": false
+      },
+      "dhcsr": {
+        "raw": "0x00000000",
+        "halted": false,
+        "debug_enabled": false,
+        "sleeping": false,
+        "locked_up": false,
+        "secure_debug_enabled": false,
+        "reset_since_last_read": false,
+        "register_ready": false
+      },
+      "breakpoints": 0,
+      "watchpoints": 0,
+      "halted": false,
+      "error": null
+    },
+    {
+      "name": "ce1",
+      "ap": "0x01C92000",
+      "cpuid": {
+        "raw": "0x00000000",
+        "implementer": "0x00",
+        "implementer_name": "unknown",
+        "variant": 0,
+        "partno": "0x000",
+        "part_name": "unknown",
+        "revision": 0,
+        "is_cortex_m33": false
+      },
+      "dhcsr": {
+        "raw": "0x00000000",
+        "halted": false,
+        "debug_enabled": false,
+        "sleeping": false,
+        "locked_up": false,
+        "secure_debug_enabled": false,
+        "reset_since_last_read": false,
+        "register_ready": false
+      },
+      "breakpoints": 0,
+      "watchpoints": 0,
+      "halted": false,
+      "error": null
+    }
+  ]
+}

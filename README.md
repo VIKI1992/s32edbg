@@ -1639,9 +1639,34 @@ captured instead of printed. `quit` (or EOF) runs the same restore-on-close the 
 frontend must always end the process this way, never kill it, or comparators stay armed and a
 stale catch latch breaks the application's own core release (Finding 7).
 
-`poll` is the frontend's 1 Hz heartbeat: one cheap sweep of every core's run state
+`poll` is the frontend's heartbeat: one cheap sweep of every core's run state
 (EDSCR/EDPRSR per R52, DHCSR per M33, halt locations for halted cores) with no instruction
 injection and no PC reads on running cores.
+
+**Cost accounting (2026-08-11).** Every result envelope also carries `ms` (backend wall time)
+and `ops` (DP/AP transactions the command issued — one `CORESIGHT_ReadAPDPReg`/`WriteAPDPReg`
+USB round trip each, ~1 ms on the wire). `ops` is the cost model this whole layer is tuned
+against: 900 ms at 850 ops is USB-bound, 900 ms at 40 ops is waiting on the target.
+
+**Pushed halts.** While a core the session resumed is running, a monitor thread inside the
+backend watches it (~50 ms sweeps of exactly the resumed cores, no traffic when everything is
+halted) and pushes an asynchronous event line the moment it halts on its own:
+
+```
+{"event":"stopped","family":"r52","core":"rtu0.1","status":"halted: breakpoint","location":{...}}
+```
+
+These arrive between envelopes, never inside one; a frontend that ignores them can keep
+polling, but the extension reacts to them directly, which is what makes continue-to-breakpoint
+feel immediate instead of paying a poll interval of detection latency.
+
+**Per-stop caching.** Registers, stack words and the gate report are cached on the session and
+keyed to run/data generations: within one stop, `regs`, `stack`, `var locals` and every
+`var watch` share ONE hardware register read and one stack-window burst; any step, resume,
+reset or write bumps a generation and drops the lot. Reads of a RUNNING core (the ~1 Hz live
+watch) always bypass these caches. The register file itself moves as a sticky-checked batch
+(~3 plain accesses per register instead of ~7 checked transactions), with the per-access
+checked path kept as the localising fallback on any fault.
 
 ### The symbols layer — `sym`, `stack`, `disasm`, `stepline`, `stepout`, `runto`
 
@@ -1658,11 +1683,36 @@ stack [--max-frames N]  unwind the halted focused core: DWARF CFI, then the GCC 
 disasm [--addr 0x...]   capstone around the PC (or an address); bytes from the ELF when it covers
                         the address, target memory otherwise; T32/A32 from the mapping symbols,
                         else DSPSR.T
-stepline [--over]       one SOURCE line: instruction-step until the line-table row changes
+stepline [--over]       one SOURCE line. Default is comparator range-stepping: capstone scans
+                        the line's ELF bytes, straight-line stretches run at silicon speed to a
+                        temporary hardware breakpoint (interrupts masked exactly as for a plain
+                        step), and only actual control flow -- branches, calls, returns,
+                        anything that writes the PC, IT blocks -- is hardware-single-stepped.
+                        A user comparator inside the line still fires (`stopped: breakpoint`);
+                        the one-line-infinite-loop guard behaves as before. Falls back to the
+                        instruction-step loop when the ELF does not cover the PC or no
+                        comparator is free; `--no-range-step` forces the loop
 stepout                 unwind one frame, temp hardware breakpoint at the return address, resume,
                         wait, clear -- on timeout the core is LEFT RUNNING and the temp slot freed
 runto 0x...             the run-to-cursor primitive, same temp-breakpoint mechanics
+var locals              a halted frame's parameters, locals and function statics -- DWARF variable
+                        DIEs evaluated against the frame's CFA (the honest fallback when there is
+                        no CFI row is the GCC frame-pointer-derived CFA, labeled `cfa_source: fp`)
+var globals             filtered, paged globals (a production image carries ~32k statics; values
+                        are read for the shown page only)
+var watch <path>        `counter`, `cfg.limits[2].max`, `*ptr`, `p->x` -- resolved locals-first
+                        under a frame, statics/globals on a running core
+var expand / write / refresh
+                        lazy children, guarded scalar writes with read-back, and the batched
+                        re-read behind the live view. Rows carry session handles that die on any
+                        run-state change ("stale-handle" is a contract, not an error message)
 ```
+
+The location evaluator is a deliberately closed table -- DW_OP_addr / DW_OP_fbreg (frame base
+DW_OP_call_frame_cfa) as GCC -O0 emits, plus DW_OP_regN/bregN and .debug_loc lists for optimized
+builds -- and anything outside it reports "unsupported location: <op>" instead of guessing.
+Reads are confined to the known RAM windows, so an MMIO-mapped variable says so rather than being
+dereferenced behind your back.
 
 `resume`/`continue` steps off the comparator it was halted on. A breakpoint halts the PE
 *before* the matched instruction executes, so DLR still points at it and a bare restart
@@ -1713,6 +1763,13 @@ instruction with automatic conversion when it fires, a memory viewer, PC profili
 doctor/probe/report diagnostics (available only while disconnected — they open their own probe
 connection, which is a D-2 reset pulse).
 
+The **Variables view** shows the selected frame's locals (click a Call Stack frame to switch —
+frame 0 on every halt), a filterable capped Globals section, and persisted Watch paths, all
+type-aware: enums by name, char* previews, expandable structs/arrays with paged children, a hex
+toggle, changed-since-last-halt dots, and scalar editing with read-back. Globals and watches keep
+refreshing at `s32e.variables.liveRefreshMs` while the focused core **runs** — plain memory reads,
+the live-calibration workflow — with a pause button in the view title.
+
 Disconnect (and window close) runs the session restore; if the backend dies instead, the extension
 says so and offers reconnect — it never auto-reconnect-loops into the D-2 defect.
 
@@ -1724,7 +1781,7 @@ says so and offers reconnect — it never auto-reconnect-loops into the D-2 defe
 been proven on silicon, what has only run against test doubles, and what has never been executed.
 
 ```
-pytest                              761 tests, no probe and no SEGGER install needed
+pytest                              805 tests, no probe and no SEGGER install needed
 pytest -m hardware -v -x            21 bench gates, in dependency order
 .\tools\bench-acceptance.ps1        the same sequence, with per-step JSON and wire-level logs
 .\tools\flash-state-matrix.ps1      debugging proven in every flash state (nothing / BL only /
@@ -1882,6 +1939,6 @@ tools/
   bench-lib.ps1               Invoke-Step/Hex, shared by both bench scripts
 vscode/               the "S32E Debug" VS Code extension (TypeScript; own Activity Bar
                       container; spawns one `debug --machine` session)
-tests/                761 hardware-free tests (fixtures/ holds the committed symbol-layer
+tests/                805 hardware-free tests (fixtures/ holds the committed symbol-layer
                       ELF), plus 21 bench gates behind `-m hardware`
 ```

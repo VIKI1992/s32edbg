@@ -73,20 +73,79 @@ class DebugSession:
     #: group, and restore() disarms it -- a session must not leave the chip
     #: in a mode where any halt stops the application everywhere.
     sync: bool = False
+    #: Variables-view handle table. A handle is "<generation>:<id>"; any
+    #: run-state change bumps the generation, so a stale handle is refused
+    #: instead of read -- the addresses it described may no longer exist.
+    var_generation: int = 0
+    var_rows: dict[int, Any] = field(default_factory=dict)
+    #: Bumped when target memory or registers change while the run state does
+    #: not -- a mem/var/reg write under a halt. The read caches below key on
+    #: (var_generation, data_generation) so either kind of change drops them;
+    #: variables-view handles deliberately survive a write (the IDE re-reads
+    #: values through the same handles right after `var write`).
+    data_generation: int = 0
+    #: Cores the session resumed and nothing has re-halted yet -- the set the
+    #: machine-mode halt monitor sweeps for the running->halted transition.
+    #: M33 names carry an "m33:" prefix. Owned by note_resumed/note_halted.
+    monitor_watch: set[str] = field(default_factory=set)
+
+    #: Read caches, valid only for _cache_key == the current generations.
+    #: An IDE stop refreshes registers three to five times (regs, stack,
+    #: locals, every watch) and re-walks the same stack words; nothing on a
+    #: halted core changes between those commands, so one hardware read
+    #: serves them all. reg cache: core name (M33 prefixed "m33:") -> the
+    #: read_registers result. word cache: (ap_base, word address) -> value,
+    #: None for a faulted read.
+    _cache_key: tuple[int, int] = (-1, -1)
+    _reg_cache: dict[str, Any] = field(default_factory=dict)
+    _word_cache: dict[tuple[int, int], Any] = field(default_factory=dict)
 
     # -- recording helpers, called from the CLI command bodies ---------------
 
+    def bump_var_generation(self) -> None:
+        """Run state changed: every variables-view handle is now a lie."""
+        self.var_generation += 1
+        self.var_rows.clear()
+
+    def note_target_written(self) -> None:
+        """Memory or a register changed under a halt: drop the read caches."""
+        self.data_generation += 1
+
+    def read_caches(self) -> tuple[dict[str, Any], dict[tuple[int, int], Any]]:
+        """(registers, words) caches for the current generations.
+
+        Callers fill and consult these freely; the pair is cleared here the
+        first time it is asked for after either generation moved.
+        """
+        key = (self.var_generation, self.data_generation)
+        if key != self._cache_key:
+            self._cache_key = key
+            self._reg_cache.clear()
+            self._word_cache.clear()
+        return self._reg_cache, self._word_cache
+
     def note_halted(self, name: str) -> None:
+        self.bump_var_generation()
         self.halted_r52.add(name)
+        self.monitor_watch.discard(name)
 
     def note_resumed(self, name: str) -> None:
+        self.bump_var_generation()
         self.halted_r52.discard(name)
+        # The machine-mode halt monitor watches exactly the cores the session
+        # resumed: the first spontaneous halt after this (a breakpoint or
+        # watchpoint firing) is the event an IDE is waiting on.
+        self.monitor_watch.add(name)
 
     def note_m33_halted(self, name: str) -> None:
+        self.bump_var_generation()
         self.halted_m33.add(name)
+        self.monitor_watch.discard(f"m33:{name}")
 
     def note_m33_resumed(self, name: str) -> None:
+        self.bump_var_generation()
         self.halted_m33.discard(name)
+        self.monitor_watch.add(f"m33:{name}")
 
     def note_bp(self, core: str, index: int) -> None:
         self.bp_set.add((core, index))
@@ -125,10 +184,13 @@ class DebugSession:
         re-sets its OS lock (guide §3.6), so every session record about it now
         describes state the reset already destroyed: forget them, and let the
         next touch re-unlock and re-sanitise (guide §5.7)."""
+        self.bump_var_generation()
         self.halted_r52.discard(name)
+        self.monitor_watch.discard(name)
         self.bp_set = {(c, n) for c, n in self.bp_set if c != name}
         self.wp_set = {(c, n) for c, n in self.wp_set if c != name}
         self.sanitized.discard(name)
+        gates.invalidate_status_cache(self.dap)
 
     def note_system_reset(self) -> None:
         """A flow (`load`) reset the whole SoC under this session.
@@ -142,8 +204,10 @@ class DebugSession:
         identity caches (frame addresses are stable; state is re-read on every
         use), and the focus.
         """
+        self.bump_var_generation()
         self.halted_r52.clear()
         self.halted_m33.clear()
+        self.monitor_watch.clear()
         self.bp_set.clear()
         self.wp_set.clear()
         self.m33_bp_set.clear()
@@ -152,6 +216,7 @@ class DebugSession:
         # `load` arms and clears every R52 latch itself (loader P1/P5), so any
         # catch bookkeeping now describes latches the flow already dropped.
         self.edbgreq_armed.clear()
+        gates.invalidate_status_cache(self.dap)
 
     # -- restore-on-close ----------------------------------------------------
 

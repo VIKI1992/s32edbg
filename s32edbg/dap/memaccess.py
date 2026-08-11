@@ -72,7 +72,10 @@ def preflight(dap: Dap, ap_base: int, *, write: bool) -> tuple[gates.GateReport,
     if write:
         gates.guard_write(ap_base)
 
-    report = gates.status(dap)
+    # Cached: preflight runs in front of every stack/variables/disassembly
+    # command, and the gates only move on `gates apply`, reset or power cycle
+    # -- all of which invalidate the cache.
+    report = gates.status(dap, cached=True)
     notes: list[str] = []
 
     if ap_base in SYSTEM_BUS_APS:

@@ -1,0 +1,282 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+session open -- 4 R52 core(s): rtu0.0 rtu0.1 rtu1.0 rtu1.1; M33: smu ce0 ce1
+focus: rtu0.0
+symbols: 11204 function(s), 652208 line row(s), CFI debug_frame (11155 FDEs), 
+entry 0x32100020
+! `load` resets the whole SoC: every core reboots. Image: br1_rear.elf, 
+3,677,850 bytes in 11 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+load: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: smu halted
+load: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce0 halted
+load: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce1 halted
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+load: SRAMC D0/D1/D2 ECC init verified (witness words read 0)
+load: parking rtu0.0 on a `b .` loop and releasing it into the halt
+load: RTU0 GPR CFG_CORE: split-lock (optional; lockstep default on denial): 
+skipped -- XRDC denies the debugger 0x76120000 (the access to 0x76120000 via 
+the AXI-AP faulted. XRDC can deny the debugger a region the cores reach freely;
+the 0x76xxxxxx RTU peripheral slice is one such region on this part.); the 
+register keeps its reset default
+rtu0.0: cleared the OS lock
+load: registered the AXI-AP with the DLL for WriteMem
+load: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+load: WriteMem fast path proven by full read-back of the first block (512 
+words)
+load: wrote 0x32100000      2,048 bytes    1.73s       1.2 KB/s
+load: wrote 0x32101200        128 bytes    0.01s       9.0 KB/s
+load: wrote 0x32101300         50 bytes    0.01s       3.4 KB/s
+load: wrote 0x32101500         68 bytes    0.01s       4.7 KB/s
+load: wrote 0x32101580     44,968 bytes    0.38s     116.4 KB/s
+load: wrote 0x3210C528          4 bytes    0.01s       0.5 KB/s
+load: wrote 0x3210C580    781,560 bytes    6.52s     117.0 KB/s
+load: wrote 0x321CB280     20,880 bytes    0.18s     110.8 KB/s
+load: wrote 0x321D0480  2,421,072 bytes   20.16s     117.3 KB/s
+load: wrote 0x3241F5D0     95,876 bytes    0.81s     116.3 KB/s
+load: wrote 0x32680000    311,196 bytes    2.59s     117.3 KB/s
+load: entry word at 0x32100020 verified (0x0000F04F)
+                loaded br1_rear.elf                
+┌────────────┬───────────┬──────┬────────┬────────┐
+│ LMA        │     Bytes │ Path │ Verify │   Time │
+├────────────┼───────────┼──────┼────────┼────────┤
+│ 0x32100000 │     2,048 │ dll  │ edges  │  1.73s │
+│ 0x32101200 │       128 │ dll  │ edges  │  0.01s │
+│ 0x32101300 │        50 │ dll  │ edges  │  0.01s │
+│ 0x32101500 │        68 │ dll  │ edges  │  0.01s │
+│ 0x32101580 │    44,968 │ dll  │ edges  │  0.38s │
+│ 0x3210C528 │         4 │ dll  │ edges  │  0.01s │
+│ 0x3210C580 │   781,560 │ dll  │ edges  │  6.52s │
+│ 0x321CB280 │    20,880 │ dll  │ edges  │  0.18s │
+│ 0x321D0480 │ 2,421,072 │ dll  │ edges  │ 20.16s │
+│ 0x3241F5D0 │    95,876 │ dll  │ edges  │  0.81s │
+│ 0x32680000 │   311,196 │ dll  │ edges  │  2.59s │
+└────────────┴───────────┴──────┴────────┴────────┘
+total 3,677,850 bytes in 32.43s (111 KB/s), fast path used, verify sampled
+rtu0.0 halted at the entry  PC 0x32100020  DSPSR 0x000001FA
+focus: rtu0.0 -- set breakpoints, then `resume` (or `continue`) when ready. 
+Quitting the session resumes the core unless --keep-on-exit.
+rtu0.0 running -- running (non-debug state)
+rtu0.0: 200 samples, 0 invalid, 46 distinct addresses
+  0x321D2EE8     87   43.5%  #####################
+  0x321D2EE6     34   17.0%  ########
+  0x323E617C     24   12.0%  ######
+  0x321DBDB8      6    3.0%  #
+  0x3241F590      4    2.0%  #
+  0x323E700E      3    1.5%  
+  0x323E5FF0      2    1.0%  
+  0x321D1798      2    1.0%  
+  0x321D8FFE      1    0.5%  
+  0x321D902A      1    0.5%  
+  0x3240FBB0      1    0.5%  
+  0x321D6444      1    0.5%  
+  0x321D1294      1    0.5%  
+  0x323EC840      1    0.5%  
+  0x3240FDE2      1    0.5%  
+  0x323DB828      1    0.5%  
+EDPCSR is only valid while the core is running; a halted core samples 
+0xFFFFFFFF. These are statistical samples, not a trace.
+0x321D2EE8  Os_Task_Os_IdleTask  
+C:\br1_rear_ecu\Sip\Components\Os\Implementation\Os_Hal_Core.h:409
+0x321D2EE6  Os_Task_Os_IdleTask  
+C:\br1_rear_ecu\Sip\Components\Os\Implementation\Os_Hal_Core.h:409
+0x323E617C  Adc_Sar_Ip_GetConvResult  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3372
+! rtu0.0 is not halted. The guide (§5.7/§5.8) recommends programming 
+comparators while the core is halted -- the change needs a context 
+synchronization event to be guaranteed to take effect. It is armed; halt-first 
+is the supported order.
+breakpoint 0 at 0x323E617C on rtu0.0 (DBGBVR 0x323E617C, DBGBCR 0x00002067, BAS
+0b0011)
+rtu0.0 ran and immediately re-halted -- halted: breakpoint at 0x323E617C
+That is a working breakpoint, not a failed resume -- the resume stepped off the
+previous one, so this is a different comparator close by.
+rtu0.0 ran and immediately re-halted -- halted: breakpoint at 0x323E617C
+That is a working breakpoint, not a failed resume -- the resume stepped off the
+previous one, so this is a different comparator close by.
+rtu0.0 ran and immediately re-halted -- halted: breakpoint at 0x323E617C
+That is a working breakpoint, not a failed resume -- the resume stepped off the
+previous one, so this is a different comparator close by.
+rtu0.0 ran and immediately re-halted -- halted: breakpoint at 0x323E617C
+That is a working breakpoint, not a failed resume -- the resume stepped off the
+previous one, so this is a different comparator close by.
+                               rtu0.0 registers                                
+┌─────┬────────────┬─────┬────────────┬─────┬────────────┬───────┬────────────┐
+│ Reg │ Value      │ Reg │ Value      │ Reg │ Value      │ Reg   │ Value      │
+├─────┼────────────┼─────┼────────────┼─────┼────────────┼───────┼────────────┤
+│ r0  │ 0x00000002 │ r4  │ 0x4E660000 │ r8  │ 0x00000006 │ r12   │ 0x00000000 │
+│ r1  │ 0x00000003 │ r5  │ 0x00000003 │ r9  │ 0x00000000 │ r13   │ 0x30001AE0 │
+│ r2  │ 0x00000000 │ r6  │ 0x00000000 │ r10 │ 0x00000018 │ r14   │ 0x00000000 │
+│ r3  │ 0x30001B28 │ r7  │ 0x00000003 │ r11 │ 0x321F3CE0 │ dspsr │ 0x6000003F │
+└─────┴────────────┴─────┴────────────┴─────┴────────────┴───────┴────────────┘
+PC 0x323E617C  (DLR)   mode System, Thumb, flags ZC
+note: register transfers use T32 encodings on this core
+                               rtu0.0 registers                                
+┌─────┬────────────┬─────┬────────────┬─────┬────────────┬───────┬────────────┐
+│ Reg │ Value      │ Reg │ Value      │ Reg │ Value      │ Reg   │ Value      │
+├─────┼────────────┼─────┼────────────┼─────┼────────────┼───────┼────────────┤
+│ r0  │ 0x00000002 │ r4  │ 0x4E660000 │ r8  │ 0x00000006 │ r12   │ 0x00000000 │
+│ r1  │ 0x00000003 │ r5  │ 0x00000003 │ r9  │ 0x00000000 │ r13   │ 0x30001AE0 │
+│ r2  │ 0x00000000 │ r6  │ 0x00000000 │ r10 │ 0x00000018 │ r14   │ 0x00000000 │
+│ r3  │ 0x30001B28 │ r7  │ 0x00000003 │ r11 │ 0x321F3CE0 │ dspsr │ 0x6000003F │
+└─────┴────────────┴─────┴────────────┴─────┴────────────┴───────┴────────────┘
+PC 0x323E617C  (DLR)   mode System, Thumb, flags ZC
+note: register transfers use T32 encodings on this core
+#0  0x323E617C  Adc_Sar_Ip_GetConvResult  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3372  (regs)
+#1  0x323E562A  Adc_Ipw_GetChanResultNoInt  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Ipw.c:711  (cfi)
+#2  0x323E579A  Adc_Ipw_ReadGroup  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Ipw.c:865  (cfi)
+#3  0x323E4C8E  Adc_ReadGroup  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc.c:3724  (cfi)
+#4  0x323DB8A8  AIN_ADC_mainFunction  
+C:\br1_rear_ecu\ASw\CDD\CDD_AIN\src\cdd_ain.c:704  (cfi)
+#5  0x323DBECE  CDD_AIN_mainFunction  
+C:\br1_rear_ecu\ASw\CDD\CDD_AIN\src\cdd_ain.c:231  (cfi)
+#6  0x32148DAE  Os_Task_BTS_serviceTask  
+C:\br1_rear_ecu\BSw\DaVinciWorkSpace\Generated_BSW\Rte_OsApplication_Trusted_Co
+re0.c:42783  (cfi)
+#7  0x321DBC22  Os_TrapTaskMissingTerminateTask  
+C:\br1_rear_ecu\Sip\Components\Os\Implementation\Os_Trap.c:8139  (cfi)
+stopped: end-of-stack
+u32Instance          uint32                   2
+u32ChnIdx            uint32                   3
+pChainType           Adc_Sar_Ip_ConvChainType ADC_SAR_IP_CONV_CHAIN_NORMAL (0)
+pResult              const Adc_Sar_Ip_ChanResultType * 0x30001B28
+VectAdr              uint32                   0
+VectBit              uint32                   3
+Cdr                  uint32                   value not live at this PC
+CEOCFRAddr           uint32 *                 value not live at this PC
+AdcBasePtr           ADC_Type *               value not live at this PC
+AdcAEBasePtr         SAR_ADC_AE_Type *        0x4E660000
+u32Instance          uint32                   2
+u32ChnIdx            uint32                   3
+pChainType           Adc_Sar_Ip_ConvChainType ADC_SAR_IP_CONV_CHAIN_NORMAL (0)
+pResult              const Adc_Sar_Ip_ChanResultType * 0x30001B28
+VectAdr              uint32                   0
+VectBit              uint32                   3
+Cdr                  uint32                   value not live at this PC
+CEOCFRAddr           uint32 *                 value not live at this PC
+AdcBasePtr           ADC_Type *               value not live at this PC
+AdcAEBasePtr         SAR_ADC_AE_Type *        0x4E660000
+5 of 32404 matching global(s)
+__func__ = "DET_EXTERNALS_storeReport"
+   0x323E614C  fbe7       b        #0x323e6146
+   0x323E614E  70b5       push     {r4, r5, r6, lr}
+   0x323E6150  4fea511c   lsr.w    ip, r1, #5
+   0x323E6154  01f01f05   and      r5, r1, #0x1f
+   0x323E6158  4ff0000e   mov.w    lr, #0
+   0x323E615C  a3f804e0   strh.w   lr, 
+   0x323E6160  1970       strb     r1, 
+   0x323E6162  83f801e0   strb.w   lr, 
+   0x323E6166  83f802e0   strb.w   lr, 
+   0x323E616A  0128       cmp      r0, #1
+   0x323E616C  29d9       bls      #0x323e61c2
+   0x323E616E  48f2bc44   movw     r4, #0x84bc
+   0x323E6172  c3f22024   movt     r4, #0x3220
+   0x323E6176  861e       subs     r6, r0, #2
+   0x323E6178  54f82640   ldr.w    r4, 
+=> 0x323E617C  04f58076   add.w    r6, r4, #0x100
+   0x323E6180  56f82160   ldr.w    r6, 
+   0x323E6184  1434       adds     r4, #0x14
+   0x323E6186  04eb8c01   add.w    r1, r4, ip, lsl #2
+   0x323E618A  86ea024c   eor.w    ip, r6, r2, lsl #16
+   0x323E618E  1cf4403f   tst.w    ip, #0x30000
+   0x323E6192  12d1       bne      #0x323e61ba
+   0x323E6194  c6f3c042   ubfx     r2, r6, #0x13, #1
+   0x323E6198  5a70       strb     r2, 
+   0x323E619A  c6f38042   ubfx     r2, r6, #0x12, #1
+   0x323E619E  9a70       strb     r2, 
+   0x323E61A0  4cf6382c   movw     ip, #0xca38
+   0x323E61A4  c3f27b1c   movt     ip, #0x317b
+   0x323E61A8  00eb4000   add.w    r0, r0, r0, lsl #1
+   0x323E61AC  6044       add      r0, ip
+   0x323E61AE  4278       ldrb     r2, 
+   0x323E61B0  012a       cmp      r2, #1
+   0x323E61B2  14d0       beq      #0x323e61de
+   0x323E61B4  c6f30b02   ubfx     r2, r6, #0, #0xc
+   0x323E61B8  9a80       strh     r2, 
+   0x323E61BA  0123       movs     r3, #1
+   0x323E61BC  ab40       lsls     r3, r5
+   0x323E61BE  0b60       str      r3, 
+   0x323E61C0  70bd       pop      {r4, r5, r6, pc}
+   0x323E61C2  48f2d044   movw     r4, #0x84d0
+   0x323E61C6  c3f22024   movt     r4, #0x3220
+   0x323E61CA  54f82040   ldr.w    r4, 
+   0x323E61CE  04f58076   add.w    r6, r4, #0x100
+   0x323E61D2  56f82160   ldr.w    r6, 
+   0x323E61D6  1434       adds     r4, #0x14
+   0x323E61D8  04eb8c01   add.w    r1, r4, ip, lsl #2
+   0x323E61DC  d5e7       b        #0x323e618a
+   0x323E61DE  c6f30b12   ubfx     r2, r6, #4, #0xc
+rtu0.0: 0x323E617C -> 0x323E6184 in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3373
+rtu0.0: 0x323E6184 -> 0x323E618A in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3384
+rtu0.0: 0x323E618A -> 0x323E6194 in 2 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3390
+rtu0.0: 0x323E6194 -> 0x323E619A in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3391
+rtu0.0: 0x323E619A -> 0x323E61A0 in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:781
+rtu0.0: 0x323E61A0 -> 0x323E61B4 in 2 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:799
+rtu0.0: 0x323E61B4 -> 0x323E61B8 in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3392
+rtu0.0: 0x323E61B8 -> 0x323E61BA in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3396
+rtu0.0: 0x323E61BA -> 0x323E61C0 in 3 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3397
+rtu0.0: 0x323E61C0 -> 0x323E562A in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Ipw.c:711
+rtu0.0: 0x323E562A -> 0x323E5632 in 3 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Ipw.c:716
+rtu0.0: 0x323E5632 -> 0x323E5636 in 1 step(s) (line-change)  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Ipw.c:730
+step 1  0x323E5636 -> 0x323E5638  (halted: halting step, normal)
+step 1  0x323E5638 -> 0x323E563A  (halted: halting step, normal)
+step 1  0x323E563A -> 0x323E55A8  (halted: halting step, normal)
+0x323E55A8  (not a call)  -> single step
+step 1  0x323E55A8 -> 0x323E55AC  (halted: halting step, normal)
+rtu0.0: halted
+rtu0.1: unknown
+rtu1.0: unknown
+rtu1.1: unknown
+smu: halted
+ce0: halted
+ce1: halted
+restore: cleared breakpoint 0 on rtu0.0
+restore: resumed rtu0.0
+session closed

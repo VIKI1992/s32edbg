@@ -20,8 +20,35 @@ int outer(int x) {
     return middle(x) + 1;
 }
 
+/* Shapes for the variables layer: enum, nested struct, array, pointers,
+ * char*, volatile, float, file statics and a function-local static. */
+
+enum mode { MODE_IDLE, MODE_RUN, MODE_FAULT };
+
+struct limits { int min; int max; };
+
+struct config {
+    enum mode mode;
+    unsigned char flags;
+    struct limits limits[3];
+    const char *name;
+    struct config *next;
+};
+
+volatile unsigned int ticks;
+float ratio = 1.5f;
+static char greeting[] = "hello";
+static struct config cfg = { MODE_RUN, 0x5A, {{0, 10}, {1, 20}, {2, 30}}, greeting, 0 };
+
+static int bump(int delta) {
+    static int calls;
+    struct limits *lp = &cfg.limits[1];
+    calls += 1;
+    return lp->max + delta + (int)ticks;
+}
+
 void _start(void) {
     for (;;) {
-        counter = outer(counter);
+        counter = outer(counter) + bump(1);
     }
 }

@@ -15,3 +15,8 @@ set TC=C:\br1_rear_ecu\Tools\compiler\gcc_v10.2\gcc-10.2-arm32-eabi\bin
 Rebuild only when the tests need new shapes, and update any line-number
 assumptions in `tests/test_symbols.py` (they locate lines by searching
 `fixture.c`'s text, so plain rebuilds are usually safe).
+
+2026-08-10: variables-layer shapes added (enum/struct/array/pointer/statics,
+`bump()` with a function-local static) and the ELF rebuilt with the same
+command. Note this toolchain defaults to `-fshort-enums` (AAPCS): `enum mode`
+is one byte, which the offset tests deliberately verify from the DWARF.

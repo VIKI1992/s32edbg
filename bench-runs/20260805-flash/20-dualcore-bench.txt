@@ -1,0 +1,79 @@
+﻿note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+session open -- 4 R52 core(s): rtu0.0 rtu0.1 rtu1.0 rtu1.1; M33: smu ce0 ce1
+! `load` resets the whole SoC: every core reboots. Image: br1_rear.elf, 
+3,677,786 bytes in 11 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+load: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: smu halted
+load: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce0 halted
+load: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce1 halted
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+error: bring-up poll timed out: PRTN1_STAT.PCS set -- wanted (value & 
+0x00000001) == 0x00000001, last read 0x00000004 at 0x41900308
+error: rtu0.1: breakpoint 0 did not take. Wrote DBGBVR 0x32100020 / DBGBCR 
+0x00002067, read back 0x42054002 / 0x42054002. Comparator writes reading back 
+as zero is the classic sign that invasive debug is not actually authorised 
+(guide §3.3, §9 pitfall 4).
+catch armed on rtu0.1 (MDM EDBGREQ latched).
+now `continue` the boot core; when the application releases rtu0.1 it halts at 
+its first instruction -- then `catch --core rtu0.1 --wait` converts the hold.
+error: say which core: --core <index|name|address>, or --all. Names on this 
+target are rtu0.0, rtu0.1, rtu1.0, rtu1.1.
+error: rtu0.1 did not halt within 30s; the latch stays armed -- the session 
+close drops it, or `catch --disarm`
+focus: rtu0.1
+error: rtu0.1 is not halted, so its registers cannot be read. In Debug state 
+the core executes instructions written to EDITR; while running it does not.
+rtu0.1 running -- running (non-debug state)
+rtu0.0: cross-trigger enabled (CTIGATE 0x42054006)
+rtu0.1: cross-trigger enabled (CTIGATE 0x42054006)
+rtu1.0: cross-trigger enabled (CTIGATE 0x00000004)
+rtu1.1: cross-trigger enabled (CTIGATE 0x00000004)
+sync on: any halt -- manual or a breakpoint hit -- now stops all cores 
+together; bare `continue` restarts the whole group; `quit` disarms.
+focus: rtu0.0
+! halting stops the application on this core, and its lockstep partner stops 
+with it in hardware. Peripherals may keep running: the MDM-AP IP_DBG controls 
+decide what freezes and this tool does not touch them, so a watchdog can expire
+and reset the board while the core is stopped.
+error: rtu0.0 did not halt within 2.0s (EDSCR 0x42054002, EDPRSR 0x42054002).
+────────────────────── rtu0.1  (debug frame 0x00510000) ───────────────────────
+EDSCR   0x42054002  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x42054002  powered_up=False halted=False os_locked=False 
+in_reset=False
+sync: cross-halt masked for the step; the other cores stay halted
+error: rtu0.0: the core never became ready for an instruction (EDSCR 
+0x42054002, ITE clear after 0.50s).
+error: no halted core to restart as a group.
+rtu0.0: cross-trigger disabled (CTIGATE 0x42054002)
+rtu0.1: cross-trigger disabled (CTIGATE 0x42054002)
+rtu1.0: cross-trigger disabled (CTIGATE 0x00000000)
+rtu1.1: cross-trigger disabled (CTIGATE 0x00000000)
+sync off
+error: rtu0.0: watchpoint 0 did not take (read back 0x42054002 / 0x42054002).
+────────────────────── rtu0.0  (debug frame 0x00410000) ───────────────────────
+EDSCR   0x42054002  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x42054002  powered_up=False halted=False os_locked=False 
+in_reset=False
+cleared all watchpoint(s) on rtu0.0
+restore: dropped the armed catch latch for rtu0.1 (a stale latch breaks the 
+application's own core release -- Finding 7)
+session closed

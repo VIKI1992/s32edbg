@@ -1,0 +1,50 @@
+﻿note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+session open -- 4 R52 core(s): rtu0.0 rtu0.1 rtu1.0 rtu1.1; M33: smu ce0 ce1
+! `load` resets the whole SoC: every core reboots. Image: br1_rear.elf, 
+3,677,786 bytes in 11 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+load: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: smu: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+load: smu halted
+load: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce0: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+load: ce0 halted
+load: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce1: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+load: ce1 halted
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+error: bring-up poll timed out: PRTN1_STAT.PCS set -- wanted (value & 
+0x00000001) == 0x00000001, last read 0x00000004 at 0x41900308
+error: say which core: --core <index|name|address>, or --all. Names on this 
+target are rtu0.0, rtu0.1, rtu1.0, rtu1.1.
+────────────────────── rtu0.1  (debug frame 0x00510000) ───────────────────────
+EDSCR   0x42054082  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x42054082  powered_up=False halted=False os_locked=False 
+in_reset=False
+────────────────────── rtu0.1  (debug frame 0x00510000) ───────────────────────
+EDSCR   0x42054082  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x42054082  powered_up=False halted=False os_locked=False 
+in_reset=False
+────────────────────── rtu0.0  (debug frame 0x00410000) ───────────────────────
+EDSCR   0x42054082  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x42054082  powered_up=False halted=False os_locked=False 
+in_reset=False
+session closed

@@ -196,14 +196,14 @@ def test_flatten_refuses_a_span_no_flat_destination_can_hold() -> None:
 
 @pytest.mark.skipif(not BR1_REAR_ELF.exists(), reason="br1_rear.elf not on this machine")
 def test_golden_numbers_for_the_real_application_elf() -> None:
-    """The numbers the bench acceptance asserts. Measured 2026-08-04 from
+    """The numbers the bench acceptance asserts. Measured 2026-08-10 from
     br1_rear.elf; if the application build changes they move together."""
     img, _blob = elf.load(BR1_REAR_ELF)
     assert img.entry == 0x32100021  # brsStartupEntryHyp | Thumb
     assert img.entry_pc == 0x32100020
     assert img.entry_thumb is True
     assert len(img.segments) == 11
-    assert img.total_filesz == 3_677_786
+    assert img.total_filesz == 3_677_850
     assert all(s.paddr % 4 == 0 for s in img.segments)
     assert min(s.paddr for s in img.segments) == 0x32100000
     assert max(s.end for s in img.segments) <= 0x327FFFFF

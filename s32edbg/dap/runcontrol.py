@@ -178,6 +178,11 @@ class CoreState:
             out["edprsr"] = r52.decode_edprsr(self.edprsr)
         out["halted"] = self.halted
         out["unreachable_reason"] = self.unreachable_reason
+        if self.rehalted:
+            # The core ran and was back in Debug state before the restart
+            # poll could see it running -- a breakpoint on a hot address. A
+            # frontend must treat this resume as an immediate stop.
+            out["rehalted"] = True
         if self.restart_confirmed is not None:
             out["restart_confirmed"] = self.restart_confirmed
         if self.status_registers_disagree:
@@ -187,6 +192,24 @@ class CoreState:
                 "trust run-control on this core until that is resolved."
             )
         return out
+
+
+@dataclass
+class ComparatorShadow:
+    """What this tool last wrote to a core's comparators.
+
+    The tool owns every comparator write -- sanitize on first session touch,
+    set/clear, step's suspend/restore -- so remembered state can replace the
+    8-comparator read sweep that step and the poll's halt attribution
+    otherwise pay on every use. A side is a dict of index -> (value register,
+    control register), or None while unknown. A side is seeded only by a
+    complete read (list_*) or a fully-acknowledged blank (sanitize), and is
+    dropped back to None the moment a write's outcome is uncertain or the
+    core is reset -- a shadow that can lie is worse than no shadow.
+    """
+
+    bp: dict[int, tuple[int, int]] | None = None
+    wp: dict[int, tuple[int, int]] | None = None
 
 
 @dataclass
@@ -201,6 +224,13 @@ class Core:
     state: CoreState = field(default_factory=CoreState)
     #: Set by discover() when the affinity-derived name would be ambiguous.
     name_override: str | None = None
+    comparator_shadow: ComparatorShadow = field(default_factory=ComparatorShadow)
+    #: The register-transfer path round-tripped the probe pattern on this
+    #: core. Success is stable while the connection lives, so read_registers
+    #: skips the 16-transaction re-proof; a transfer fault under a remembered
+    #: success re-verifies once (the calibrated instruction set can go stale
+    #: if the core is later halted in the other one). Cleared on core reset.
+    reg_path_ok: bool = False
 
     @property
     def name(self) -> str:
@@ -984,19 +1014,45 @@ def resume(
     before_status = r52.edscr_status(before.edscr) if before.edscr is not None else None
 
     if step_off_breakpoint and before_status == r52.EDSCR_STATUS_BREAKPOINT:
-        # Retire the instruction under the comparator, then fall through to the
-        # ordinary restart. If the step itself fails, resume anyway rather than
-        # leaving the core halted: the caller asked it to run.
-        try:
-            after_step = step(dap, core, ap_base=ap_base)
-        except RunControlError:
-            pass
-        else:
-            before_status = (
-                r52.edscr_status(after_step.edscr)
-                if after_step.edscr is not None
-                else before_status
-            )
+        # The status can outlive the comparator: a range-step hop clears its
+        # temporary breakpoint after halting on it, and the next resume would
+        # pay a full step (~0.25 s) stepping off nothing. When the shadow
+        # KNOWS no armed comparator matches the PC, skip it; word-granular
+        # matching over-approximates (an other-halfword BAS still steps),
+        # and an unknown shadow or unreadable PC keeps the step -- correct
+        # stays the default, skipping is the proven-safe optimisation.
+        needed = True
+        shadow_bp = core.comparator_shadow.bp
+        if shadow_bp is not None:
+            armed = [
+                value
+                for value, control in shadow_bp.values()
+                if control & r52.DBGBCR_E
+            ]
+            if not armed:
+                needed = False
+            else:
+                try:
+                    pc = read_pc(dap, core, ap_base=ap_base)
+                except (RunControlError, DapError):
+                    pass
+                else:
+                    needed = any((value & ~3) == (pc & ~3) for value in armed)
+        if needed:
+            # Retire the instruction under the comparator, then fall through
+            # to the ordinary restart. If the step itself fails, resume
+            # anyway rather than leaving the core halted: the caller asked
+            # it to run.
+            try:
+                after_step = step(dap, core, ap_base=ap_base)
+            except RunControlError:
+                pass
+            else:
+                before_status = (
+                    r52.edscr_status(after_step.edscr)
+                    if after_step.edscr is not None
+                    else before_status
+                )
 
     _prepare_cti(dap, core, ap_base=ap_base)
     _restart(dap, core, ap_base=ap_base)
@@ -1345,6 +1401,65 @@ def execute(
 _INSTRUCTION_SET: dict[int, bool] = {}
 
 
+# -- span-batched register transfers ----------------------------------------
+#
+# The primitives below run inside dap.checked_span(): plain accesses, one
+# sticky check for the whole batch, EDSCR.ERR checked once at the end. That
+# takes a register-file sweep from ~7 transactions per access to ~3 per
+# register. The trade is localisation -- a fault anywhere poisons the whole
+# span -- so every fast path is paired with a fallback to the per-access
+# checked implementation, which remains the correctness reference.
+
+
+def _span_wait_ite(
+    dap: Dap, core: Core, *, ap_base: int, timeout_s: float = 0.5
+) -> int:
+    """_wait_ite with plain reads, for use inside a checked span.
+
+    A faulted plain read returns 0, and 0 is not a value a live EDSCR can
+    hold (the STATUS field is never all-zero) -- treated as a fault so the
+    span fails fast instead of spinning out the timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        edscr = _read(dap, ap_base, core.debug_base, r52.EDSCR)
+        if edscr == 0:
+            raise RunControlError(
+                f"{core.name}: EDSCR read zero inside a batched transfer."
+            )
+        if edscr & r52.EDSCR_ITE:
+            return edscr
+        if time.monotonic() > deadline:
+            raise RunControlError(
+                f"{core.name}: the core never became ready for an instruction "
+                f"(EDSCR 0x{edscr:08X}, ITE clear after {timeout_s:.2f}s)."
+            )
+
+
+def _span_exec(dap: Dap, core: Core, instruction: int, *, ap_base: int) -> None:
+    """EDITR write + ITE wait, plain. The wait doubles as the readiness gate
+    for the next injection; EDSCR.ERR is checked once at span end."""
+    dap.mem_write(ap_base, core.debug_base + r52.EDITR, instruction, size=32)
+    _span_wait_ite(dap, core, ap_base=ap_base)
+
+
+def _span_reg_to_dtr(dap: Dap, core: Core, n: int, *, ap_base: int, t32: bool) -> int:
+    _span_exec(dap, core, r52.instr_reg_to_dtr(n, t32=t32), ap_base=ap_base)
+    return _read(dap, ap_base, core.debug_base, r52.DBGDTRTX)
+
+
+def _span_end_err_check(dap: Dap, core: Core, *, ap_base: int) -> None:
+    """One EDSCR.ERR check for every instruction the span injected. ERR is
+    latching, so a single look at the end covers them all."""
+    edscr = _read(dap, ap_base, core.debug_base, r52.EDSCR)
+    if edscr & r52.EDSCR_ERR:
+        dap.mem_write(ap_base, core.debug_base + r52.EDRCR, r52.EDRCR_CSE, size=32)
+        raise RunControlError(
+            f"{core.name}: an instruction faulted during a batched register "
+            f"transfer (EDSCR 0x{edscr:08X})."
+        )
+
+
 def read_reg(
     dap: Dap, core: Core, n: int, *, ap_base: int = AP_APB, timeout_s: float = 0.5
 ) -> int:
@@ -1451,7 +1566,8 @@ def read_registers(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> Registers:
             "does not."
         )
 
-    out.path_verified = verify_register_path(dap, core, ap_base=ap_base)
+    remembered = core.reg_path_ok
+    out.path_verified = remembered or verify_register_path(dap, core, ap_base=ap_base)
     if not out.path_verified:
         out.notes.append(
             "the register-transfer round trip FAILED under both T32 and A32 encodings: "
@@ -1460,8 +1576,109 @@ def read_registers(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> Registers:
             "can be trusted."
         )
         return out
+    core.reg_path_ok = True
     out.notes.append(f"register transfers use {instruction_set(core)} encodings on this core")
 
+    try:
+        _read_registers_fast(dap, core, out, ap_base=ap_base)
+    except (DapError, RunControlError):
+        # The batch cannot localise a fault; throw it away and re-run the
+        # per-access reference path, whose failures name their register.
+        out.values.clear()
+        out.pc = None
+        out.pc_sampled = None
+        try:
+            _read_registers_checked(dap, core, out, ap_base=ap_base)
+        except RunControlError:
+            if not remembered:
+                raise
+            # The remembered success can be stale in exactly one way: the
+            # core is now halted in the other instruction set and the
+            # calibrated EDITR encodings fault. Re-prove the path once and
+            # retry; a second failure propagates.
+            core.reg_path_ok = False
+            return read_registers(dap, core, ap_base=ap_base)
+
+    # PC comes from the sample register rather than the register file. In Debug
+    # state r15 does not read as the PC, and the architecturally correct source
+    # (DLR) needs an instruction encoding this tool has not verified. EDPCSR is
+    # documented but implementation-defined while halted, so it is reported
+    # separately and labelled, never mixed in with the values above.
+    # EDPCSR is reported only as a cross-check, and only when it is valid. It is
+    # a profiling aid: measured 0xFFFFFFFF -- the architectural "sample not
+    # valid" -- on every halted core here. The PC above comes from DLR, which is
+    # the architected debug-state source.
+    if out.pc_sampled is not None and out.pc is not None and out.pc_sampled != out.pc:
+        out.notes.append(
+            f"EDPCSR samples 0x{out.pc_sampled:08X} while DLR gives 0x{out.pc:08X}. "
+            "DLR is the debug-state PC; EDPCSR is a profiling sample and may lag."
+        )
+    if out.pc is None:
+        out.notes.append(
+            "PC unavailable: the DLR read did not succeed and EDPCSR is not valid "
+            "while halted. Where a core stopped is still knowable from the breakpoint "
+            "that stopped it -- see `core status`."
+        )
+    return out
+
+
+def _read_registers_fast(
+    dap: Dap, core: Core, out: Registers, *, ap_base: int
+) -> None:
+    """The whole register file as one checked span: ~3 plain accesses per
+    register instead of ~7 checked transactions. Raises on ANY fault -- the
+    caller falls back to _read_registers_checked to localise."""
+    base = core.debug_base
+    t32 = _INSTRUCTION_SET.get(base, True)
+    with dap.checked_span():
+        edscr = _span_wait_ite(dap, core, ap_base=ap_base)
+        if edscr & r52.EDSCR_ERR:
+            dap.mem_write(ap_base, base + r52.EDRCR, r52.EDRCR_CSE, size=32)
+        for n in range(15):
+            out.values[f"r{n}"] = _span_reg_to_dtr(
+                dap, core, n, ap_base=ap_base, t32=t32
+            )
+        # DLR and DSPSR land in the scratch register, whose value the sweep
+        # above already captured -- restore it whatever happens, or a failing
+        # span would corrupt the context it was reading.
+        saved = out.values[f"r{r52.SCRATCH_REG}"]
+        try:
+            _span_exec(
+                dap, core, r52.instr_dlr_to_reg(r52.SCRATCH_REG, t32=t32),
+                ap_base=ap_base,
+            )
+            out.pc = _span_reg_to_dtr(
+                dap, core, r52.SCRATCH_REG, ap_base=ap_base, t32=t32
+            )
+            _span_exec(
+                dap, core, r52.instr_dspsr_to_reg(r52.SCRATCH_REG, t32=t32),
+                ap_base=ap_base,
+            )
+            out.values["dspsr"] = _span_reg_to_dtr(
+                dap, core, r52.SCRATCH_REG, ap_base=ap_base, t32=t32
+            )
+        finally:
+            dap.mem_write(ap_base, base + r52.DBGDTRRX, saved, size=32)
+            try:
+                _span_exec(
+                    dap, core, r52.instr_dtr_to_reg(r52.SCRATCH_REG, t32=t32),
+                    ap_base=ap_base,
+                )
+            except RunControlError:
+                pass  # the span is failing anyway; the fallback re-reads
+            out.values[f"r{r52.SCRATCH_REG}"] = saved
+        _span_end_err_check(dap, core, ap_base=ap_base)
+        sampled = _read(dap, ap_base, base, r52.EDPCSR_LO)
+    if sampled != r52.EDPCSR_INVALID:
+        out.pc_sampled = sampled
+
+
+def _read_registers_checked(
+    dap: Dap, core: Core, out: Registers, *, ap_base: int
+) -> None:
+    """The per-access reference implementation: ~7 transactions per value,
+    but a fault localises to one register or one note instead of poisoning
+    the batch. An r0-r14 failure propagates (read_registers may re-verify)."""
     for n in range(15):
         out.values[f"r{n}"] = read_reg(dap, core, n, ap_base=ap_base)
 
@@ -1487,30 +1704,9 @@ def read_registers(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> Registers:
         write_reg(dap, core, r52.SCRATCH_REG, saved, ap_base=ap_base)
         out.values[f"r{r52.SCRATCH_REG}"] = saved
 
-    # PC comes from the sample register rather than the register file. In Debug
-    # state r15 does not read as the PC, and the architecturally correct source
-    # (DLR) needs an instruction encoding this tool has not verified. EDPCSR is
-    # documented but implementation-defined while halted, so it is reported
-    # separately and labelled, never mixed in with the values above.
-    # EDPCSR is reported only as a cross-check, and only when it is valid. It is
-    # a profiling aid: measured 0xFFFFFFFF -- the architectural "sample not
-    # valid" -- on every halted core here. The PC above comes from DLR, which is
-    # the architected debug-state source.
     sampled = _read_checked(dap, ap_base, core.debug_base, r52.EDPCSR_LO)
     if sampled is not None and sampled != r52.EDPCSR_INVALID:
         out.pc_sampled = sampled
-        if out.pc is not None and sampled != out.pc:
-            out.notes.append(
-                f"EDPCSR samples 0x{sampled:08X} while DLR gives 0x{out.pc:08X}. DLR is "
-                "the debug-state PC; EDPCSR is a profiling sample and may lag."
-            )
-    if out.pc is None:
-        out.notes.append(
-            "PC unavailable: the DLR read did not succeed and EDPCSR is not valid "
-            "while halted. Where a core stopped is still knowable from the breakpoint "
-            "that stopped it -- see `core status`."
-        )
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1535,30 +1731,67 @@ def comparator_counts(core: Core) -> tuple[int, int]:
     return int(counts["breakpoints"]), int(counts["watchpoints"])
 
 
-def list_breakpoints(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> list[dict[str, object]]:
-    """Every breakpoint comparator, programmed or not."""
+def list_breakpoints(
+    dap: Dap, core: Core, *, ap_base: int = AP_APB, from_shadow: bool = False
+) -> list[dict[str, object]]:
+    """Every breakpoint comparator, programmed or not.
+
+    The default reads hardware -- that stays the answer for anything
+    user-facing -- and seeds the shadow when every slot read. ``from_shadow``
+    serves the remembered state instead (16 transactions saved) and is for
+    hot paths like the poll's halt attribution; it silently falls back to the
+    hardware read while the shadow is unknown.
+    """
     total, _ = comparator_counts(core)
+    shadow = core.comparator_shadow
+    if from_shadow and shadow.bp is not None:
+        return [
+            {"index": n, **r52.decode_breakpoint(*shadow.bp[n])}
+            for n in range(total)
+            if n in shadow.bp
+        ]
     out: list[dict[str, object]] = []
+    seed: dict[int, tuple[int, int]] | None = {}
     for n in range(total):
         value = _read_checked(dap, ap_base, core.debug_base, r52.dbgbvr(n))
         control = _read_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n))
         if value is None or control is None:
             out.append({"index": n, "error": "comparator registers did not read"})
+            seed = None
             continue
+        if seed is not None:
+            seed[n] = (value, control)
         out.append({"index": n, **r52.decode_breakpoint(value, control)})
+    if seed is not None:
+        shadow.bp = seed
     return out
 
 
-def list_watchpoints(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> list[dict[str, object]]:
+def list_watchpoints(
+    dap: Dap, core: Core, *, ap_base: int = AP_APB, from_shadow: bool = False
+) -> list[dict[str, object]]:
     _, total = comparator_counts(core)
+    shadow = core.comparator_shadow
+    if from_shadow and shadow.wp is not None:
+        return [
+            {"index": n, **r52.decode_watchpoint(*shadow.wp[n])}
+            for n in range(total)
+            if n in shadow.wp
+        ]
     out: list[dict[str, object]] = []
+    seed: dict[int, tuple[int, int]] | None = {}
     for n in range(total):
         value = _read_checked(dap, ap_base, core.debug_base, r52.dbgwvr(n))
         control = _read_checked(dap, ap_base, core.debug_base, r52.dbgwcr(n))
         if value is None or control is None:
             out.append({"index": n, "error": "comparator registers did not read"})
+            seed = None
             continue
+        if seed is not None:
+            seed[n] = (value, control)
         out.append({"index": n, **r52.decode_watchpoint(value, control)})
+    if seed is not None:
+        shadow.wp = seed
     return out
 
 
@@ -1589,7 +1822,13 @@ def set_breakpoint(
     """
     total, _ = comparator_counts(core)
     if index is None:
-        index = _free_slot(list_breakpoints(dap, core, ap_base=ap_base), "breakpoint")
+        # Shadow-served when known: the free-slot search otherwise costs a
+        # 16-transaction read of all 8 comparators on every temporary
+        # breakpoint (step-over, run-to, every range-step hop).
+        index = _free_slot(
+            list_breakpoints(dap, core, ap_base=ap_base, from_shadow=True),
+            "breakpoint",
+        )
     if not 0 <= index < total:
         raise RunControlError(
             f"{core.name} implements {total} breakpoint comparators, so {index} is not "
@@ -1609,11 +1848,13 @@ def set_breakpoint(
     ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgbvr(index), value)
     ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgbcr(index), control)
     if not ok:
+        core.comparator_shadow.bp = None
         raise RunControlError(f"{core.name}: a breakpoint comparator write faulted.")
 
     back_value = _read_checked(dap, ap_base, core.debug_base, r52.dbgbvr(index))
     back_control = _read_checked(dap, ap_base, core.debug_base, r52.dbgbcr(index))
     if back_value != value or back_control != control:
+        core.comparator_shadow.bp = None
         raise RunControlError(
             f"{core.name}: breakpoint {index} did not take. Wrote DBGBVR 0x{value:08X} / "
             f"DBGBCR 0x{control:08X}, read back 0x{back_value or 0:08X} / "
@@ -1621,6 +1862,8 @@ def set_breakpoint(
             "classic sign that invasive debug is not actually authorised "
             "(guide §3.3, §9 pitfall 4)."
         )
+    if core.comparator_shadow.bp is not None:
+        core.comparator_shadow.bp[index] = (value, control)
     return {"index": index, **r52.decode_breakpoint(value, control)}
 
 
@@ -1631,8 +1874,14 @@ def clear_breakpoint(dap: Dap, core: Core, index: int, *, ap_base: int = AP_APB)
     before handing the target back -- a disabled comparator still holding an
     address is confusing to whoever looks next.
     """
-    _write_checked(dap, ap_base, core.debug_base, r52.dbgbcr(index), 0)
-    _write_checked(dap, ap_base, core.debug_base, r52.dbgbvr(index), 0)
+    ok = _write_checked(dap, ap_base, core.debug_base, r52.dbgbcr(index), 0)
+    ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgbvr(index), 0)
+    shadow = core.comparator_shadow
+    if shadow.bp is not None:
+        if ok:
+            shadow.bp[index] = (0, 0)
+        else:
+            shadow.bp = None
 
 
 def set_watchpoint(
@@ -1647,7 +1896,10 @@ def set_watchpoint(
 ) -> dict[str, object]:
     _, total = comparator_counts(core)
     if index is None:
-        index = _free_slot(list_watchpoints(dap, core, ap_base=ap_base), "watchpoint")
+        index = _free_slot(
+            list_watchpoints(dap, core, ap_base=ap_base, from_shadow=True),
+            "watchpoint",
+        )
     if not 0 <= index < total:
         raise RunControlError(
             f"{core.name} implements {total} watchpoint comparators, so {index} is not "
@@ -1666,21 +1918,31 @@ def set_watchpoint(
     ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(index), value)
     ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(index), control)
     if not ok:
+        core.comparator_shadow.wp = None
         raise RunControlError(f"{core.name}: a watchpoint comparator write faulted.")
 
     back_value = _read_checked(dap, ap_base, core.debug_base, r52.dbgwvr(index))
     back_control = _read_checked(dap, ap_base, core.debug_base, r52.dbgwcr(index))
     if back_value != value or back_control != control:
+        core.comparator_shadow.wp = None
         raise RunControlError(
             f"{core.name}: watchpoint {index} did not take (read back "
             f"0x{back_value or 0:08X} / 0x{back_control or 0:08X})."
         )
+    if core.comparator_shadow.wp is not None:
+        core.comparator_shadow.wp[index] = (value, control)
     return {"index": index, **r52.decode_watchpoint(value, control)}
 
 
 def clear_watchpoint(dap: Dap, core: Core, index: int, *, ap_base: int = AP_APB) -> None:
-    _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(index), 0)
-    _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(index), 0)
+    ok = _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(index), 0)
+    ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(index), 0)
+    shadow = core.comparator_shadow
+    if shadow.wp is not None:
+        if ok:
+            shadow.wp[index] = (0, 0)
+        else:
+            shadow.wp = None
 
 
 def sanitize_comparators(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
@@ -1697,18 +1959,27 @@ def sanitize_comparators(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
     """
     bp_total, wp_total = comparator_counts(core)
     armed = 0
+    all_ok = True
     for n in range(bp_total):
         control = _read_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n))
         if control is not None and control & r52.DBGBCR_E:
             armed += 1
-        _write_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n), 0)
-        _write_checked(dap, ap_base, core.debug_base, r52.dbgbvr(n), 0)
+        all_ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n), 0)
+        all_ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgbvr(n), 0)
     for n in range(wp_total):
         control = _read_checked(dap, ap_base, core.debug_base, r52.dbgwcr(n))
         if control is not None and control & r52.DBGWCR_E:
             armed += 1
-        _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(n), 0)
-        _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(n), 0)
+        all_ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgwcr(n), 0)
+        all_ok &= _write_checked(dap, ap_base, core.debug_base, r52.dbgwvr(n), 0)
+    # A fully-acknowledged blank is a complete picture: seed the shadow so
+    # step and the poll's halt attribution stop re-reading all 8 slots.
+    if all_ok:
+        core.comparator_shadow.bp = {n: (0, 0) for n in range(bp_total)}
+        core.comparator_shadow.wp = {n: (0, 0) for n in range(wp_total)}
+    else:
+        core.comparator_shadow.bp = None
+        core.comparator_shadow.wp = None
     return armed
 
 
@@ -1726,9 +1997,48 @@ def _restart(dap: Dap, core: Core, *, ap_base: int) -> None:
         raise RunControlError(f"{core.name}: the CTIAPPPULSE write faulted.")
 
 
+def _read_via_scratch_fast(
+    dap: Dap, core: Core, mover: int, *, ap_base: int
+) -> int:
+    """Save scratch, run ``mover`` (sysreg -> scratch), read it out, restore
+    -- as one checked span (~10 plain accesses instead of ~15 checked
+    transactions). Raises on any fault; callers fall back to the per-access
+    path. The restore runs even on a failing span, so a poisoned batch does
+    not leave the halted context corrupted."""
+    t32 = _INSTRUCTION_SET.get(core.debug_base, True)
+    base = core.debug_base
+    with dap.checked_span():
+        edscr = _span_wait_ite(dap, core, ap_base=ap_base)
+        if edscr & r52.EDSCR_ERR:
+            dap.mem_write(ap_base, base + r52.EDRCR, r52.EDRCR_CSE, size=32)
+        saved = _span_reg_to_dtr(dap, core, r52.SCRATCH_REG, ap_base=ap_base, t32=t32)
+        try:
+            _span_exec(dap, core, mover, ap_base=ap_base)
+            value = _span_reg_to_dtr(
+                dap, core, r52.SCRATCH_REG, ap_base=ap_base, t32=t32
+            )
+        finally:
+            dap.mem_write(ap_base, base + r52.DBGDTRRX, saved, size=32)
+            try:
+                _span_exec(
+                    dap, core, r52.instr_dtr_to_reg(r52.SCRATCH_REG, t32=t32),
+                    ap_base=ap_base,
+                )
+            except RunControlError:
+                pass
+        _span_end_err_check(dap, core, ap_base=ap_base)
+    return value
+
+
 def read_pc(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
     """The PC of a halted core, from DLR."""
     t32 = _INSTRUCTION_SET.get(core.debug_base, True)
+    try:
+        return _read_via_scratch_fast(
+            dap, core, r52.instr_dlr_to_reg(r52.SCRATCH_REG, t32=t32), ap_base=ap_base
+        )
+    except (DapError, RunControlError):
+        pass  # fall back to the localising per-access path
     saved = read_reg(dap, core, r52.SCRATCH_REG, ap_base=ap_base)
     try:
         execute(dap, core, r52.instr_dlr_to_reg(r52.SCRATCH_REG, t32=t32), ap_base=ap_base)
@@ -1740,6 +2050,13 @@ def read_pc(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
 def read_dspsr(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> int:
     """The saved PSR of a halted core, from DSPSR."""
     t32 = _INSTRUCTION_SET.get(core.debug_base, True)
+    try:
+        return _read_via_scratch_fast(
+            dap, core, r52.instr_dspsr_to_reg(r52.SCRATCH_REG, t32=t32),
+            ap_base=ap_base,
+        )
+    except (DapError, RunControlError):
+        pass
     saved = read_reg(dap, core, r52.SCRATCH_REG, ap_base=ap_base)
     try:
         execute(
@@ -1776,6 +2093,42 @@ def write_pc(dap: Dap, core: Core, value: int, *, ap_base: int = AP_APB) -> None
 def write_dspsr(dap: Dap, core: Core, value: int, *, ap_base: int = AP_APB) -> None:
     """Set the PSR the core will restore on restart, by writing DSPSR."""
     _write_debug_sysreg(dap, core, r52.instr_reg_to_dspsr, value, ap_base=ap_base)
+
+
+def set_interrupt_mask_for_run(
+    dap: Dap, core: Core, *, ap_base: int = AP_APB
+) -> int | None:
+    """Set EDSCR.INTdis for a debugger-driven run; returns the prior field.
+
+    The comparator range-step resumes the core for real between two
+    addresses, and without the mask a periodic tick would teleport the run
+    into an exception handler -- exactly the failure ``step`` masks against.
+    Returns None (nothing to restore) when EDSCR is unreadable.
+    """
+    edscr = _read_checked(dap, ap_base, core.debug_base, r52.EDSCR)
+    if edscr is None:
+        return None
+    _write_checked(
+        dap, ap_base, core.debug_base, r52.EDSCR, r52.edscr_with_intdis(edscr, True)
+    )
+    return edscr & r52.EDSCR_INTDIS_MASK
+
+
+def restore_interrupt_mask(
+    dap: Dap, core: Core, prior: int | None, *, ap_base: int = AP_APB
+) -> None:
+    """Put EDSCR.INTdis back after set_interrupt_mask_for_run."""
+    if prior is None:
+        return
+    now = _read_checked(dap, ap_base, core.debug_base, r52.EDSCR)
+    if now is not None:
+        _write_checked(
+            dap,
+            ap_base,
+            core.debug_base,
+            r52.EDSCR,
+            r52.edscr_with_intdis(now, bool(prior)),
+        )
 
 
 def step(
@@ -1824,17 +2177,32 @@ def step(
     # because finding the match needs the PC, which needs the register path,
     # which may not be verified. A single step executes one instruction, so
     # nothing else can be missed in the meantime.
+    #
+    # The shadow, when known, says which comparators are armed without the
+    # 8-slot read sweep (16 transactions per step); only the actually-armed
+    # ones -- typically one or two -- pay the disable/re-enable writes. The
+    # suspend/restore is net-zero on the comparators, so the shadow itself
+    # needs no update here.
     suspended: list[tuple[int, int]] = []
-    try:
-        for n in range(comparator_counts(core)[0]):
-            control = _read_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n))
-            if control is not None and control & r52.DBGBCR_E:
+    shadow_bp = core.comparator_shadow.bp
+    if shadow_bp is not None:
+        for n, (_value, control) in sorted(shadow_bp.items()):
+            if control & r52.DBGBCR_E:
                 suspended.append((n, control))
                 _write_checked(
                     dap, ap_base, core.debug_base, r52.dbgbcr(n), control & ~r52.DBGBCR_E
                 )
-    except RunControlError:
-        pass  # no believable comparator count; nothing to suspend
+    else:
+        try:
+            for n in range(comparator_counts(core)[0]):
+                control = _read_checked(dap, ap_base, core.debug_base, r52.dbgbcr(n))
+                if control is not None and control & r52.DBGBCR_E:
+                    suspended.append((n, control))
+                    _write_checked(
+                        dap, ap_base, core.debug_base, r52.dbgbcr(n), control & ~r52.DBGBCR_E
+                    )
+        except RunControlError:
+            pass  # no believable comparator count; nothing to suspend
 
     if mask_interrupts:
         _write_checked(
@@ -2147,7 +2515,7 @@ def halt_location(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> dict[str, o
     if status == r52.EDSCR_STATUS_BREAKPOINT:
         armed = [
             entry
-            for entry in list_breakpoints(dap, core, ap_base=ap_base)
+            for entry in list_breakpoints(dap, core, ap_base=ap_base, from_shadow=True)
             if entry.get("enabled")
         ]
         out["armed_breakpoints"] = armed
@@ -2168,7 +2536,9 @@ def halt_location(dap: Dap, core: Core, *, ap_base: int = AP_APB) -> dict[str, o
             )
     elif status == r52.EDSCR_STATUS_WATCHPOINT:
         out["armed_watchpoints"] = [
-            e for e in list_watchpoints(dap, core, ap_base=ap_base) if e.get("enabled")
+            e
+            for e in list_watchpoints(dap, core, ap_base=ap_base, from_shadow=True)
+            if e.get("enabled")
         ]
         # Guide §5.3: "On a watchpoint halt, the data address is in EDWAR" --
         # the high word is UNKNOWN and ignored. §5.8 adds that the reported
