@@ -82,6 +82,11 @@
           "id": "s32e.memory",
           "name": "Memory",
           "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.stacks",
+          "name": "Stacks",
+          "icon": "media/icon.svg"
         }
       ]
     },
@@ -358,6 +363,18 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "s32e.stacks.selectProject",
+        "title": "Select Project (Stack Config)...",
+        "category": "S32E",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "s32e.refreshStacks",
+        "title": "Refresh Stack Utilization",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "s32e.addWatch",
         "title": "Add Watch...",
         "category": "S32E",
@@ -627,6 +644,16 @@
           "command": "s32e.refreshMemory",
           "when": "view == s32e.memory && s32e.connected",
           "group": "navigation@2"
+        },
+        {
+          "command": "s32e.stacks.selectProject",
+          "when": "view == s32e.stacks && s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.refreshStacks",
+          "when": "view == s32e.stacks && s32e.connected",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -877,6 +904,11 @@
           "type": "boolean",
           "default": false,
           "description": "Full word-for-word verify after Load to RAM (sampled verification always runs)."
+        },
+        "s32e.stacks.fillPattern": {
+          "type": "string",
+          "default": "0xAAAAAAAA",
+          "description": "The 32-bit word the OS paints unused stack with (MICROSAR OS_HAL_STACK_FILL_PATTERN). The Stacks view's utilization scan looks for where this pattern ends."
         },
         "s32e.variables.liveRefreshMs": {
           "type": "number",

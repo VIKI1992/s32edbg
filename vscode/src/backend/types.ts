@@ -206,6 +206,48 @@ export interface VarRefreshResult {
   rows: VarRow[];
 }
 
+/** One configured stack out of the project ARXML (`stacks config`). */
+export interface StackCfgEntry {
+  name: string;
+  size: number | null;
+  type: string | null;
+  core: string | null;
+  users: string[];
+}
+
+export interface StacksConfigResult {
+  project: string | null;
+  arxml: string | null;
+  candidates: string[];
+  total: number;
+  stacks: StackCfgEntry[];
+}
+
+/** One stack's painted-watermark utilization (`stacks scan`). */
+export interface StackScanRow {
+  name: string;
+  core: string | null;
+  type: string | null;
+  users: string[];
+  address: string | null;
+  size: number | null;
+  size_elf: number | null;
+  used: number | null;
+  free: number | null;
+  pct: number | null;
+  overflow: boolean | null;
+  watermark: string | null;
+  note: string | null;
+  error: string | null;
+}
+
+export interface StacksScanResult {
+  arxml: string;
+  pattern: string;
+  scanned: number;
+  rows: StackScanRow[];
+}
+
 export function hexToInt(text: string | null | undefined): number | null {
   if (!text) {
     return null;

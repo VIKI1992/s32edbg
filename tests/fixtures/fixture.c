@@ -52,3 +52,9 @@ void _start(void) {
         counter = outer(counter) + bump(1);
     }
 }
+
+/* Stack-monitor shapes: painted-stack arrays that the ARXML fixture
+ * (stacks_os_ecuc.arxml) references by name via OsCfg_Stack_<name>_Dyn.
+ * Appended after _start so every earlier line number stays put. */
+unsigned int OsCfg_Stack_TestA_Dyn[64];
+unsigned int OsCfg_Stack_TestB_Dyn[32];

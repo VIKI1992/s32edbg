@@ -2254,6 +2254,22 @@ one session, on a board with the known-good app in flash:
       ~2 s of Pause or a stream stall, and recovers on resume. The sidebar
       divider drags to resize (110 px .. 60 % of the panel, chart re-lays
       out live); double-clicking it resets to 200 px.
+    - 16j. Stacks view (2026-08-12, offline-verified, bench pending): with
+      the app running past `StartOS`, **Select Project** → point at
+      `C:\br1_rear_ecu` → it lands on
+      `BSw\DaVinciWorkSpace\Config\ECUC\Rear_ECU_Os_Os_ecuc.arxml` (the
+      38 MB `Rear_ECU.ecuc.Initial.arxml` must NOT qualify) and the first
+      scan runs — expect all 27 stacks (15 OsCore0 + 12 OsCore1), no error
+      rows, a few seconds total (the envelope's ms/ops names the cost).
+      Cross-check one task stack's used-bytes against a trusted reading
+      (T32 or the OS's own Os_GetStackUsage) — they must agree exactly
+      (same algorithm: first non-0xAAAAAAAA word scanning up from the low
+      address). `mem write <low-word-of-a-scratch-stack> 0x0 --ap axi`,
+      refresh → that row flags OVERFLOW. Refresh with all cores running
+      and with them halted — both work (plain AXI reads). Init/Kernel
+      stacks read high by design (painted only below the painting SP).
+      No traffic without the button: watch the output channel stay quiet
+      while the view is merely open.
 
 Record the run under `bench-runs/` as usual.
 

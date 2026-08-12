@@ -16,6 +16,7 @@ import { BreakpointStore } from "./state/breakpoints";
 import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
 import { DebugState } from "./state/session";
+import { StacksState } from "./state/stacks";
 import { VariablesLive, VariablesState } from "./state/variables";
 import {
   isAutoRefreshNode,
@@ -30,6 +31,7 @@ import { CoresView } from "./views/coresView";
 import { MemoryView } from "./views/memoryView";
 import { RegistersView } from "./views/registersView";
 import { SessionView } from "./views/sessionView";
+import { StacksView } from "./views/stacksView";
 import { StackView } from "./views/stackView";
 import { VariablesView } from "./views/variablesView";
 import { WatchpointsView } from "./views/watchpointsView";
@@ -78,6 +80,12 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   const memTree = vscode.window.createTreeView("s32e.memory", {
     treeDataProvider: memoryView,
+  });
+  // Stacks: refresh-button-only by design -- not in polledTrees, no
+  // Auto-refresh checkbox, no probe traffic unless the button is pressed.
+  const stacks = new StacksState(context.workspaceState);
+  const stacksTree = vscode.window.createTreeView("s32e.stacks", {
+    treeDataProvider: new StacksView(state, stacks),
   });
   const bpTree = vscode.window.createTreeView("s32e.breakpoints", {
     treeDataProvider: new BreakpointsView(bpStore, viewPolling, comparators),
@@ -133,7 +141,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output, state, elf, bpStore, wpStore, disasm, mem, pcDecor, poller,
     comparators, plots, statusBar, stackTree, regsTree, varsTree, coresTree,
-    memTree, bpTree, wpTree, variables, varLive, viewPolling,
+    memTree, bpTree, wpTree, stacks, stacksTree, variables, varLive,
+    viewPolling,
     vscode.window.registerTreeDataProvider("s32e.session", new SessionView(state, elf)),
     vscode.workspace.registerTextDocumentContentProvider(DISASM_SCHEME, disasm),
     vscode.workspace.registerTextDocumentContentProvider(MEM_SCHEME, mem),
@@ -142,7 +151,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const deps: Deps = {
     state, elf, output, poller, bpStore, wpStore, disasm, mem, pcDecor,
     statusBar, stackView, variables, varLive, viewPolling, comparators,
-    plots,
+    plots, stacks,
     variablesTreeVisible: () => varsTree.visible,
     refreshTitles,
   };

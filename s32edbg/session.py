@@ -91,6 +91,10 @@ class DebugSession:
     #: The machine-mode streaming sampler (cli._SampleStreamer), present only
     #: inside `debug --machine`; `var sample` commands configure it.
     sampler: Any = None
+    #: The stack monitor's parsed project config (`stacks config`):
+    #: {"project", "arxml", "entries": list[stackcfg.StackEntry]} or None.
+    #: Pure host-side data -- survives run-state changes untouched.
+    stack_config: Any = None
 
     #: Read caches, valid only for _cache_key == the current generations.
     #: An IDE stop refreshes registers three to five times (regs, stack,

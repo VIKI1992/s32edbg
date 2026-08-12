@@ -21,6 +21,7 @@ from rich.console import Console
 from . import __version__
 from . import elf as elf_mod
 from . import machine as machine_mod
+from . import stackcfg
 from .symbols import disasm as symdisasm
 from .symbols import dwarf as symdwarf
 from .symbols import unwind as symunwind
@@ -3005,6 +3006,263 @@ def stack_cmd(ctx: Ctx, core_spec: str | None, max_frames: int) -> None:
             "core": name,
             "frames": [f.as_dict() for f in frames],
             "stopped": reason,
+        })
+
+
+# ---------------------------------------------------------------------------
+# stacks -- OS stack utilization (ARXML-configured, painted-word scans)
+# ---------------------------------------------------------------------------
+
+
+def _stack_watermark(read_words_at, total_words: int, fill: int) -> tuple[int, bool]:
+    """(first non-fill word index, canary intact) for one painted stack.
+
+    ``read_words_at(index, count) -> list[int]``. The painted region is a
+    contiguous prefix ``[0, W)`` of the stack (full-descending: usage eats
+    the high end). Binary probes alone can overshoot W when live data
+    happens to hold the fill value, so no candidate is believed until a
+    64-word window right below it reads fully painted -- a failed window
+    moves the candidate down onto the offending word and re-verifies, which
+    strictly descends and therefore terminates. Overestimating usage is the
+    accepted failure direction; underestimating never happens.
+    """
+    canary_ok = read_words_at(0, 1)[0] == fill
+    lo, hi = 0, total_words
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if read_words_at(mid, 1)[0] == fill:
+            lo = mid + 1
+        else:
+            hi = mid
+    cand = lo
+    while cand > 0:
+        base = max(0, cand - 64)
+        window = read_words_at(base, cand - base)
+        bad = next((i for i, w in enumerate(window) if w != fill), None)
+        if bad is None:
+            break
+        cand = base + bad
+    return cand, canary_ok
+
+
+def _elf_stack_size(vindex, g) -> int | None:
+    """The backing array's byte size out of DWARF, if it names one."""
+    tinfo = vindex.type_of(g.decl.type_die)
+    if tinfo.size is not None:
+        return tinfo.size
+    if tinfo.count is not None and tinfo.elem is not None:
+        elem = vindex.type_of(tinfo.elem)
+        if elem.size is not None:
+            return tinfo.count * elem.size
+    return None
+
+
+def _scan_one_stack(
+    dap: Dap, vindex, entry: stackcfg.StackEntry, fill: int
+) -> dict[str, object]:
+    """One stack's scan row; errors land in the row, never abort the batch."""
+    row: dict[str, object] = {
+        "name": entry.name,
+        "core": entry.core,
+        "type": entry.stack_type,
+        "users": entry.users,
+        "address": None,
+        "size": entry.size,
+        "size_elf": None,
+        "used": None,
+        "free": None,
+        "pct": None,
+        "overflow": None,
+        "watermark": None,
+        "note": None,
+        "error": None,
+    }
+    symbol = f"OsCfg_Stack_{entry.name}_Dyn"
+    matches = vindex.globals_by_name.get(symbol)
+    if not matches:
+        row["error"] = f"{symbol} not in the loaded ELF (stale ELF vs ARXML?)"
+        return row
+    g = matches[0]
+    addr = g.decl.static_addr
+    if addr is None:
+        row["error"] = f"{symbol} has no static address"
+        return row
+    row["address"] = f"0x{addr:08X}"
+    elf_size = _elf_stack_size(vindex, g)
+    row["size_elf"] = elf_size
+    size = entry.size if entry.size is not None else elf_size
+    if size is None or size < 8 or size % 4:
+        row["error"] = f"unusable stack size {size!r}"
+        return row
+    row["size"] = size
+    if elf_size is not None and entry.size is not None and elf_size != entry.size:
+        row["note"] = (
+            f"ARXML says {entry.size} B but the ELF array is {elf_size} B "
+            "-- scanning the ARXML size"
+        )
+
+    def read_at(idx: int, count: int) -> list[int]:
+        return memaccess.read_words(dap, AP_AXI, addr + 4 * idx, count)
+
+    try:
+        watermark, canary_ok = _stack_watermark(read_at, size // 4, fill)
+    except (S32EError, TransportError) as exc:
+        row["error"] = str(exc)
+        return row
+    used = size - watermark * 4
+    row["used"] = used
+    row["free"] = watermark * 4
+    row["pct"] = round(used * 100.0 / size, 1)
+    row["overflow"] = not canary_ok
+    row["watermark"] = f"0x{addr + 4 * watermark:08X}"
+    if watermark == 0:
+        note = (
+            "no fill pattern anywhere -- unpainted (StartOS not reached?) "
+            "or fully used"
+        )
+        row["note"] = f"{row['note']}; {note}" if row["note"] else note
+    return row
+
+
+@main.group()
+def stacks() -> None:
+    """OS stack utilization: ARXML-configured stacks, painted-word scans.
+
+    Not `stack` (the call-stack unwinder). `stacks config` points the
+    session at a project's resolved Os ECUC export -- its OsStackSummary
+    lists every physical stack the OS builds; `stacks scan` joins that list
+    against the loaded ELF's OsCfg_Stack_<name>_Dyn arrays and finds each
+    stack's high-water mark by reading where the boot-time fill pattern
+    ends. Reads ride the AXI-AP like the memory viewer: no halt required.
+    """
+
+
+@stacks.command("config")
+@click.option("--project", "project_dir", default=None,
+              help="Project root to search for a resolved Os ECUC .arxml.")
+@click.option("--arxml", "arxml_path", default=None,
+              help="Exact .arxml to parse (skips discovery).")
+@click.pass_obj
+def stacks_config(
+    ctx: Ctx, project_dir: str | None, arxml_path: str | None
+) -> None:
+    """Load the project's stack list into the session.
+
+    Discovery probes every .arxml under --project for OsStackSummary
+    containers; only files actually defining stacks qualify (a pre-merge
+    ECUC snapshot never does). More than one hit is reported as
+    `candidates` for the caller to disambiguate with --arxml.
+    """
+    if arxml_path is None and project_dir is None:
+        raise click.ClickException(
+            "give --project to discover, or --arxml directly"
+        )
+    candidates: list[str] = []
+    if arxml_path is None:
+        assert project_dir is not None
+        if not Path(project_dir).is_dir():
+            raise click.ClickException(f"{project_dir} is not a directory")
+        candidates = stackcfg.discover_arxml(project_dir)
+        if not candidates:
+            raise click.ClickException(
+                f"no .arxml defining OsStackSummary stacks under {project_dir}"
+            )
+        if len(candidates) > 1:
+            console.print(
+                f"{len(candidates)} candidate files -- rerun with --arxml:"
+            )
+            for c in candidates:
+                console.print(f"  {c}")
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {
+                    "project": project_dir,
+                    "arxml": None,
+                    "candidates": candidates,
+                    "total": 0,
+                    "stacks": [],
+                })
+            return
+        arxml_path = candidates[0]
+    try:
+        entries = stackcfg.parse_os_ecuc(arxml_path)
+    except Exception as exc:
+        raise click.ClickException(f"{arxml_path}: {exc}") from None
+    if not entries:
+        raise click.ClickException(
+            f"{arxml_path}: no OsStackSummary/OsStack containers"
+        )
+    if ctx.session is not None:
+        ctx.session.stack_config = {
+            "project": project_dir,
+            "arxml": str(arxml_path),
+            "entries": entries,
+        }
+    console.print(f"{len(entries)} stack(s) from {arxml_path}")
+    for e in entries:
+        console.print(f"  {e.name:<40} {str(e.size or '?'):>7} B  {e.core or '-'}")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "project": project_dir,
+            "arxml": str(arxml_path),
+            "candidates": candidates,
+            "total": len(entries),
+            "stacks": [e.as_dict() for e in entries],
+        })
+
+
+@stacks.command("scan")
+@click.option("--pattern", default="0xAAAAAAAA", show_default=True,
+              help="The 32-bit word the OS paints unused stack with.")
+@click.pass_obj
+def stacks_scan(ctx: Ctx, pattern: str) -> None:
+    """High-water scan of every configured stack (target may be running).
+
+    Per stack: a canary read at the low end (the overflow flag), a binary
+    probe for where the fill pattern stops, and a painted-window
+    verification below the candidate so a stray fill-valued local cannot
+    fake a lower watermark. A faulting stack reports its error and the
+    rest still scan. Note the stack the OS painted from (Init/Kernel) is
+    only painted below its then-SP, so it reads high -- that is not an
+    overflow.
+    """
+    session = ctx.session
+    cfg = getattr(session, "stack_config", None) if session is not None else None
+    if not cfg:
+        raise click.ClickException(
+            "no stack config in this session -- run `stacks config` first"
+        )
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    try:
+        fill = int(pattern, 16) & 0xFFFFFFFF
+    except ValueError:
+        raise click.ClickException(f"{pattern!r} is not a hex word") from None
+    rows: list[dict[str, object]] = []
+    with open_transport(ctx) as (_t, dap):
+        assert dap is not None
+        for note in _prepare_dap(dap, ctx=ctx):
+            console.print(f"[dim]note:[/dim] {note}")
+        _report, notes = memaccess.preflight(dap, AP_AXI, write=False)
+        for note in notes:
+            console.print(f"[yellow]![/yellow] {note}")
+        for entry in cfg["entries"]:
+            rows.append(_scan_one_stack(dap, vindex, entry, fill))
+    scanned = sum(1 for r in rows if r["error"] is None)
+    for r in rows:
+        if r["error"] is not None:
+            console.print(f"  {r['name']:<40} [red]{r['error']}[/red]")
+        else:
+            flag = "  [red]OVERFLOW[/red]" if r["overflow"] else ""
+            console.print(
+                f"  {r['name']:<40} {r['pct']:5.1f}%  "
+                f"{r['used']}/{r['size']} B{flag}"
+            )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "arxml": cfg["arxml"],
+            "pattern": f"0x{fill:08X}",
+            "scanned": scanned,
+            "rows": rows,
         })
 
 

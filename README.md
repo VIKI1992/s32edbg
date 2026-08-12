@@ -1704,6 +1704,14 @@ var names               the names-only catalogue behind the scope picker: every 
                         static (file and function scope, with cu/owner provenance) filtered
                         and paged out of the symbol index -- no target reads, no handles;
                         `--scalars` keeps just what `var sample` can stream
+stacks config           point the session at a project's resolved Os ECUC .arxml (--project
+                        discovers it by probing for OsStackSummary containers; --arxml is
+                        explicit) -- the MICROSAR stack list: name, size, type, core, users
+stacks scan             high-water scan of every configured stack, target running or halted:
+                        joins the ARXML names to the ELF's OsCfg_Stack_<name>_Dyn arrays,
+                        binary-probes where the 0xAAAAAAAA fill pattern ends (verified by a
+                        painted 64-word window), flags an overwritten low-word canary as
+                        overflow; a faulting stack errors its own row only
 var watch <path>        `counter`, `cfg.limits[2].max`, `*ptr`, `p->x` -- resolved locals-first
                         under a frame, statics/globals on a running core
 var expand / write / refresh

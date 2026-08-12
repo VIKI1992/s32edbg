@@ -7,6 +7,8 @@ import {
   hexToInt,
   PollResult,
   StackFrame,
+  StacksConfigResult,
+  StacksScanResult,
   toHex,
   VarRow,
   VarWriteResult,
@@ -21,6 +23,7 @@ import { BreakpointStore, S32Breakpoint } from "./state/breakpoints";
 import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
 import { CoreInfo, DebugState, familyOf, M33_NAMES } from "./state/session";
+import { StacksState } from "./state/stacks";
 import { VariablesLive, VariablesState } from "./state/variables";
 import { PolledView, ViewPolling } from "./state/viewPolling";
 import { S32Watchpoint, WatchpointStore } from "./state/watchpoints";
@@ -51,6 +54,7 @@ export interface Deps {
   viewPolling: ViewPolling;
   comparators: ComparatorReconciler;
   plots: PlotPanels;
+  stacks: StacksState;
   variablesTreeVisible: () => boolean;
   refreshTitles: () => void;
 }
@@ -212,6 +216,50 @@ async function symLoad(deps: Deps): Promise<boolean> {
         "Gutter breakpoints and source stepping stay unavailable.",
     );
     return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// stack monitor
+// ---------------------------------------------------------------------------
+
+/** One button press = one scan. Re-issues `stacks config` first: parsing the
+ * ARXML is host-side work (<100 ms) and re-doing it keeps the refresh honest
+ * across backend reconnects (the session forgets its config with the
+ * process). Needs symbols -- addresses come from the ELF. */
+async function refreshStacks(deps: Deps): Promise<void> {
+  const { state, stacks } = deps;
+  if (!state.connected) {
+    throw new Error("not connected");
+  }
+  if (!stacks.arxml) {
+    await vscode.commands.executeCommand("s32e.stacks.selectProject");
+    return;
+  }
+  if (!state.symbolsLoaded && !(await symLoad(deps))) {
+    throw new Error(
+      "stack addresses come from the ELF's symbols — pick an ELF first",
+    );
+  }
+  const client = state.requireClient();
+  const pattern =
+    setting<string>("stacks.fillPattern", "0xAAAAAAAA").trim() || "0xAAAAAAAA";
+  stacks.scanning = true;
+  stacks.fire();
+  try {
+    await vscode.window.withProgress(
+      { location: { viewId: "s32e.stacks" } },
+      async () => {
+        await client.run(`stacks config --arxml "${stacks.arxml}"`);
+        const result = (await client.run(
+          `stacks scan --pattern ${pattern}`,
+        )) as StacksScanResult;
+        stacks.noteScan(result.rows);
+      },
+    );
+  } finally {
+    stacks.scanning = false;
+    stacks.fire();
   }
 }
 
@@ -1042,6 +1090,62 @@ export function registerCommands(
     deps.refreshTitles();
   });
   reg("s32e.refreshMemory", () => mem.refreshAll());
+
+  // -- stack monitor --
+  reg("s32e.stacks.selectProject", async () => {
+    if (!state.connected) {
+      throw new Error(
+        "connect first — the backend searches and parses the project's ARXML",
+      );
+    }
+    const uris = await vscode.window.showOpenDialog({
+      title: "Project folder (searched for the resolved Os ECUC .arxml)",
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      defaultUri: deps.stacks.project
+        ? vscode.Uri.file(deps.stacks.project)
+        : vscode.workspace.workspaceFolders?.[0]?.uri,
+    });
+    const dir = uris?.[0]?.fsPath;
+    if (!dir) {
+      return;
+    }
+    const client = state.requireClient();
+    let result = (await vscode.window.withProgress(
+      {
+        location: { viewId: "s32e.stacks" },
+        title: "searching for stack ARXML…",
+      },
+      () => client.run(`stacks config --project "${dir}"`),
+    )) as StacksConfigResult;
+    if (result.candidates.length > 1) {
+      const pick = await vscode.window.showQuickPick(
+        result.candidates.map((c) => ({
+          label: path.basename(c),
+          description: c,
+        })),
+        { title: "Several ARXML files define stacks — which one?" },
+      );
+      if (!pick) {
+        return;
+      }
+      result = (await client.run(
+        `stacks config --arxml "${pick.description}"`,
+      )) as StacksConfigResult;
+    }
+    if (!result.arxml) {
+      throw new Error("no ARXML selected");
+    }
+    await deps.stacks.set(dir, result.arxml);
+    void vscode.window.setStatusBarMessage(
+      `S32E: ${result.total} stacks from ${path.basename(result.arxml)}`,
+      4000,
+    );
+    await refreshStacks(deps);
+  });
+  reg("s32e.refreshStacks", () => refreshStacks(deps));
+
   reg("s32e.writeMemory", async () => {
     if (!state.connected) {
       throw new Error("not connected");
