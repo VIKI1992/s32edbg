@@ -537,6 +537,8 @@ function scopeHtml(rate: number): string {
     width: 200px; flex: none; overflow-y: auto; padding: 4px 8px;
     border-right: 1px solid var(--vscode-editorWidget-border);
   }
+  #splitter { width: 5px; flex: none; cursor: ew-resize; background: transparent; }
+  #splitter:hover, #splitter:active { background: var(--vscode-focusBorder); }
   .sig { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
   .chip { width: 10px; height: 10px; border-radius: 2px; flex: none; }
   .sig .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -613,6 +615,7 @@ function scopeHtml(rate: number): string {
     <div id="addrow"><input id="addpath" placeholder="search vars or type path…"><button id="addbtn">+</button></div>
     <div id="sugg"></div>
   </div>
+  <div id="splitter" title="drag to resize · double-click resets"></div>
   <div id="wrap"><canvas id="c"></canvas><div id="note"></div></div>
 </div>
 <div id="readout"></div>
@@ -905,6 +908,25 @@ function scopeHtml(rate: number): string {
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") cursorA = cursorB = null;
   });
+
+  // sidebar splitter -- the chart needs no notification: draw() re-measures
+  // wrap.clientWidth every frame.
+  const sideEl = document.getElementById("side");
+  const mainEl = document.getElementById("main");
+  const splitEl = document.getElementById("splitter");
+  let sideDrag = null;           // {startX, startW} while resizing
+  splitEl.addEventListener("mousedown", (ev) => {
+    sideDrag = { startX: ev.clientX, startW: sideEl.getBoundingClientRect().width };
+    ev.preventDefault();         // no text selection mid-drag
+  });
+  splitEl.addEventListener("dblclick", () => { sideEl.style.width = "200px"; });
+  window.addEventListener("mousemove", (ev) => {
+    if (!sideDrag) return;
+    const max = Math.max(110, mainEl.clientWidth * 0.6);
+    const w = Math.min(max, Math.max(110, sideDrag.startW + ev.clientX - sideDrag.startX));
+    sideEl.style.width = w + "px";
+  });
+  window.addEventListener("mouseup", () => { sideDrag = null; });
 
   const PAD_L = 56, PAD_R = 10, PAD_T = 6, PAD_B = 20;
   let geom = { t0: 0, t1: 1, plotW: 1 };

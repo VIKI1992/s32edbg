@@ -2251,7 +2251,9 @@ one session, on a board with the known-good app in flash:
       per-signal normalization; in lanes mode Match Y gives every lane
       the same range. The `samples/s achieved` label keeps updating while
       cursors are placed (it froze before), decays to a plain 0 within
-      ~2 s of Pause or a stream stall, and recovers on resume.
+      ~2 s of Pause or a stream stall, and recovers on resume. The sidebar
+      divider drags to resize (110 px .. 60 % of the panel, chart re-lays
+      out live); double-clicking it resets to 200 px.
 
 Record the run under `bench-runs/` as usual.
 
