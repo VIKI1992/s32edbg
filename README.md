@@ -1700,6 +1700,10 @@ var locals              a halted frame's parameters, locals and function statics
                         no CFI row is the GCC frame-pointer-derived CFA, labeled `cfa_source: fp`)
 var globals             filtered, paged globals (a production image carries ~32k statics; values
                         are read for the shown page only)
+var names               the names-only catalogue behind the scope picker: every global and
+                        static (file and function scope, with cu/owner provenance) filtered
+                        and paged out of the symbol index -- no target reads, no handles;
+                        `--scalars` keeps just what `var sample` can stream
 var watch <path>        `counter`, `cfg.limits[2].max`, `*ptr`, `p->x` -- resolved locals-first
                         under a frame, statics/globals on a running core
 var expand / write / refresh

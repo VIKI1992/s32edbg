@@ -1,5 +1,11 @@
 import * as vscode from "vscode";
-import { SamplesEvent, VarRow, VarWatchResult } from "../backend/types";
+import {
+  SamplesEvent,
+  VarNameRow,
+  VarNamesResult,
+  VarRow,
+  VarWatchResult,
+} from "../backend/types";
 import { setting } from "../config";
 import { DebugState } from "../state/session";
 import { Output } from "../ui/output";
@@ -135,6 +141,65 @@ export class PlotPanels implements vscode.Disposable {
       .requireClient()
       .run(`var watch "${path}" --core ${core}`)) as VarWatchResult;
     this.addFromRow(core, result.row);
+  }
+
+  /** Add straight from a `var names` catalogue row: address and width are
+   * already known, so no `var watch` round trip and no handle. Statics get
+   * a cu(::func) qualified path -- two files may both own a `counter`. */
+  addFromNameRow(row: VarNameRow): void {
+    const core = this.state.focus;
+    if (!this.state.connected || !core) {
+      throw new Error("not connected");
+    }
+    if (!row.sampleable || row.address === null) {
+      throw new Error(
+        `${row.name} cannot be streamed: sampling needs a 1/2/4-byte ` +
+          "scalar with a fixed memory address",
+      );
+    }
+    const qualifier = row.static
+      ? `${row.cu}::${row.owner ? row.owner + "::" : ""}`
+      : "";
+    this.addFromRow(core, {
+      handle: null,
+      name: row.name,
+      path: qualifier + row.name,
+      type: row.type,
+      kind: row.kind,
+      value: null,
+      address: row.address,
+      register: null,
+      size: row.size,
+      expandable: false,
+      count: null,
+      static: row.static,
+      error: null,
+    });
+  }
+
+  /** Serve the sidebar picker: a names-only catalogue query -- no values
+   * are read, so per-keystroke traffic is symbol-index work only. Errors
+   * land in the suggestion list, not the note banner. */
+  async queryNames(panel: ScopePanel, text: string): Promise<void> {
+    const cleaned = text.replace(/["\\]/g, "").trim();
+    if (!this.state.connected || !this.state.client) {
+      panel.queryResult(text, [], 0, "connect to search variables");
+      return;
+    }
+    if (!cleaned) {
+      panel.queryResult(text, [], 0, null);
+      return;
+    }
+    try {
+      const result = (await this.state.client.run(
+        `var names --scalars --limit 50 --filter "${cleaned}"`,
+      )) as VarNamesResult;
+      panel.queryResult(text, result.names, result.total, null);
+    } catch (err) {
+      panel.queryResult(
+        text, [], 0, err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 
   newPanel(): ScopePanel {
@@ -321,6 +386,10 @@ class ScopePanel {
         try {
           if (msg.type === "addPath") {
             await this.owner.addByPath(this.key, String(msg.path));
+          } else if (msg.type === "query") {
+            await this.owner.queryNames(this, String(msg.text));
+          } else if (msg.type === "addVar") {
+            this.owner.addFromNameRow(msg.row as VarNameRow);
           } else if (msg.type === "remove") {
             this.owner.remove(String(msg.id));
           } else if (msg.type === "hide") {
@@ -390,6 +459,12 @@ class ScopePanel {
 
   note(text: string): void {
     this.post({ type: "note", text });
+  }
+
+  queryResult(
+    text: string, rows: VarNameRow[], total: number, error: string | null,
+  ): void {
+    this.post({ type: "queryResult", text, rows, total, error });
   }
 
   private post(msg: Record<string, unknown>): void {
@@ -470,6 +545,32 @@ function scopeHtml(rate: number): string {
   .sig.hidden .name, .sig.hidden .val { opacity: 0.45; }
   #addrow { display: flex; gap: 4px; margin-top: 6px; }
   #addrow input { flex: 1; min-width: 40px; }
+  #sugg { margin-top: 2px; }
+  .sug {
+    display: flex; align-items: baseline; gap: 6px; padding: 2px 4px;
+    cursor: pointer; border-radius: 2px;
+  }
+  .sug .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sug .ty {
+    color: var(--vscode-descriptionForeground); font-size: 11px;
+    margin-left: auto; flex: none; max-width: 55%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sug:hover { background: var(--vscode-list-hoverBackground); }
+  .sug.sel {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+  }
+  .sug.sel .ty { color: inherit; }
+  #suggmore {
+    color: var(--vscode-descriptionForeground); padding: 2px 4px;
+    font-style: italic;
+  }
+  button.on {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground); border-color: transparent;
+  }
+  #zoomgrp button { padding: 2px 6px; }
   #wrap { position: relative; flex: 1; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
   #note {
@@ -496,7 +597,10 @@ function scopeHtml(rate: number): string {
     <option value="30">30 s</option>
     <option value="60">60 s</option>
   </select></label>
+  <label>zoom <span id="zoomgrp"><button id="zx" class="on">X</button><button id="zy">Y</button><button id="zxy">XY</button></span></label>
+  <button id="fit" title="re-autoscale Y and follow live X again">Fit</button>
   <button id="layout">Overlay</button>
+  <button id="matchy" title="one shared Y scale across all signals: equal values at equal height">Match Y</button>
   <button id="pause">Pause</button>
   <button id="clearCursors">Clear cursors</button>
   <button id="clear">Clear</button>
@@ -506,7 +610,8 @@ function scopeHtml(rate: number): string {
 <div id="main">
   <div id="side">
     <div id="signals"></div>
-    <div id="addrow"><input id="addpath" placeholder="add path…"><button id="addbtn">+</button></div>
+    <div id="addrow"><input id="addpath" placeholder="search vars or type path…"><button id="addbtn">+</button></div>
+    <div id="sugg"></div>
   </div>
   <div id="wrap"><canvas id="c"></canvas><div id="note"></div></div>
 </div>
@@ -535,6 +640,22 @@ function scopeHtml(rate: number): string {
   let cursorA = null;            // absolute ms
   let cursorB = null;
   let dragging = null;           // "A" | "B"
+  let zoomAxis = "x";            // which axis the wheel zooms: x | y | xy
+  let matchY = false;            // one shared Y scale across signals
+  let followX = true;            // right edge tracks the newest sample
+  let viewT1 = 0;                // right edge when detached (absolute ms)
+  const yMan = new Map();        // id -> {min, max} manual Y (per signal)
+  let ySharedMan = null;         // {min, max} manual Y (matched mode)
+  let lastScales = new Map();    // last frame's scales -- the wheel's targets
+  let lastLayout = { laneH: 1, lanes: true, visible: [] };
+  const arrivals = [];           // [wall-clock ms, samples] for the rate label
+  let panning = null;            // {startX, t1} during an Alt+drag pan
+  let curSnaps = [];             // cursor history: dblclick-fit undoes its clicks
+  let suggRows = [];             // picker suggestions as sent by the extension
+  let suggSel = -1;
+  let suggTotal = 0;
+  let suggError = null;
+  let suggTimer = null;
 
   function css(name, fallback) {
     const v = getComputedStyle(document.body).getPropertyValue(name).trim();
@@ -597,6 +718,13 @@ function scopeHtml(rate: number): string {
     if (cur !== null) out.push(cur);
     return out;
   }
+  function zoomRange(min, max, anchor, factor) {
+    let lo = anchor - (anchor - min) * factor;
+    let hi = anchor + (max - anchor) * factor;
+    if (!isFinite(lo) || !isFinite(hi) || hi - lo <= 0) return { min, max };
+    if (hi - lo < 1e-9) { const mid = (lo + hi) / 2; lo = mid - 5e-10; hi = mid + 5e-10; }
+    return { min: lo, max: hi };
+  }
 
   window.addEventListener("message", (ev) => {
     const msg = ev.data;
@@ -604,7 +732,15 @@ function scopeHtml(rate: number): string {
       const s = series(msg.id);
       for (let i = 0; i < msg.t.length; i++) { s.t.push(msg.t[i]); s.v.push(msg.v[i]); }
       if (s.t.length > RING) { const cut = s.t.length - RING; s.t.splice(0, cut); s.v.splice(0, cut); }
+      arrivals.push([performance.now(), msg.t.length]);
+      while (arrivals.length && arrivals[0][0] < performance.now() - 2000) arrivals.shift();
       noteEl.style.display = "none";
+    } else if (msg.type === "queryResult") {
+      if (msg.text === addInput.value.trim()) {   // else: a stale echo
+        suggRows = msg.rows; suggTotal = msg.total; suggError = msg.error;
+        suggSel = suggRows.length ? 0 : -1;
+        renderSugg();
+      }
     } else if (msg.type === "signals") {
       list = msg.list;
       renderList();
@@ -648,8 +784,36 @@ function scopeHtml(rate: number): string {
     ev.target.value = String(hz);
     vscode.postMessage({ type: "setRate", hz });
   });
-  document.getElementById("win").addEventListener("change", (ev) => {
-    windowMs = Number(ev.target.value) * 1000;
+  const winSel = document.getElementById("win");
+  function setWindowMs(ms) {
+    windowMs = Math.min(600000, Math.max(50, ms));
+    let idx = -1;
+    for (let i = 0; i < winSel.options.length; i++) {
+      if (Number(winSel.options[i].value) * 1000 === windowMs) idx = i;
+    }
+    winSel.selectedIndex = idx;   // -1 = a wheel-zoomed custom span
+  }
+  winSel.addEventListener("change", (ev) => {
+    setWindowMs(Number(ev.target.value) * 1000);
+  });
+  const zoomBtns = {
+    x: document.getElementById("zx"),
+    y: document.getElementById("zy"),
+    xy: document.getElementById("zxy"),
+  };
+  function setZoomAxis(ax) {
+    zoomAxis = ax;
+    for (const k in zoomBtns) zoomBtns[k].className = k === ax ? "on" : "";
+  }
+  zoomBtns.x.addEventListener("click", () => setZoomAxis("x"));
+  zoomBtns.y.addEventListener("click", () => setZoomAxis("y"));
+  zoomBtns.xy.addEventListener("click", () => setZoomAxis("xy"));
+  function fit() { yMan.clear(); ySharedMan = null; followX = true; }
+  document.getElementById("fit").addEventListener("click", fit);
+  const matchBtn = document.getElementById("matchy");
+  matchBtn.addEventListener("click", () => {
+    matchY = !matchY;
+    matchBtn.className = matchY ? "on" : "";
   });
   const layoutBtn = document.getElementById("layout");
   layoutBtn.addEventListener("click", () => {
@@ -673,12 +837,71 @@ function scopeHtml(rate: number): string {
   document.getElementById("csv").addEventListener("click", () =>
     vscode.postMessage({ type: "exportCsv" }));
   const addInput = document.getElementById("addpath");
+  const suggEl = document.getElementById("sugg");
   const doAdd = () => {
     const path = addInput.value.trim();
-    if (path) { vscode.postMessage({ type: "addPath", path }); addInput.value = ""; }
+    if (path) { vscode.postMessage({ type: "addPath", path }); addInput.value = ""; closeSugg(); }
   };
+  function closeSugg() {
+    suggRows = []; suggSel = -1; suggTotal = 0; suggError = null;
+    renderSugg();
+  }
+  function pickSugg(i) {
+    const r = suggRows[i];
+    if (!r) return;
+    vscode.postMessage({ type: "addVar", row: r });
+    addInput.value = "";
+    closeSugg();
+  }
+  function renderSugg() {
+    suggEl.textContent = "";
+    if (suggError) {
+      const d = document.createElement("div");
+      d.id = "suggmore"; d.textContent = suggError;
+      suggEl.append(d);
+      return;
+    }
+    suggRows.forEach((r, i) => {
+      const row = document.createElement("div");
+      row.className = "sug" + (i === suggSel ? " sel" : "");
+      row.title = r.type + " " + r.name + " @ " + (r.address || "?") +
+        " — " + r.cu + (r.owner ? "::" + r.owner : "");
+      const name = document.createElement("span");
+      name.className = "name"; name.textContent = r.name;
+      const ty = document.createElement("span");
+      ty.className = "ty";
+      ty.textContent = r.static ? r.type + " · " + r.cu : r.type;
+      // mousedown (not click): fires before the input's blur closes the list
+      row.addEventListener("mousedown", (ev) => { ev.preventDefault(); pickSugg(i); });
+      row.append(name, ty);
+      suggEl.append(row);
+    });
+    if (suggTotal > suggRows.length) {
+      const more = document.createElement("div");
+      more.id = "suggmore";
+      more.textContent = (suggTotal - suggRows.length) + " more — keep typing";
+      suggEl.append(more);
+    }
+  }
+  addInput.addEventListener("input", () => {
+    const text = addInput.value.trim();
+    if (suggTimer) clearTimeout(suggTimer);
+    if (!text) { closeSugg(); return; }
+    suggTimer = setTimeout(() => vscode.postMessage({ type: "query", text }), 150);
+  });
+  addInput.addEventListener("blur", () => closeSugg());
   document.getElementById("addbtn").addEventListener("click", doAdd);
-  addInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doAdd(); });
+  addInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown" && suggRows.length) {
+      suggSel = (suggSel + 1) % suggRows.length; renderSugg(); ev.preventDefault();
+    } else if (ev.key === "ArrowUp" && suggRows.length) {
+      suggSel = (suggSel - 1 + suggRows.length) % suggRows.length; renderSugg(); ev.preventDefault();
+    } else if (ev.key === "Escape" && (suggRows.length || suggError)) {
+      closeSugg(); ev.stopPropagation();
+    } else if (ev.key === "Enter") {
+      if (suggSel >= 0) pickSugg(suggSel); else doAdd();
+    }
+  });
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") cursorA = cursorB = null;
   });
@@ -694,6 +917,14 @@ function scopeHtml(rate: number): string {
   }
 
   canvas.addEventListener("mousedown", (ev) => {
+    if (ev.altKey || ev.button === 1) {   // pan: detach from live and drag
+      if (followX) { viewT1 = latestT() || Date.now(); followX = false; }
+      panning = { startX: ev.offsetX, t1: viewT1 };
+      ev.preventDefault();
+      return;
+    }
+    curSnaps.unshift([cursorA, cursorB]);   // dblclick-fit undo history
+    if (curSnaps.length > 2) curSnaps.length = 2;
     const t = xToT(ev.offsetX);
     const near = (c) => c !== null && Math.abs(tToX(c) - ev.offsetX) < 6;
     if (near(cursorA)) { dragging = "A"; return; }
@@ -703,10 +934,61 @@ function scopeHtml(rate: number): string {
     else { cursorB = t; dragging = "B"; }
   });
   canvas.addEventListener("mousemove", (ev) => {
+    if (panning) {
+      viewT1 = panning.t1 - ((ev.offsetX - panning.startX) / geom.plotW) * windowMs;
+      return;
+    }
     if (dragging === "A") cursorA = xToT(ev.offsetX);
     else if (dragging === "B") cursorB = xToT(ev.offsetX);
   });
-  window.addEventListener("mouseup", () => { dragging = null; });
+  window.addEventListener("mouseup", () => {
+    if (panning) {
+      const latest = latestT();
+      if (latest && viewT1 >= latest) followX = true;   // dragged back to now
+      panning = null;
+    }
+    dragging = null;
+  });
+  canvas.addEventListener("dblclick", () => {
+    const snap = curSnaps[1] || curSnaps[0];   // undo this dblclick's clicks
+    if (snap) { cursorA = snap[0]; cursorB = snap[1]; }
+    fit();
+  });
+  canvas.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const factor = ev.deltaY > 0 ? 1.25 : 0.8;
+    if (zoomAxis === "x" || zoomAxis === "xy") {
+      if (followX) {
+        setWindowMs(windowMs * factor);   // live: the right edge stays pinned
+      } else {
+        const anchor = xToT(ev.offsetX);  // detached: the hovered time stays put
+        setWindowMs(windowMs * factor);
+        viewT1 = anchor + (viewT1 - anchor) * factor;
+      }
+    }
+    if (zoomAxis === "y" || zoomAxis === "xy") zoomYAt(ev.offsetY, factor);
+  }, { passive: false });
+  function zoomYAt(my, factor) {
+    const vis = lastLayout.visible;
+    if (!vis.length) return;
+    const pick = lastLayout.lanes
+      ? vis[Math.min(vis.length - 1,
+          Math.max(0, Math.floor((my - PAD_T) / lastLayout.laneH)))]
+      : null;
+    // matched: one shared range (anchored in the hovered lane's geometry);
+    // lanes: only the hovered lane; overlay: every signal around the same
+    // height fraction, preserving the per-signal normalization.
+    const targets = matchY ? [pick || vis[0]] : (pick ? [pick] : vis);
+    for (const sig of targets) {
+      const sc = lastScales.get(sig.id);
+      if (!sc) continue;
+      const f = Math.min(1, Math.max(0, (my - sc.y0) / sc.hgt));
+      const anchor = sc.vmax - f * (sc.vmax - sc.vmin);
+      const r = zoomRange(sc.vmin, sc.vmax, anchor, factor);
+      if (matchY) { ySharedMan = r; return; }
+      yMan.set(sig.id, r);
+    }
+  }
 
   function draw() {
     const dpr = window.devicePixelRatio || 1;
@@ -717,7 +999,18 @@ function scopeHtml(rate: number): string {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
-    const end = latestT() || Date.now();
+    const latest = latestT();
+    if (!followX && latest) {   // keep a detached view inside the data
+      let earliest = Infinity;
+      for (const s of data.values()) {
+        if (s.t.length && s.t[0] < earliest) earliest = s.t[0];
+      }
+      viewT1 = Math.max(
+        isFinite(earliest) ? earliest : latest,
+        Math.min(viewT1, latest + windowMs * 0.25),
+      );
+    }
+    const end = followX ? (latest || Date.now()) : viewT1;
     geom = { t0: end - windowMs, t1: end, plotW: w - PAD_L - PAD_R };
     const plotH = h - PAD_T - PAD_B;
     if (geom.plotW < 30 || plotH < 30) { requestAnimationFrame(draw); return; }
@@ -746,8 +1039,8 @@ function scopeHtml(rate: number): string {
     }
     ctx.textAlign = "left";
 
-    const scales = new Map();  // id -> {min, max, y0, hgt}
-    visible.forEach((sig, idx) => {
+    const autos = new Map();   // id -> autoscale range + decimated columns
+    visible.forEach((sig) => {
       const s = series(sig.id);
       const cols = decimate(s, geom.t0, geom.t1, columns);
       let vmin = Infinity, vmax = -Infinity;
@@ -755,13 +1048,36 @@ function scopeHtml(rate: number): string {
       if (!isFinite(vmin)) { vmin = 0; vmax = 1; }
       if (vmin === vmax) { const p = Math.max(1, Math.abs(vmin) * 0.1); vmin -= p; vmax += p; }
       const span = vmax - vmin; vmin -= span * 0.07; vmax += span * 0.07;
+      autos.set(sig.id, { vmin, vmax, cols });
+    });
+    let shared = null;         // matched: one absolute range for every signal
+    if (matchY) {
+      if (ySharedMan) {
+        shared = ySharedMan;
+      } else {
+        let lo = Infinity, hi = -Infinity;
+        for (const a of autos.values()) { if (a.vmin < lo) lo = a.vmin; if (a.vmax > hi) hi = a.vmax; }
+        if (!isFinite(lo)) { lo = 0; hi = 1; }
+        shared = { min: lo, max: hi };
+      }
+    }
+    const scales = new Map();  // id -> {vmin, vmax, y0, hgt, cols}
+    visible.forEach((sig, idx) => {
+      const a = autos.get(sig.id);
+      const man = matchY ? shared : (yMan.get(sig.id) || null);
       const y0 = lanes ? PAD_T + idx * laneH : PAD_T;
       const hgt = lanes ? laneH - 6 : plotH;
-      scales.set(sig.id, { vmin, vmax, y0, hgt, cols });
+      scales.set(sig.id, {
+        vmin: man ? man.min : a.vmin,
+        vmax: man ? man.max : a.vmax,
+        y0, hgt, cols: a.cols,
+      });
     });
+    lastScales = scales;
+    lastLayout = { laneH, lanes, visible };
 
     // lane separators + min/max labels + series
-    visible.forEach((sig) => {
+    visible.forEach((sig, idx) => {
       const sc = scales.get(sig.id);
       const color = slotColor(sig.slot);
       if (lanes) {
@@ -771,10 +1087,26 @@ function scopeHtml(rate: number): string {
         ctx.lineTo(w - PAD_R, Math.round(sc.y0 + sc.hgt) + 0.5);
         ctx.stroke(); ctx.globalAlpha = 1;
       }
-      ctx.fillStyle = textColor;
-      ctx.fillText(fmt(sc.vmax), 4, sc.y0 + 10);
-      ctx.fillText(fmt(sc.vmin), 4, sc.y0 + sc.hgt - 2);
+      if (lanes) {
+        ctx.fillStyle = textColor;
+        ctx.fillText(fmt(sc.vmax), 4, sc.y0 + 10);
+        ctx.fillText(fmt(sc.vmin), 4, sc.y0 + sc.hgt - 2);
+      } else if (matchY) {
+        if (idx === 0) {     // one shared scale = one pair of labels
+          ctx.fillStyle = textColor;
+          ctx.fillText(fmt(sc.vmax), 4, sc.y0 + 10);
+          ctx.fillText(fmt(sc.vmin), 4, sc.y0 + sc.hgt - 2);
+        }
+      } else {               // per-signal scales: stacked, in signal color
+        ctx.fillStyle = color;
+        ctx.fillText(fmt(sc.vmax), 4, sc.y0 + 10 + idx * 12);
+        ctx.fillText(fmt(sc.vmin), 4, sc.y0 + sc.hgt - 2 - idx * 12);
+      }
       const y = (v) => sc.y0 + (1 - (v - sc.vmin) / (sc.vmax - sc.vmin)) * sc.hgt;
+      ctx.save();            // manual zoom can push a trace outside its lane
+      ctx.beginPath();
+      ctx.rect(PAD_L, sc.y0, geom.plotW, sc.hgt);
+      ctx.clip();
       ctx.strokeStyle = color; ctx.lineWidth = 1;
       ctx.beginPath();
       for (const c of sc.cols) {
@@ -790,6 +1122,7 @@ function scopeHtml(rate: number): string {
         if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
       }
       ctx.stroke();
+      ctx.restore();
       const label = document.getElementById("val-" + sig.id);
       if (label) {
         const s = series(sig.id);
@@ -807,6 +1140,17 @@ function scopeHtml(rate: number): string {
       ctx.setLineDash([]);
       ctx.globalAlpha = 1; ctx.fillStyle = textColor;
       ctx.fillText(name, px + 3, PAD_T + 10);
+    }
+
+    // achieved rate: wall-clock arrivals over the last 2 s -- keeps counting
+    // with cursors placed, decays to 0 when the stream stalls.
+    while (arrivals.length && arrivals[0][0] < performance.now() - 2000) arrivals.shift();
+    if (visible.length) {
+      let got = 0;
+      for (const a of arrivals) got += a[1];
+      achieved.textContent = (got / 2).toFixed(0) + " samples/s achieved";
+    } else {
+      achieved.textContent = "";
     }
 
     // readout: cursors table or live hint
@@ -831,15 +1175,10 @@ function scopeHtml(rate: number): string {
       }
       readout.innerHTML = bits.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
     } else {
-      // achieved rate over the last 2 s, total across signals
-      let n = 0;
-      const cut = end - 2000;
-      for (const s of data.values()) {
-        for (let i = s.t.length - 1; i >= 0 && s.t[i] >= cut; i--) n++;
-      }
-      achieved.textContent = n ? (n / 2).toFixed(0) + " samples/s achieved" : "";
       readout.textContent =
-        "click the chart to place cursor A, again for B · drag to adjust · Esc clears";
+        "click: cursor A, again: B · wheel: zoom " + zoomAxis.toUpperCase() +
+        " · dbl-click: fit · Alt+drag: pan · Esc clears cursors" +
+        (followX ? "" : " · view detached — Fit to follow");
     }
     requestAnimationFrame(draw);
   }

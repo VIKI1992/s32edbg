@@ -4026,6 +4026,55 @@ def var_globals(
             })
 
 
+@var.command("names")
+@click.option("--filter", "filter_s", default=None,
+              help="Case-insensitive substring filter on the name.")
+@click.option("--limit", type=click.IntRange(1, 1000), default=50,
+              show_default=True)
+@click.option("--offset", type=click.IntRange(min=0), default=0,
+              show_default=True)
+@click.option("--scalars", is_flag=True,
+              help="Only rows streamed sampling can plot: 1/2/4-byte "
+                   "scalars with a fixed memory address.")
+@click.pass_obj
+def var_names(
+    ctx: Ctx, filter_s: str | None, limit: int, offset: int, scalars: bool
+) -> None:
+    """Global/static names out of the symbol index -- no target I/O.
+
+    The scope picker's data source: unlike `var globals` this never reads a
+    value and never allocates a handle, so filtering tens of thousands of
+    entries per keystroke is safe with the target running, halted or absent.
+    Rows carry name/type/kind/size/address plus static/cu/owner provenance
+    and a `sampleable` verdict (what `var sample` can stream).
+    """
+    index = _require_symbols(ctx)
+    vindex = index.variables()
+    rows = vindex.name_rows()
+    needle = (filter_s or "").lower()
+    matched = [
+        r for r in rows
+        if (not scalars or r["sampleable"])
+        and (not needle or needle in str(r["name"]).lower())
+    ]
+    shown = matched[offset : offset + limit]
+    console.print(
+        f"{len(shown)} of {len(matched)} matching name(s)"
+        + (f" (filter: {filter_s})" if filter_s else "")
+    )
+    for r in shown:
+        console.print(
+            f"{r['name']:<28} {str(r['type']):<24} {r['address'] or '-'}"
+        )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "total": len(matched),
+            "shown": len(shown),
+            "offset": offset,
+            "names": shown,
+        })
+
+
 @var.command("expand")
 @click.argument("handle")
 @click.option("--children-from", "start", type=int, default=0, show_default=True)

@@ -4,6 +4,7 @@ import {
   decimate,
   nearestIndex,
   nearestSample,
+  zoomRange,
 } from "../src/plot/plotMath";
 import { decodeRaw } from "../src/plot/plotValue";
 
@@ -59,6 +60,33 @@ describe("decimate", () => {
       [{ t: 0, v: 1 }, { t: 1, v: 9 }, { t: 99, v: 4 }], 0, 100, 1,
     );
     expect(cols).toEqual([{ x: 0, min: 1, max: 9, last: 4 }]);
+  });
+});
+
+describe("zoomRange", () => {
+  it("zooms out around the anchor (factor > 1)", () => {
+    expect(zoomRange(0, 100, 50, 2)).toEqual({ min: -50, max: 150 });
+  });
+  it("zooms in around the anchor (factor < 1)", () => {
+    expect(zoomRange(0, 100, 50, 0.5)).toEqual({ min: 25, max: 75 });
+  });
+  it("pins the edge the anchor sits on", () => {
+    expect(zoomRange(0, 100, 0, 2)).toEqual({ min: 0, max: 200 });
+    expect(zoomRange(0, 100, 100, 0.5)).toEqual({ min: 50, max: 100 });
+  });
+  it("reaches a full 32-bit sweep by repeated zoom-out", () => {
+    let r = { min: 0, max: 255 };
+    for (let i = 0; i < 80 && r.max < 4294967295; i++) {
+      r = zoomRange(r.min, r.max, r.min, 1.25);
+    }
+    expect(r.max).toBeGreaterThan(4294967295);
+    expect(r.min).toBe(0);
+  });
+  it("floors a vanishing span and rejects non-finite results", () => {
+    const tiny = zoomRange(1, 1 + 1e-12, 1, 0.5);
+    expect(tiny.max - tiny.min).toBeGreaterThan(0);
+    expect(zoomRange(0, Number.MAX_VALUE, 0, 2))
+      .toEqual({ min: 0, max: Number.MAX_VALUE });
   });
 });
 

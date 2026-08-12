@@ -172,6 +172,28 @@ export interface VarWatchResult {
   row: VarRow;
 }
 
+/** One `var names` catalogue row -- symbol-index data only: no handle, no
+ * value, never a target read. `sampleable` = what `var sample` can stream
+ * (a 1/2/4-byte scalar with a fixed memory address). */
+export interface VarNameRow {
+  name: string;
+  type: string;
+  kind: string;
+  size: number | null;
+  address: string | null;
+  static: boolean;
+  cu: string;
+  owner: string | null;
+  sampleable: boolean;
+}
+
+export interface VarNamesResult {
+  total: number;
+  shown: number;
+  offset: number;
+  names: VarNameRow[];
+}
+
 export interface VarWriteResult {
   wrote: string;
   readback: string;

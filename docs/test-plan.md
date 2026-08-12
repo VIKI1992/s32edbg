@@ -2232,6 +2232,26 @@ one session, on a board with the known-good app in flash:
       CoreSight path — the remainder is inter-batch overhead plus the
       ~0.96 ms/read wire floor; if true 1 kHz becomes necessary, the next
       step is a bench spike on the J-Link DLL's HSS probe-side sampler.
+    - 16i. Scope picker/zoom/Match-Y (2026-08-12, offline-verified, bench
+      pending): typing in the sidebar box live-searches every plottable
+      global/static in the ELF (`var names` — symbol-index only, the
+      envelope shows `0op`); results carry type + provenance, ↑/↓ + Enter
+      or a click adds (statics land as `file.c::name`, function statics as
+      `file.c::func::name`), Enter on free text still resolves a watch
+      path (`cfg.limits[1].max`). Zoom is axis-selectable: `zoom X` +
+      wheel widens the time span past the window presets (the dropdown
+      blanks on a custom span); `zoom Y` + wheel over a lane rescales that
+      lane only — zoom out until a 32-bit counter's full 0..4.29e9 sweep
+      fits; Alt+drag pans back through history (readout notes "view
+      detached"; dragging back to now, Fit, or double-click re-follows —
+      a double-click restores the cursors its two clicks moved). Overlay
+      + **Match Y**: an 8-bit and a 16-bit counter share one absolute
+      scale (the 8-bit trace flattens to the bottom 1/256th; equal values
+      sit at equal height); Match Y off restores today's equal-amplitude
+      per-signal normalization; in lanes mode Match Y gives every lane
+      the same range. The `samples/s achieved` label keeps updating while
+      cursors are placed (it froze before), decays to a plain 0 within
+      ~2 s of Pause or a stream stall, and recovers on resume.
 
 Record the run under `bench-runs/` as usual.
 

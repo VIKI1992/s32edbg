@@ -265,3 +265,54 @@ def test_var_locals_without_symbols_is_usage(machine) -> None:
     assert envs[1]["ok"] is False
     assert envs[1]["error"]["kind"] == "usage"
     assert "sym load" in envs[1]["error"]["message"]
+
+
+def test_var_names_catalogue_without_target_io(machine, vindex) -> None:
+    """`var names` = the picker's data source: no reads, no handles."""
+    _device, invoke = machine
+    code, envs = invoke(
+        f"{SYM}\n"
+        "var names --filter counter\n"
+        "var names --scalars --limit 1000\n"
+        "var names --filter cfg\n"
+        "var names --limit 2 --offset 1\n"
+        "var globals --filter counter\n"
+        "quit\n"
+    )
+    assert code == 0
+
+    names_env = envs[1]
+    assert names_env["ok"] is True
+    assert names_env.get("ops", 0) == 0, "names must never touch the target"
+    result = names_env["result"]
+    row = next(r for r in result["names"] if r["name"] == "counter")
+    counter = global_named(vindex, "counter")
+    assert row["address"] == f"0x{counter.decl.static_addr:08X}"
+    assert row["static"] is False
+    assert row["cu"] == "fixture.c"
+    assert row["owner"] is None
+    assert row["sampleable"] is True
+    assert "handle" not in row and "value" not in row
+
+    scalars = envs[2]["result"]
+    assert all(r["sampleable"] for r in scalars["names"])
+    by_name = {r["name"]: r for r in scalars["names"]}
+    assert "cfg" not in by_name, "a struct is not sampleable"
+    assert "greeting" not in by_name, "an array is not sampleable"
+    assert {"counter", "ticks", "ratio", "calls"} <= set(by_name)
+    assert by_name["ratio"]["kind"] == "float"
+    assert by_name["calls"]["static"] is True
+    assert by_name["calls"]["owner"] == "bump", "function statics carry owners"
+
+    cfg_row = next(r for r in envs[3]["result"]["names"] if r["name"] == "cfg")
+    assert cfg_row["kind"] == "struct"
+    assert cfg_row["sampleable"] is False
+    assert cfg_row["static"] is True
+
+    page = envs[4]["result"]
+    assert page["offset"] == 1
+    assert page["shown"] <= 2
+    assert page["total"] >= 6
+
+    # names allocated no handles: the next `var globals` row is still 0:1.
+    assert envs[5]["result"]["variables"][0]["handle"] == "0:1"

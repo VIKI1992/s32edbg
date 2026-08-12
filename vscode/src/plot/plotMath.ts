@@ -46,6 +46,30 @@ export function cursorDelta(samples: Pt[], tA: number, tB: number): CursorDelta 
   return { a, b, dv: a !== null && b !== null ? b.v - a.v : null };
 }
 
+export interface Range {
+  min: number;
+  max: number;
+}
+
+/** Scale [min, max] around an anchor value: factor > 1 zooms out, < 1 zooms
+ * in. A non-finite or inverted result collapses back to the input range; a
+ * vanishing span is floored so the mapping stays invertible. */
+export function zoomRange(
+  min: number, max: number, anchor: number, factor: number,
+): Range {
+  let lo = anchor - (anchor - min) * factor;
+  let hi = anchor + (max - anchor) * factor;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi - lo <= 0) {
+    return { min, max };
+  }
+  if (hi - lo < 1e-9) {
+    const mid = (lo + hi) / 2;
+    lo = mid - 5e-10;
+    hi = mid + 5e-10;
+  }
+  return { min: lo, max: hi };
+}
+
 export interface Column {
   x: number;
   min: number;

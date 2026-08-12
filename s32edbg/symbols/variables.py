@@ -175,6 +175,7 @@ class VariableIndex:
         self.globals_by_name: dict[str, list[GlobalEntry]] = {}
         self.statics_by_cu: dict[str, dict[str, GlobalEntry]] = {}
         self._types: dict[int, TypeInfo] = {}
+        self._name_rows: list[dict[str, object]] | None = None
 
     @classmethod
     def build(cls, dwarf: Any, _symbol_index: Any) -> "VariableIndex":
@@ -270,6 +271,58 @@ class VariableIndex:
         self.globals_by_name.setdefault(decl.name, []).append(entry)
         if not external:
             self.statics_by_cu.setdefault(cu_file, {})[decl.name] = entry
+
+    # -- the names catalogue ---------------------------------------------------
+
+    #: Kinds a `var sample` stream can plot -- scalar lanes the 8/16/32-bit
+    #: programmed read covers. Aggregates and 8-byte types are not streamable.
+    SAMPLEABLE_KINDS = ("int", "uint", "bool", "char", "enum", "float", "pointer")
+
+    def name_rows(self) -> list[dict[str, object]]:
+        """Serializable name/type/address rows for every global and static.
+
+        No target I/O and no handles -- this is the picker's data source, so
+        it must be cheap to filter per keystroke against tens of thousands of
+        entries. Built once per index and cached; addresses come from the
+        pre-parsed DW_OP_addr fast path, falling back to the offline location
+        evaluator (no frame, no registers) for the rare loclist global.
+        """
+        if self._name_rows is not None:
+            return self._name_rows
+        rows: list[dict[str, object]] = []
+        for g in self.globals:
+            tinfo = self.type_of(g.decl.type_die)
+            addr = g.decl.static_addr
+            if addr is None and g.decl.loc_attr is not None:
+                try:
+                    ops = location_ops(self._dwarf, g.decl, None)
+                    loc = evaluate(
+                        ops,
+                        frame_base=lambda: (None, "no frame"),
+                        reg_value=lambda n: None,
+                    )
+                    if loc.kind == "memory":
+                        addr = loc.address
+                except Exception:
+                    addr = None
+            sampleable = (
+                addr is not None
+                and tinfo.kind in self.SAMPLEABLE_KINDS
+                and tinfo.size in (1, 2, 4)
+            )
+            rows.append({
+                "name": g.name,
+                "type": tinfo.name,
+                "kind": tinfo.kind,
+                "size": tinfo.size,
+                "address": f"0x{addr:08X}" if addr is not None else None,
+                "static": not g.external,
+                "cu": g.cu_file.replace("\\", "/").rsplit("/", 1)[-1],
+                "owner": g.owner_func,
+                "sampleable": sampleable,
+            })
+        self._name_rows = rows
+        return rows
 
     # -- types ---------------------------------------------------------------
 
