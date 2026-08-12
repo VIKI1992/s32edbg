@@ -91,9 +91,16 @@ export class BreakpointsView implements vscode.TreeDataProvider<Node> {
     } else if (verdict?.verdict === "unknown") {
       bits.push("hw: unreadable");
     }
+    if (bp.adopted) {
+      bits.push("adopted");
+    }
     item.description = bits.join("  ");
     item.tooltip =
       `${where} on ${bp.core} (${bp.origin})\n` +
+      (bp.adopted
+        ? "ADOPTED: found armed in hardware, not set by this session -- " +
+          "delete it like any breakpoint to clear the comparator\n"
+        : "") +
       (bp.address !== null ? `address ${toHex(bp.address)}\n` : "") +
       (bp.state === "armed"
         ? `armed in hardware comparator ${bp.slot}`

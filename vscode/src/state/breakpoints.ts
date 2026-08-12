@@ -19,10 +19,15 @@ export interface S32Breakpoint {
   /** vscode native breakpoint id, when this came from the gutter. */
   nativeId?: string;
   origin: "gutter" | "address" | "disasm";
+  /** Adopted from a comparator this session did not arm (a leftover kept
+   * alive by --keep-breakpoints). Dropped, not re-armed, on disconnect. */
+  adopted?: boolean;
 }
 
 let counter = 0;
 const nextId = () => `s32bp-${++counter}`;
+const foreignKey = (fsPath: string, line: number) =>
+  `${fsPath.toLowerCase()}:${line}`;
 
 /** Our model of every breakpoint, synced with VS Code's native gutter dots.
  *
@@ -40,6 +45,9 @@ export class BreakpointStore implements vscode.Disposable {
    * disassembly provider once it exists). */
   disasmLineToAddr: ((uri: vscode.Uri, line: number) => number | null) | null =
     null;
+  /** file:line keys whose next native-add echo belongs to an adoption --
+   * the double-arm guard: adoptNative BINDS these instead of arming. */
+  private readonly pendingForeign = new Map<string, S32Breakpoint>();
 
   constructor(
     private readonly state: DebugState,
@@ -103,6 +111,17 @@ export class BreakpointStore implements vscode.Disposable {
     }
     const uri = bp.location.uri;
     const line = bp.location.range.start.line + 1;
+    if (uri.scheme === "file") {
+      // The echo of a dot adoptForeign just created: bind it to the adopted
+      // model and DO NOT arm -- the hardware comparator is already armed.
+      const pending = this.pendingForeign.get(foreignKey(uri.fsPath, line));
+      if (pending) {
+        this.pendingForeign.delete(foreignKey(uri.fsPath, line));
+        pending.nativeId = bp.id;
+        this.fire();
+        return null;
+      }
+    }
     const core = this.defaultCore();
     let model: S32Breakpoint | null = null;
     if (uri.scheme === "file") {
@@ -237,6 +256,57 @@ export class BreakpointStore implements vscode.Disposable {
     return model;
   }
 
+  /** Adopt a comparator this session did NOT arm: the slot is already live,
+   * so no `bp set` is issued -- the row is born armed. With a resolved
+   * source line a real gutter dot is created (unless one already sits
+   * there); the pendingForeign map makes the native-add echo bind to this
+   * model instead of arming a duplicate. Deleting the dot or the row goes
+   * through the ordinary disarm path, which clears the slot by index. */
+  adoptForeign(
+    core: string,
+    address: number,
+    slot: number,
+    source: { fsPath: string; line: number } | null,
+  ): S32Breakpoint {
+    const model: S32Breakpoint = {
+      id: nextId(),
+      core,
+      address,
+      source: source ?? undefined,
+      slot,
+      state: "armed",
+      origin: source ? "gutter" : "address",
+      adopted: true,
+    };
+    this.all.push(model);
+    if (source) {
+      const clash = this.all.some(
+        (m) =>
+          m !== model &&
+          m.source !== undefined &&
+          m.source.fsPath.toLowerCase() === source.fsPath.toLowerCase() &&
+          m.source.line === source.line,
+      );
+      if (clash) {
+        // A dot already sits on that line -- keep this an address-backed
+        // row rather than stacking a second native breakpoint on it.
+        model.origin = "address";
+      } else {
+        this.pendingForeign.set(foreignKey(source.fsPath, source.line), model);
+        vscode.debug.addBreakpoints([
+          new vscode.SourceBreakpoint(
+            new vscode.Location(
+              vscode.Uri.file(source.fsPath),
+              new vscode.Position(source.line - 1, 0),
+            ),
+          ),
+        ]);
+      }
+    }
+    this.fire();
+    return model;
+  }
+
   async remove(
     model: S32Breakpoint,
     { keepNative = false }: { keepNative?: boolean } = {},
@@ -307,9 +377,27 @@ export class BreakpointStore implements vscode.Disposable {
     await this.applyAll();
   }
 
-  /** Session gone: slots are meaningless, everything is pending again. */
+  /** Session gone: slots are meaningless, everything is pending again --
+   * except adopted rows, which are dropped outright: re-arming one next
+   * connect would duplicate the still-armed foreign comparator, and the
+   * next session's discovery sweep re-adopts whatever is really there. */
   markAllPending(): void {
-    for (const model of this.all) {
+    for (const model of [...this.all]) {
+      if (model.adopted) {
+        const i = this.all.indexOf(model);
+        if (i >= 0) {
+          this.all.splice(i, 1);
+        }
+        if (model.nativeId) {
+          const native = vscode.debug.breakpoints.find(
+            (b) => b.id === model.nativeId,
+          );
+          if (native) {
+            vscode.debug.removeBreakpoints([native]);
+          }
+        }
+        continue;
+      }
       if (model.state === "armed") {
         model.state = "pending";
         model.slot = null;

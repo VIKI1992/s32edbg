@@ -9,12 +9,15 @@ import { WatchpointStore } from "./watchpoints";
 
 /** One hardware comparator slot as `bp list` / `wp list` reports it.
  * An entry is either an error row or a decoded one; the R52 and M33 decoders
- * emit different extras, but index/error/enabled/address are common. */
+ * emit different extras, but index/error/enabled/address are common.
+ * Watchpoint rows additionally carry size (`bytes`) and access (`on`). */
 export interface HwSlot {
   index: number;
   error?: string;
   enabled?: boolean;
   address?: string;
+  bytes?: number;
+  on?: string;
 }
 
 export type Verdict = "verified" | "mismatch" | "unknown";
@@ -24,11 +27,19 @@ export interface RowVerdict {
   reason: string;
 }
 
+/** An enabled hardware slot no session row claims -- adoption's raw input. */
+export interface HwOrphan {
+  index: number;
+  address: string;
+  bytes?: number;
+  on?: string;
+}
+
 export interface CoreVerdicts {
   /** store row id -> verdict, for rows the store considers armed */
   rows: Map<string, RowVerdict>;
   /** enabled hardware slots no armed local row claims */
-  orphans: { index: number; address: string }[];
+  orphans: HwOrphan[];
   /** every slot unreadable (OS lock / reset hold): treat as no-information */
   unreadable: boolean;
 }
@@ -104,7 +115,12 @@ export function reconcileCore(locals: LocalRow[], hw: HwSlot[]): CoreVerdicts {
   }
   for (const slot of readable) {
     if (slot.enabled && !claimed.has(slot.index)) {
-      out.orphans.push({ index: slot.index, address: slot.address ?? "?" });
+      out.orphans.push({
+        index: slot.index,
+        address: slot.address ?? "?",
+        ...(slot.bytes !== undefined ? { bytes: slot.bytes } : {}),
+        ...(slot.on !== undefined ? { on: slot.on } : {}),
+      });
     }
   }
   return out;
@@ -159,7 +175,11 @@ export class ComparatorReconciler implements vscode.Disposable {
     this.changeEmitter.fire();
   }
 
-  async tick(): Promise<void> {
+  /** One verify pass. `full` widens the swept set to every discovered core
+   * -- the connect / checkbox-recheck discovery pass that finds leftovers on
+   * cores with no session rows; per-core failures are skipped there (an
+   * unpowered M33 or a reset-held R52 must not kill the sweep). */
+  async tick(full = false): Promise<void> {
     const wantBp = this.polling.on("breakpoints");
     const wantWp = this.polling.on("watchpoints");
     if (
@@ -175,6 +195,11 @@ export class ComparatorReconciler implements vscode.Disposable {
     try {
       const client = this.state.client!;
       const cores = new Set<string>();
+      if (full) {
+        for (const name of this.state.cores.keys()) {
+          cores.add(name);
+        }
+      }
       if (wantBp) {
         for (const b of this.bpStore.all) {
           cores.add(b.core);
@@ -191,31 +216,41 @@ export class ComparatorReconciler implements vscode.Disposable {
       let changed = false;
       for (const core of cores) {
         const m33 = familyOf(core) === "m33";
-        if (wantBp) {
-          const result = (await client.run(
-            m33 ? `m33 bp list --core ${core}` : `bp list --core ${core}`,
-          )) as { breakpoints?: HwSlot[] };
-          this.results.set(
-            `${core}#bp`,
-            reconcileCore(
-              this.bpStore.all.filter((b) => b.core === core),
-              result.breakpoints ?? [],
-            ),
+        try {
+          if (wantBp) {
+            const result = (await client.run(
+              m33 ? `m33 bp list --core ${core}` : `bp list --core ${core}`,
+            )) as { breakpoints?: HwSlot[] };
+            this.results.set(
+              `${core}#bp`,
+              reconcileCore(
+                this.bpStore.all.filter((b) => b.core === core),
+                result.breakpoints ?? [],
+              ),
+            );
+            changed = true;
+          }
+          if (wantWp) {
+            const result = (await client.run(
+              m33 ? `m33 wp list --core ${core}` : `wp list --core ${core}`,
+            )) as { watchpoints?: HwSlot[] };
+            this.results.set(
+              `${core}#wp`,
+              reconcileCore(
+                this.wpStore.all.filter((w) => w.core === core),
+                result.watchpoints ?? [],
+              ),
+            );
+            changed = true;
+          }
+        } catch (err) {
+          if (!full) {
+            throw err;
+          }
+          this.output.line(
+            `!! comparator sweep skipped ${core}: ` +
+              (err instanceof Error ? err.message : String(err)),
           );
-          changed = true;
-        }
-        if (wantWp) {
-          const result = (await client.run(
-            m33 ? `m33 wp list --core ${core}` : `wp list --core ${core}`,
-          )) as { watchpoints?: HwSlot[] };
-          this.results.set(
-            `${core}#wp`,
-            reconcileCore(
-              this.wpStore.all.filter((w) => w.core === core),
-              result.watchpoints ?? [],
-            ),
-          );
-          changed = true;
         }
       }
       if (changed) {

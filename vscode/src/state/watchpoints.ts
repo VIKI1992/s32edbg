@@ -12,6 +12,9 @@ export interface S32Watchpoint {
   slot: number | null;
   state: "pending" | "armed" | "failed";
   error?: string;
+  /** Adopted from a comparator this session did not arm (a leftover kept
+   * alive by --keep-breakpoints). Dropped, not re-armed, on disconnect. */
+  adopted?: boolean;
 }
 
 let counter = 0;
@@ -70,6 +73,34 @@ export class WatchpointStore implements vscode.Disposable {
     this.fire();
   }
 
+  /** Adopt a watchpoint comparator this session did NOT arm: the slot is
+   * already live, so no `wp set` is issued -- the row is born armed with
+   * the size/access the hardware decodes. Deleting the row goes through
+   * the ordinary path, which clears the slot by index. */
+  adoptForeign(
+    core: string,
+    address: number,
+    slot: number,
+    size: number,
+    on: string,
+  ): S32Watchpoint {
+    const access: S32Watchpoint["on"] =
+      on === "load" || on === "store" ? on : "both";
+    const model: S32Watchpoint = {
+      id: nextId(),
+      core,
+      address,
+      size,
+      on: access,
+      slot,
+      state: "armed",
+      adopted: true,
+    };
+    this.all.push(model);
+    this.fire();
+    return model;
+  }
+
   async remove(model: S32Watchpoint): Promise<void> {
     if (model.state === "armed" && model.slot !== null && this.state.connected) {
       const family = familyOf(model.core);
@@ -108,8 +139,17 @@ export class WatchpointStore implements vscode.Disposable {
     await this.applyAll();
   }
 
+  /** Session gone -- adopted rows are dropped (the next session's sweep
+   * re-adopts what is really armed); everything else goes back to pending. */
   markAllPending(): void {
-    for (const model of this.all) {
+    for (const model of [...this.all]) {
+      if (model.adopted) {
+        const i = this.all.indexOf(model);
+        if (i >= 0) {
+          this.all.splice(i, 1);
+        }
+        continue;
+      }
       if (model.state === "armed") {
         model.state = "pending";
         model.slot = null;

@@ -159,6 +159,10 @@ async function connect(deps: Deps): Promise<void> {
     poller.start();
     deps.varLive.start();
     deps.comparators.start();
+    // One all-cores discovery sweep: leftovers from a previous session (kept
+    // alive by --keep-breakpoints) surface for adoption even on cores this
+    // session has no rows on. The periodic sweep stays narrow.
+    void deps.comparators.tick(true);
     deps.plots.resync();
     state.fireChange();
     statusBar.refresh();

@@ -12,6 +12,7 @@ import { MEM_SCHEME, MemProvider } from "./editor/memProvider";
 import { PcDecorations } from "./editor/sourceDecorations";
 import { PlotPanels } from "./plot/plotPanel";
 import { Poller } from "./poll/poller";
+import { ComparatorAdoption } from "./state/adoption";
 import { BreakpointStore } from "./state/breakpoints";
 import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
@@ -51,6 +52,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const poller = new Poller(state, output, viewPolling);
   const comparators = new ComparatorReconciler(
     state, bpStore, wpStore, viewPolling, output,
+  );
+  // Foreign comparators (kept alive by --keep-breakpoints) become session
+  // rows the moment a sweep reports them: BPs land in the gutter when their
+  // address resolves to local source, WPs as ordinary rows.
+  const adoption = new ComparatorAdoption(
+    state, comparators, bpStore, wpStore, output,
   );
   const plots = new PlotPanels(state, output);
   const statusBar = new StatusBar(state, elf);
@@ -142,7 +149,7 @@ export function activate(context: vscode.ExtensionContext): void {
     output, state, elf, bpStore, wpStore, disasm, mem, pcDecor, poller,
     comparators, plots, statusBar, stackTree, regsTree, varsTree, coresTree,
     memTree, bpTree, wpTree, stacks, stacksTree, variables, varLive,
-    viewPolling,
+    viewPolling, adoption,
     vscode.window.registerTreeDataProvider("s32e.session", new SessionView(state, elf)),
     vscode.workspace.registerTextDocumentContentProvider(DISASM_SCHEME, disasm),
     vscode.workspace.registerTextDocumentContentProvider(MEM_SCHEME, mem),
@@ -172,9 +179,9 @@ export function activate(context: vscode.ExtensionContext): void {
         void mem.refreshAll();
       } else if (view === "breakpoints" || view === "watchpoints") {
         // Revive the interval (a 10-failure stop may have killed it) and
-        // verify immediately.
+        // run a full all-cores discovery sweep immediately.
         comparators.start();
-        void comparators.tick();
+        void comparators.tick(true);
       } else if (state.focusInfo?.halted === true) {
         void refreshFocusData(deps, new Set([view]));
       }

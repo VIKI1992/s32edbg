@@ -48,6 +48,16 @@ describe("reconcileCore verdicts", () => {
     expect(out.orphans).toEqual([{ index: 3, address: "0x32345678" }]);
   });
 
+  it("orphans carry watchpoint size/access through for adoption", () => {
+    const out = reconcileCore(
+      [],
+      [{ index: 1, enabled: true, address: "0x317BA000", bytes: 2, on: "store" }],
+    );
+    expect(out.orphans).toEqual([
+      { index: 1, address: "0x317BA000", bytes: 2, on: "store" },
+    ]);
+  });
+
   it("all-error slots mean unknown, never a demotion", () => {
     // OS lock / reset hold: the whole bank reads as errors. That is an
     // absence of information -- the local rows must survive untouched.

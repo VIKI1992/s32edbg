@@ -1180,7 +1180,9 @@ halted are resumed — in that order, so a resumed core does not trip over a ses
 **First touch of a core sanitises its comparators.** Guide §5.7: every comparator field is
 UNKNOWN after cold reset, *including the enable bit*, so the session starts each core it drives
 from a known state and reports what it discarded. `--keep-breakpoints` skips this for workflows
-that deliberately carry comparators between sessions.
+that deliberately carry comparators between sessions. The VS Code extension always passes it:
+foreign comparators surface in its verify sweep and are adopted into the session (gutter dot +
+row) or cleared by the user, never wiped silently.
 
 Non-interactive use — for scripts and for the bench harness:
 

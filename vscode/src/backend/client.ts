@@ -78,7 +78,10 @@ export class SessionClient implements vscode.Disposable {
     timeoutMs = 45000,
   ): Promise<{ client: SessionClient; ready: ReadyEvent }> {
     const client = new SessionClient(output);
-    const args = [...globalArgs(cfg), "debug", "--machine"];
+    // --keep-breakpoints: pre-existing comparators survive to be adopted or
+    // cleared by the user instead of dying silently at the first write-touch
+    // (guide §5.7); the sweep + adoption flow is their management surface.
+    const args = [...globalArgs(cfg), "debug", "--machine", "--keep-breakpoints"];
     output.section(`connect: ${cfg.pythonPath} ${args.join(" ")}`);
     const proc = spawn(cfg.pythonPath, args, {
       env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },

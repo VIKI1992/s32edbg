@@ -70,9 +70,13 @@ export class WatchpointsView implements vscode.TreeDataProvider<Node> {
         : wp.state === "failed"
           ? "failed"
           : "pending"
-    }${hwBit}`;
+    }${hwBit}${wp.adopted ? "  adopted" : ""}`;
     item.tooltip =
       `watch ${wp.size} byte(s) at ${toHex(wp.address)} for ${wp.on} on ${wp.core}\n` +
+      (wp.adopted
+        ? "ADOPTED: found armed in hardware, not set by this session -- " +
+          "delete it like any watchpoint to clear the comparator\n"
+        : "") +
       (wp.state === "failed"
         ? `FAILED: ${wp.error}`
         : wp.state === "armed"

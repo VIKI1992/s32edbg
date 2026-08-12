@@ -2210,12 +2210,27 @@ one session, on a board with the known-good app in flash:
     - 16g. Breakpoints/Watchpoints Auto-refresh: with a BP armed and the
       checkbox on, the row gains `✓ hw` within `s32e.comparators.verifyMs`
       (default 5 s). `load` (SoC reset) flips it to `⚠ hw:` until re-arm.
-      An externally armed comparator (e.g. `bp set` from a second CLI
-      session — do not actually run one mid-session on the bench; simulate
-      by clearing/re-arming) shows as an orphan row whose right-click
-      Clear action disarms it. Unchecking stops the `bp list`/`wp list`
-      traffic in the output channel; an OS-locked core shows
-      `hw: unreadable` and the local rows survive.
+      Unchecking stops the `bp list`/`wp list` traffic in the output
+      channel; an OS-locked core shows `hw: unreadable` and the local rows
+      survive.
+    - 16g². Foreign-comparator adoption (2026-08-12, offline-verified,
+      bench pending): before connecting, arm a BP and a WP from a one-shot
+      CLI (`s32edbg bp set 0x... --core rtu0.0`, `wp set ... --size 2
+      --on store`), then connect from the IDE (sessions now pass
+      `--keep-breakpoints` — nothing is wiped at first touch) with the
+      checkboxes on. The connect-time all-cores sweep finds both: the BP
+      appears as a real **gutter dot** on the resolved source line and as
+      a Breakpoints row marked `adopted` (slot number = the pre-armed
+      slot, NO `bp set` in the output channel — the double-arm guard);
+      the WP appears as a Watchpoints row marked `adopted` with 2 B /
+      store decoded from hardware. Click the gutter dot off → `bp list`
+      from a second shell shows the slot free. Remove the adopted WP row
+      → slot free. Arm a leftover on a NON-focused core (e.g. rtu0.1)
+      → the connect sweep still finds it. `bp set` from the IDE while a
+      foreign slot is armed lands in a different slot. Disconnect →
+      adopted rows and their dots disappear; reconnect → re-adopted.
+      An address with no line info (e.g. a bare RAM address) adopts as an
+      address row without a dot, still deletable.
     - 16h. The Scope (streaming, benched 2026-08-11 under
       `bench-runs/20260811-plotstream/`: **754.9 Hz achieved single-signal**
       at rate 1000, median inter-sample 0.963 ms; two signals 365.8 Hz
