@@ -55,3 +55,21 @@ export class ThemeIcon {
 export class ThemeColor {
   constructor(public id: string) {}
 }
+
+/** Configuration store the tests can seed: workspace.getConfiguration("s32e")
+ * reads from `configValues` keyed "s32e.<key>", falling back like the API. */
+export const configValues = new Map<string, unknown>();
+
+export const workspace = {
+  getConfiguration(section?: string) {
+    return {
+      get<T>(key: string, fallback: T): T {
+        const full = section ? `${section}.${key}` : key;
+        return configValues.has(full) ? (configValues.get(full) as T) : fallback;
+      },
+      async update(): Promise<void> {
+        /* not exercised in unit tests */
+      },
+    };
+  },
+};

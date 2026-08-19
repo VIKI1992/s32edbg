@@ -169,10 +169,50 @@ Data shifts LSB-first between TDI and TDO (RM 136.4.2). Reading does not require
 whole register: *"Shifting may be terminated after the required number of bits have been
 acquired"* (RM 136.4.3.2).
 
-**The BSR length and bit ordering are not in the RM.** RM 136.3.4 puts them only in the BSDL file,
-which RM Table 984 names (`SIP_S32E277n8n9_BGA27_831F01D.bsdl` for the 27×27 S32E277/8/9) without
-saying where to get it. That is why this tool measures the length empirically and emits an indexed
-raw bit vector with no pin names. Supply the BSDL and pin mapping becomes possible.
+**The BSR length and bit ordering come from the bundled BSDL — corrected by silicon.** RM 136.3.4
+puts them only in the BSDL file, which RM Table 984 names (`SIP_S32E277n8n9_BGA27_831F01D.bsdl`
+for the 27×27 S32E277/8/9) without saying where to get it. The tool bundles the file NXP actually
+ships (`SIP_S32S277n8n9_S32E277n8n9_BGA27_831F01D.bsdl` — the S32S/S32E combined SIP file; its own
+DESIGN_WARNING targets the S32S277/8/9) in `s32edbg/data/` and parses it with `s32edbg/bsdl.py`:
+IDCODE `0x0831F01D`, INSTRUCTION_LENGTH 16, declared **BOUNDARY_LENGTH 494** — and its
+DESIGN_WARNING carries the whole Table 984 preamble verbatim, so the RM and the BSDL confirm each
+other on the trickiest sequence in the tool.
+
+**Measured 2026-08-19: this part chains 464 of those 494 cells.** The missing 30 are the file's
+single run of consecutive `internal` cells (262..291, between the DDR block and LIN_6) — no pins
+lost, everything above shifts down by 30. Recorded in `data/bscan.py:BSDL_CELL_QUIRKS` and applied
+automatically by `bsdl.load_bundled`; see test-plan §7.3 and `bench-runs/20260819-bscan-bsdl/` for
+the measurement. Selection is by parsed IDCODE, never filename; `--bsdl` overrides the bundled
+copy verbatim (no quirks), with the length verify as the arbiter.
+
+### Pin mapping via BSDL
+
+Every observable pin is a **BC_7 `bidir` data cell plus a BC_1/BC_2 `control` cell** (disval 0,
+result Z) — 227 of them — plus exactly one `output2` with no control cell (`DDR0_RESET_N`: always
+driven, no Z state). The remaining cells are `control` and `internal`. Captured bit *n* is cell
+*n* (IEEE 1149.1: cell 0 nearest TDO, LSB shifted first); `--reverse-cells` exists as the
+bench-falsifiable escape hatch should silicon disagree. A pin row reports its level and whether
+its own output driver was on (control cell ≠ disval).
+
+Caveats the BSDL itself declares: `AUR_*` pins have no BSR cells (untestable); DDR0 data pins
+(`DDR0_DQ*`/`DMI*`/`DQS*`) **cannot SAMPLE their inputs in mission mode** — the path to the BSR is
+blocked, so their sampled level shows the output latch (PRELOAD is unaffected); a functional POR is
+required before BSR instructions. `JCOMP`/`POR_B` are compliance pins ((POR_B, JCOMP) must be 11)
+with no cells.
+
+Each pin row also carries its **SIUL2 pad identity** (`PAD_xxx` + instance + MSCR index, or
+`AE MSCR n` for the AE-die `PB*` pads), joined by BGA ball from NXP's `S32E2_IOMUX.xlsx` — shipped
+as an attachment embedded in the RM PDF, materialized into `s32edbg/data/pads_bga27.py` by
+`tools/gen_pads.py`. Dedicated pins (RESET_B, POR_B, JCOMP, EXTAL) have no pad; the JTAG pins do
+(TCK = PAD_173 — RM 135.15.1's "can be later reassigned" said as much).
+
+Where the BSDL and RM Table 959 disagree on an opcode, **the BSDL wins at shift time**
+(`jtag/bscan.py:ir_for`) and the divergence is printed. Today there is exactly one, and it is
+benign: `ENABLE_CENSOR_CTRL` 0x0100 (BSDL) vs 0x0107 (RM) — an instruction boundary scan never
+issues. Every opcode the tool does shift agrees, including the non-duplicated `HIGHZ 0x0509`. One
+width discrepancy is recorded and deliberately not acted on: EXT_TEST_CTRL's DR is 215 bits per
+REGISTER_ACCESS, `205'h…` per the DESIGN_WARNING literal, and **208 bits as proven on silicon** —
+the shipped payload stays 208.
 
 ### The IR width contradiction, settled on silicon
 
@@ -225,7 +265,7 @@ PRELOAD is non-invasive. RM 136.4.4.2: it loads the boundary-scan update latches
 operation is not affected."* Those latches drive nothing unless EXTEST or CLAMP is subsequently
 selected.
 
-### The instructions this tool refuses, and why
+### The instructions behind the drive opt-in, and why
 
 | Instruction | What it does | RM |
 |---|---|---|
@@ -233,19 +273,46 @@ selected.
 | **HIGHZ** | Places **all output drivers** in an inactive state, and asserts the internal system reset | 136.4.4.4 |
 | **CLAMP** | Drives pins from the BSR while bypass is selected, and asserts the internal system reset | 136.4.4.5 |
 
-On a live ECU each of those is a reset, and HIGHZ is additionally a bus float. The opcodes are
-recorded in `s32edbg/data/bscan.py` as documentation; asking for one raises with the citation.
+**Known limitation — EXTEST drive is unconfirmed on S32E silicon (bench 2026-08-19).** On an
+S32E277 the drive path does not work: EXTEST (0x0404) correctly selects the 464-bit BSR (HIGHZ
+0x0509 and CLAMP 0x0C0C each select the 1-bit bypass, as REGISTER_ACCESS declares) and asserts the
+internal MCU reset, but **the preloaded output data never reaches the pads**. Read-back *under*
+EXTEST — a capture-DR taken while EXTEST is latched, which samples the live pad — is bit-for-bit
+identical whether the loaded vector is all-1 or all-0, and a pin explicitly driven high reads back
+low; only the MCU-reset side-effect is observable (RESET_B 1→0, functional drivers drop). The shift
+mechanics are verified correct (SAMPLE reads real pin state fine), so this is not a tool bug. Likely
+NXP-held cause: the RM Table 984 `EXT_TEST_CTRL` payload is documented only as "selects the BSR
+segments" and appears to configure them for observe/SAMPLE, not output-drive; and/or the private
+`JTAGC_EXTEST_PULSE (0x0800)` / `JTAGC_EXTEST_TRAIN (0x0900)` opcodes (present-but-commented in the
+BSDL) are needed to apply the drive. An NXP ticket is open. The drive commands remain available
+(gated) so the fix can be tried once known; `bench-runs/20260819-bscan-bsdl/EXTEST-not-driving.md`
+has the full evidence.
 
-### Measuring the register length
+On a live ECU each of those is a reset, and HIGHZ is additionally a bus float. So they sit behind
+`--i-understand-boundary-scan-drives-pins`; without it the refusal carries the citation (exit 3).
+Two more facts the consent covers. The drive flow is *preload-then-latch* — the vector loads under
+SAMPLE/PRELOAD (system still untouched) and the final `SIR` flips every pin at one Update-IR, with
+all unnamed cells at their BSDL safe values and their drivers off. And the latched instruction
+**persists after the JTAGLoad run exits**: the pins stay driven and the MCU stays in reset until
+`bscan release` (a TAP reset — TLR reloads IDCODE, RM 136.3.1) or a power-cycle. The BSDL requires
+a functional POR before further BSR work after that.
 
-The BSR length is found by shifting a known marker through and counting the delay before it
-emerges — the register's captured contents come out first.
+### Verifying (or measuring) the register length
 
-One subtlety that is easy to get wrong: **the marker must not be a run of ones.** The search
-returns the earliest match, so any run of ones already present in the captured pin state is
-mistaken for the marker and the measured length comes out too short, confidently and with no
-error. The BSR capture is live pin state and can trivially contain a byte of ones. This tool uses
-`0x6699A55A`, which has no run of identical bits longer than two.
+With the quirked BSDL the length is known — 464 — and *verified* in a single JTAGLoad run: shift
+`464 + 32` bits with a 32-bit marker entering first, and let the SVF's own TDO compare expect the
+marker exactly 464 clocks later, MASK covering only that window. `Download successful.` is the
+proof; any other length puts capture tail or a shifted marker in the window and fails. No TDO
+*reporting* is needed at all, which is what frees this from the raw-JTAG limitation. The same
+oracle read BYPASS as exactly 1 bit and IDCODE as exactly 32 on this silicon — the calibration
+that made the 494-vs-464 discrepancy a fact rather than a suspicion.
+
+The empirical measurement (`bscan length --measure`) remains for a chain with no BSDL, with its
+original subtlety: **the marker must not be a run of ones.** The search returns the earliest
+match, so any run of ones already present in the captured pin state is mistaken for the marker and
+the measured length comes out too short, confidently and with no error. The BSR capture is live pin
+state and can trivially contain a byte of ones. This tool uses `0x6699A55A`, which has no run of
+identical bits longer than two — and the same asymmetry is what makes the one-run verify alias-proof.
 
 ### Proving the scan is real
 

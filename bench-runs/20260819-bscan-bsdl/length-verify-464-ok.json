@@ -1,0 +1,7 @@
+{
+  "method": "svf-verify",
+  "ir_length": 16,
+  "expected": 464,
+  "matches": true,
+  "bsdl": "bundled:SIP_S32S277n8n9_S32E277n8n9_BGA27_831F01D.bsdl"
+}

@@ -206,7 +206,7 @@ layer that carries the safety policy. The exit-code contract:
 | exit | meaning | raised by |
 |---|---|---|
 | 0 | success | — |
-| 1 | usage error | `click.ClickException` — bad `--ap`, misaligned dump, missing `--bsr-length`, malformed address/value/index (addresses require the `0x` prefix; bare numbers are rejected, never guessed) |
+| 1 | usage error | `click.ClickException` — bad `--ap`, misaligned dump, a malformed `bscan drive PIN=VAL`, malformed address/value/index (addresses require the `0x` prefix; bare numbers are rejected, never guessed) |
 | 2 | tool error | any `S32EError` — no DAP, power-up refused, transport failure. Also any *other* escaped exception: reported as `internal error`, never a traceback (`S32EDBG_TRACE=1` re-raises) |
 | 3 | **refused by safety policy** | `UnsafeOperation` |
 | 130 | aborted at a prompt | `click.Abort` |
@@ -225,7 +225,7 @@ The refusals that must stay refused:
 | `iface swd` without `--i-understand-swd-is-one-way` | exit 3 | RM 135.5.1 — return needs POR |
 | `mem write --ap sda` (even with `--yes`) | exit 3 | RM 135.13.4 — the HSE C/R is one-shot |
 | any AXI-AP access while functional reset is asserted | exit 3 | RM Table 957 — needs a destructive reset to undo |
-| `bscan` EXTEST / HIGHZ / CLAMP | not implemented | RM 136.4.4.3/.4/.5 — each asserts internal system reset |
+| `bscan` drive / highz / clamp without `--i-understand-boundary-scan-drives-pins` | exit 3 | RM 136.4.4.3/.4/.5 — each asserts internal system reset, and the latched drive persists until TAP reset or power-cycle |
 
 `--yes` skips the *prompt*, never the *policy*. There is a test for exactly that.
 
@@ -271,7 +271,7 @@ pytest -m hardware -v -x
 | 9b | `load <app.elf> --verify` (with `-ElfPath`) | SRAMC witnesses read 0; every segment written and full-verified; rtu0.0 halted with PC = entry | See "The `load` flow" section below for the phase order and what each abort means. Resets the whole SoC by design. |
 | 9c | `flash jedec` → read → erase/program/verify at `-FlashScratch` (default `0x300000`, never offset 0 first) | JEDEC `0xC23989C2`; applet halts at bkpt with rc 0; pattern byte-exact after power-loss-free round trip | See "The `flash` flow" section below — u-f1..u-f9 are the uncertainties this step exists to settle; failures become Findings 10+. |
 | 10 | `bscan preamble --run-svf` | "Download successful. SVF ok" | A parser complaint usually means the 208-bit operand; the SVF path exists because the raw path cannot carry it. |
-| 11 | `bscan sample --bsr-length 64` | two captures agree | Disagreement means the target is not quiescent, or the capture is not stable. |
+| 11 | `bscan sample` | 228 named pins, `RESET_B` = 1 | Named via the bundled BSDL with the silicon quirk (464 cells; §7.3, ✅ 2026-08-19). `--bsr-length 64` remains the raw fallback; a wrong `RESET_B` on a powered board points at cell orientation — retry `--reverse-cells`. |
 | 12 | `report` | every section present | A section reporting an error is acceptable and by design — see below. |
 
 **One deliberate non-failure worth understanding.** `romdump` and `report` record
@@ -348,32 +348,82 @@ One bit of 64 moved; the other 63 held. A quiescent board gave
 `0x0000000000000006`. **The scan reaches real boundary cells.** No hands were
 needed in the end — the running application supplied the change.
 
-`s32edbg bscan sample --watch` still exists for a manual pin toggle. Without the
-BSDL the bit indices are shift positions, not pin names, so the check is "some
-bit changed", never "bit N changed".
+`s32edbg bscan sample --watch` exists for a manual pin toggle — and since
+2026-08-19 the bundled BSDL names the bits, so the check is "pin N changed",
+with control cells reported as `cell K (control for PIN)`. The second `--watch`
+capture first plays one whole-register TDO compare seeded with the first
+capture, so "nothing changed" costs one JTAGLoad run instead of 62; any
+mismatch falls back to the full per-byte read (JTAGLoad's report does not say
+*which* byte differed).
 
-Cost: one `JTAGLoad.exe` invocation **per byte**, because JTAGLoad stops at the
-first TDO mismatch and that mismatch report is its only read channel. 64 bits is
-8 runs; 512 bits is 64 runs and takes minutes.
+Cost otherwise unchanged: one `JTAGLoad.exe` invocation **per byte**, because
+JTAGLoad stops at the first TDO mismatch and that mismatch report is its only
+read channel. The full 464-cell register (58 bytes) is 58 runs — measured
+2026-08-19 at ~5 s total (~80 ms per run), plus 4 runs for the IDCODE probe.
 
-### 7.3 BSR length — unresolved, with a designed experiment
+### 7.3 BSR length — RESOLVED ON SILICON 2026-08-19: **464**, not the BSDL's 494
 
 RM 136.3.4 puts the length only in the BSDL file, which RM Table 984 names
-(`SIP_S32E277n8n9_BGA27_831F01D.bsdl`) but does not supply. Measuring it needs a
-TDO-reporting raw shift, which no backend here provides — so `--bsr-length` is
-currently required.
+(`SIP_S32E277n8n9_BGA27_831F01D.bsdl`) but does not supply. NXP's SIP file
+(real name `SIP_S32S277n8n9_S32E277n8n9_BGA27_831F01D.bsdl` — note the S32S
+prefix; its own DESIGN_WARNING targets the S32S277/8/9 SIP) is bundled in
+`s32edbg/data/` and says **BOUNDARY_LENGTH = 494**. Its DESIGN_WARNING repeats
+the RM Table 984 preamble verbatim — two sources agreeing on the preamble.
 
-An earlier attempt shifted an all-ones TDI fill expecting the tail to read
-`0xFF`; it returned an unexplained `0x55` pattern. **Not resolved, not
-explained.**
+**Measured 2026-08-19** (`bench-runs/20260819-bscan-bsdl/`, board powered,
+bootloader on the SMU, R52s off): with that exact preamble the SAMPLE/PRELOAD
+register is **464 bits**. The marker-delay oracle
+(`transport/svf.py:emit_marker_verify` — one SVF shifts `len + 32` bits with
+the `0x6699A55A` marker entering first and lets the TDO compare expect it
+exactly `len` clocks later, MASK on that window only; `Download successful.`
+is the proof) first read registers of *known* length exactly right — BYPASS 1,
+IDCODE 32 — then rejected every SAMPLE length in 480..560. A marker+ones-fill
+scan byte-probed through the mismatch-report channel found the marker bytes
+`5A A5 99 66` byte-aligned at bit **464**, and the exact verify matched.
 
-The designed replacement, not yet implemented: a **marker-delay measurement in a
-single SVF file**. Shift a distinctive pattern in on scan 1, then read scan 2 and
-find the byte offset at which the marker emerges — that offset is the register
-length. It must be one file, because each `JTAGLoad` run begins with `STATE
-RESET` and would discard the shifted marker. This needs a small addition to
-`transport/svf.py` (a two-scan emitter); `jtag/tapseq.find_marker_delay()`
-already exists for the decode.
+Locating the missing 30 bits: the 464-bit capture was scored against every
+contiguous 30-cell cut of the BSDL (hard requirement RESET_B = 1; maximize
+output-enable cells reading driver-off, since only the bootloader runs). The
+unique best cut is **cell 262** — precisely the BSDL's only run of 30
+consecutive `internal` BC_2 cells (262..291, between DDR0_CA5 and LIN_6_TX).
+**No pins are lost**; cells ≥ 292 shift down by 30, confirmed by
+above-the-cut pins decoding coherently (GTM_033 / LFAST_0_EXT_REF /
+ETH_1_MII_TXER are among the seven driver-on pins, all a bootloader's
+CAN/LIN-TX-idle set). Recorded as `data.bscan.BSDL_CELL_QUIRKS` and applied
+automatically by `bsdl.load_bundled`; an explicit `--bsdl` file stays
+verbatim and the length verify arbitrates.
+
+Bench state after that session:
+
+1. ✅ `bscan length` → `464 bits (verified on silicon, one run)`.
+2. ✅ `bscan sample` → 228 named pins; RESET_B=1 driver-off; BOOTMOD_0=1,
+   BOOTMOD_1=0 (strap read — cross-check against the schematic when
+   convenient); DDR0_RESET_N=0 always-driven (DDR in reset on a
+   bootloader-only board); 22 DDR pins flagged SAMPLE-input-blocked.
+3. ✅ Cell orientation: the IEEE default (cell 0 nearest TDO) is correct —
+   marker byte order and every anchor agree; `--reverse-cells` was not
+   needed and stays only as a diagnostic.
+4. ✅ Adaptive verify: whole-register unchanged confirmed in ONE JTAGLoad
+   run (the `--watch` fast path).
+5. ❌ Gated drive (EXTEST) — **does not work on this silicon** (bench
+   2026-08-19, `EXTEST-not-driving.md`). EXTEST selects the 464-bit BSR and
+   asserts internal reset, but preloaded output data does not reach the pads:
+   read-back *under* EXTEST is identical for an all-1 vs all-0 vector, and a
+   pin driven high reads back low. Shift path verified correct (SAMPLE works);
+   cause is NXP-held (EXT_TEST_CTRL payload selects observe-only segments,
+   and/or the private JTAGC_EXTEST_PULSE/TRAIN step is required). NXP ticket
+   open. Commands stay available (gated + loud warning) to retry once known.
+   Re-test when a fix arrives: `bscan drive <PIN>=0` on a scoped safe net →
+   pin follows; `highz` floats it; `release`; power-cycle after.
+
+The earlier unexplained `0x55` from an all-ones fill (2026-08-01) is now
+explained: reads at 64 bits were sampling the low window of a 464-bit
+register — the `0x55` was real pin state (alternating data/control cells of
+high-reading pins in the DDR region), not a fill artifact.
+
+The hardware-marked tests pin the resolved facts
+(`test_the_bsr_length_is_the_quirked_464`,
+`test_a_named_sample_reads_sane_pin_states` in `tests/test_hardware.py`).
 
 ### 7.4 Raw JTAG
 
@@ -2285,6 +2335,46 @@ one session, on a board with the known-good app in flash:
       stacks read high by design (painted only below the painting SP).
       No traffic without the button: watch the output channel stay quiet
       while the view is merely open.
+    - 16k. Boundary Scan view (2026-08-19, offline-verified, bench pending —
+      **must be the last step of the whole checklist**: its preamble takes
+      the DAP away until a board power-cycle, §7.3). While CONNECTED the
+      view shows only the welcome text ("disconnect first") and its ⟳ /
+      Select BSDL buttons are hidden (`!s32e.connected` when-clauses).
+      Disconnect → press ⟳ → the modal warning appears once ("links
+      JTAGC_AE... power-cycle"); accept → progress notification while ~62
+      one-shot JTAGLoad runs execute (~10 s measured) → 228 pin rows sorted
+      by cell, header naming the bundled BSDL and the sample time; spot-check
+      `RESET_B` level 1 / driver off and `DDR0_DQ0` flagged SAMPLE-blocked
+      (tooltip explains the output-latch caveat). Press ⟳ again: no second
+      modal. Reconnect attempt now fails (expected, chain grown) → the view
+      welcome returns; power-cycle → connect works → disconnect → ⟳ shows
+      the modal again (re-armed by the successful connect).
+      Every row always shows its driver state (`drv:on` / `drv:off` /
+      `always-on` for DDR0_RESET_N); SoC-driving rows carry a colored icon.
+      Rows also show the SIUL2 pad between ball and driver state
+      (extension 0.3.1): spot-check `DSPI_2_SCK … PAD_086`, `PBB_07 … AE
+      MSCR 15`, `RESET_B` with no pad; the tooltip carries the instance +
+      MSCR (`SIUL2_1 MSCR 86`).
+    - 16k². IDE EXTEST drive (extension 0.3.0, 2026-08-19). **The drive
+      itself does not work on this silicon** (see §7.3 item 5 /
+      `EXTEST-not-driving.md`); this step verifies the UI wiring only, and
+      the modal now leads with that limitation. Right-click a safe,
+      unloaded pin (spare CAN/LIN TX) → **Drive Pin Low (EXTEST)** → its own
+      modal appears once per board session (limitation, MCU reset,
+      persistence, whole-set semantics, sample-glitch note); accept → the
+      row turns `⚡ BS-driving 0` with the zap icon, the header says `EXTEST
+      driving 1 pin(s)` (the SVF runs and latches; the pad will not follow
+      until the NXP fix — a scope stays flat, as documented). Right-click → Drive High
+      → no second modal, pin follows (whole set re-sent). Press ⟳ → sample
+      completes and the drive re-latches automatically (scope shows a brief
+      glitch to functional control during the read — expected and stated in
+      the modal). Right-click → **Stop Driving Pin** with one pin left →
+      falls through to release. The **Release** title button (TAP reset) →
+      toast says the MCU is booting; power-cycle before anything else.
+      Driving refuses while connected, like sampling. The CLI drive path
+      (`bscan drive ... --i-understand-boundary-scan-drives-pins`) remains
+      for scripted use; the IDE modal is the same consent, and the IDE
+      passes the flag itself after it.
 
 Record the run under `bench-runs/` as usual.
 

@@ -21,7 +21,7 @@ s32edbg = "s32edbg.cli:entry"
 include = ["s32edbg*"]
 
 [tool.setuptools.package-data]
-"s32edbg.data" = ["*.bin"]
+"s32edbg.data" = ["*.bin", "*.bsdl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

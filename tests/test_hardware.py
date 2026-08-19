@@ -466,6 +466,61 @@ def test_the_capture_is_stable_in_structure_but_not_frozen() -> None:
     )
 
 
+def test_the_bsr_length_is_the_quirked_464() -> None:
+    """Resolves test-plan section 7.3 on silicon. **Run last** (preamble).
+
+    Settled on the bench 2026-08-19: the BSDL says 494 but this part chains
+    **464** -- the file's single 30-cell internal segment (262..291) is
+    absent, which is what `data.bscan.BSDL_CELL_QUIRKS` records and
+    `bsdl.load_bundled` applies. The marker-delay verify proves the quirked
+    length in one JTAGLoad run: a 32-bit marker shifted in behind the
+    register must re-emerge exactly 464 clocks later. The same oracle read
+    BYPASS as exactly 1 bit and IDCODE as exactly 32, so a failure here is
+    the chain, not the method.
+    """
+    from s32edbg import bsdl as bsdl_lib
+
+    b = bsdl_lib.load_bundled(0x0831_F01D)
+    assert b is not None and b.boundary_length == 464
+    assert bscan_mod.svf_verify_length(
+        BSCAN_DEFAULT_IRLEN, b.boundary_length, bsdl=b, install=discover()
+    ), (
+        "the marker did not re-emerge after 464 bits. Either the preamble did "
+        "not take (power-cycle and retry) or this part's chain differs from "
+        "the recorded quirk -- re-measure per test-plan section 7.3."
+    )
+
+
+def test_a_named_sample_reads_sane_pin_states() -> None:
+    """The BSDL mapping against physical truth. **Run last** (preamble).
+
+    RESET_B must read 1 on a running board (the compliance pattern already
+    requires POR_B high, and a board in reset would not be executing), and the
+    capture must decode to the full 228-pin set. BOOTMOD levels are strap-
+    dependent so only their presence is asserted; record their values in the
+    bench log and check them against the schematic -- that check, plus a
+    deliberately toggled header pin landing on the right name, is what
+    settles the cell-orientation question (else re-run with reverse_cells).
+    """
+    from s32edbg import bsdl as bsdl_lib
+
+    b = bsdl_lib.load_bundled(0x0831_F01D)
+    assert b is not None
+    result = bscan_mod.svf_sample(
+        BSCAN_DEFAULT_IRLEN, b.boundary_length, install=discover(), bsdl=b
+    )
+    assert result.cells == 464 and result.pins is not None
+    rows = {r["name"]: r for r in result.pins}
+    assert len(rows) == 228
+    assert rows["RESET_B"]["level"] == 1, (
+        f"RESET_B sampled {rows['RESET_B']['level']} on a powered board. If other "
+        "pins look shifted too, the cell orientation may be reversed -- retry "
+        "with reverse_cells=True and record which one matches the schematic."
+    )
+    assert rows["BOOTMOD_0"]["level"] in (0, 1)
+    assert rows["BOOTMOD_1"]["level"] in (0, 1)
+
+
 def test_the_preamble_links_the_ae_tap_and_takes_the_dap_away(commander) -> None:
     """**Destructive to DAP access until a power cycle. Keep this last.**
 

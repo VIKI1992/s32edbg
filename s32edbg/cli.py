@@ -19,6 +19,7 @@ import click
 from rich.console import Console
 
 from . import __version__
+from . import bsdl as bsdl_lib
 from . import elf as elf_mod
 from . import machine as machine_mod
 from . import stackcfg
@@ -42,12 +43,13 @@ from .data import r52debug
 from .data import rtuboot
 from .data import smuboot
 from .data import swj
-from .data.bscan import BSCAN_DEFAULT_IRLEN, BSCAN_PROBE_BITS
+from .data.bscan import BSCAN_DEFAULT_IRLEN
 from .data.expected_apmap import AP_ALIASES, AP_APB, AP_AXI, AP_MDM, AP_SDA, APBIC1_ROM_BASE
 from .data.known_ids import decode_dpidr
 from .data.ladder1 import MDM_IDR_EXPECTED, SDA_SYSRSTC, SDA_SYSRSTC_SYSFUNCREQ
-from .errors import ElfError, PowerUpError, S32EError, TransportError, UnsafeOperation
+from .errors import BsdlError, ElfError, PowerUpError, S32EError, TransportError, UnsafeOperation
 from .jtag import bscan as bscan_mod
+from .jtag.bscan import DRIVE_OPT_IN
 from .jtag import tap as tap_mod
 from .report import emit
 from .session import DebugSession
@@ -283,11 +285,13 @@ def main(ctx: click.Context, transport_kind: str, serial: str | None, speed_khz:
     clocks are off by default (RM 135.11) and the enables are lost on power
     loss. Everything else fails politely until it has run.
 
-    Safety policy baked in: boundary scan is SAMPLE/PRELOAD only, the SDA-AP
-    authentication path is never written (the reset-control registers are the
-    sole, allowlisted exception), AXI-AP traffic is refused while functional
-    reset is asserted, and switching to SWD needs an explicit opt-in because
-    returning to JTAG requires a power-on reset.
+    Safety policy baked in: the boundary-scan drive instructions
+    (EXTEST/HIGHZ/CLAMP) assert internal MCU reset and need an explicit
+    opt-in, the SDA-AP authentication path is never written (the
+    reset-control registers are the sole, allowlisted exception), AXI-AP
+    traffic is refused while functional reset is asserted, and switching to
+    SWD needs an explicit opt-in because returning to JTAG requires a
+    power-on reset.
     """
     ctx.obj = Ctx(transport_kind, serial, speed_khz, jlink_dir, log, json_out, echo, irlen, device)
 
@@ -6417,11 +6421,19 @@ def tap_dr(ctx: Ctx, value: str, bits: int) -> None:
 
 @main.group()
 def bscan() -> None:
-    """Boundary scan (SAMPLE/PRELOAD only).
+    """Boundary scan: named pin sampling, and gated pin driving.
 
-    EXTEST, HIGHZ and CLAMP are deliberately not implemented: RM 136.4.4 says
-    each asserts the internal MCU system reset, and HIGHZ additionally floats
-    every output driver.
+    SAMPLE/PRELOAD is non-invasive and always available; the bundled BSDL
+    (auto-selected by the probed IDCODE, or given with --bsdl) turns the raw
+    bit vector into named pin states. EXTEST, HIGHZ and CLAMP drive or float
+    real pins and assert the internal MCU system reset (RM 136.4.4), so each
+    demands --i-understand-boundary-scan-drives-pins -- and a latched drive
+    persists after the command exits, until `bscan release` or a power-cycle.
+
+    KNOWN LIMITATION: the drive path (EXTEST) is UNCONFIRMED on S32E silicon --
+    on an S32E277 the pads did not follow the preloaded data (bench 2026-08-19,
+    pending NXP). SAMPLE/read is fully working. See the boundary-scan section of
+    docs/system-debug-interface.md.
     """
 
 
@@ -6447,6 +6459,99 @@ PREAMBLE_CHAIN_WARNING = (
     "apmap, romdump, mem, attach -- will stop working until you power-cycle. "
     "Run boundary scan last."
 )
+
+#: What accepting the drive opt-in actually means. RM 136.4.4.3/.4/.5 plus the
+#: latching behaviour measured on the SVF path.
+DRIVE_WARNING = (
+    "EXTEST/HIGHZ/CLAMP assert the internal MCU system reset (RM 136.4.4) -- the "
+    "application stops -- and the latched state persists after this command "
+    "exits: pins stay driven and the MCU stays in reset until `bscan release` "
+    "or a power-cycle."
+)
+
+#: Measured on S32E277 silicon 2026-08-19 (bench-runs/20260819-bscan-bsdl/
+#: EXTEST-not-driving.md): with the RM Table 984 preamble, EXTEST selects the
+#: 464-bit BSR and asserts internal reset, but the preloaded output data does
+#: NOT reach the pads -- read-back under EXTEST is identical whether the vector
+#: is all-1 or all-0. Root cause is NXP-held: the EXT_TEST_CTRL payload appears
+#: to configure the segments for observe/SAMPLE only, and/or the private
+#: JTAGC_EXTEST_PULSE/TRAIN step is needed to apply the drive. SAMPLE is
+#: unaffected. Kept available (not refused) so the fix can be tried once known.
+EXTEST_UNCONFIRMED_WARNING = (
+    "boundary-scan DRIVE is UNCONFIRMED on S32E silicon: on an S32E277 the pads "
+    "did not follow the preloaded data (bench 2026-08-19). SAMPLE/read works. "
+    "The drive may need a different EXT_TEST_CTRL payload or the private "
+    "JTAGC_EXTEST_PULSE step -- pending NXP. Verify with a scope; do not rely on it."
+)
+
+
+def _bscan_hz(ctx: Ctx) -> int:
+    return ctx.speed_khz * 1000
+
+
+def _print_bsdl_findings(b) -> None:
+    for line in bsdl_lib.opcode_disagreements(b):
+        console.print(f"[yellow]![/yellow] opcode disagreement: {line} -- the BSDL wins")
+    for note in b.notes:
+        console.print(f"[dim]bsdl note: {note}[/dim]")
+
+
+def _resolve_bsdl(ctx: Ctx, bsdl_path: str | None, *, probe: bool):
+    """The BSDL for this run.
+
+    --bsdl wins outright. Otherwise the IDCODE is probed through the SVF path
+    (four JTAGLoad runs, no SIR, valid at either chain width) and matched
+    against the bundled files; a probed ID that matches nothing is an error,
+    never a silent fallback -- that is how an S32E270 would get an S32E277's
+    pin map. Only when probing is off or failed does the single bundled file
+    stand in, with the assumption printed.
+    """
+    if bsdl_path:
+        try:
+            b = bsdl_lib.parse_bsdl(bsdl_path)
+        except FileNotFoundError:
+            raise click.ClickException(f"{bsdl_path}: no such file") from None
+        _print_bsdl_findings(b)
+        return b
+
+    idcode: int | None = None
+    if probe:
+        try:
+            idcode = bscan_mod.svf_read_idcode(
+                install=discover(ctx.jlink_dir),
+                serial=ctx.serial,
+                log_file=ctx.log,
+                frequency_hz=_bscan_hz(ctx),
+            )
+            console.print(f"[dim]probed IDCODE 0x{idcode:08X}[/dim]")
+        except TransportError as exc:
+            console.print(
+                f"[yellow]![/yellow] IDCODE probe failed ({exc}); "
+                "falling back to the bundled BSDL"
+            )
+
+    if idcode is not None:
+        b = bsdl_lib.load_bundled(idcode)
+        if b is None:
+            raise click.ClickException(
+                f"probed IDCODE 0x{idcode:08X} matches no bundled BSDL. Pass "
+                "--bsdl <file>; if the chain was already preambled or driven, "
+                "power-cycle the board first so the cold chain answers."
+            )
+        if b.idcode != idcode:
+            console.print(
+                f"[dim]matched {b.entity} with the fuse-sourced IDCODE bits "
+                "[20:17] masked (RM: not valid immediately out of reset)[/dim]"
+            )
+    else:
+        b = bsdl_lib.resolve(None, None)
+        if b is None:
+            raise click.ClickException(
+                "no BSDL: pass --bsdl <file> (more than one bundled candidate)"
+            )
+        console.print(f"[dim]assuming {b.entity} (the only bundled BSDL)[/dim]")
+    _print_bsdl_findings(b)
+    return b
 
 
 @bscan.command("preamble")
@@ -6500,50 +6605,109 @@ def bscan_preamble(ctx: Ctx, svf_path: str | None, run_svf: bool) -> None:
 
 
 @bscan.command("length")
-@click.option("--max-bits", type=int, default=4096, show_default=True)
-@click.option("--skip-preamble", is_flag=True, help="Assume the preamble has already been shifted.")
+@click.option("--bsdl", "bsdl_path", default=None, help="BSDL file; default: bundled, auto-selected by probed IDCODE.")
+@click.option("--measure", is_flag=True, help="Measure with the raw-shift transport instead of verifying the BSDL length (needs a TDO-reporting backend).")
+@click.option("--max-bits", type=int, default=4096, show_default=True, help="Measurement cap (--measure only).")
+@click.option("--skip-preamble", is_flag=True, help="--measure only: assume the preamble has already been shifted.")
 @click.pass_obj
-def bscan_length(ctx: Ctx, max_bits: int, skip_preamble: bool) -> None:
-    """Measure the boundary-scan register length.
+def bscan_length(ctx: Ctx, bsdl_path: str | None, measure: bool, max_bits: int, skip_preamble: bool) -> None:
+    """Verify (default) or measure the boundary-scan register length.
 
-    The RM does not state it: "The size of the boundary scan register and bit
-    ordering is device-dependent and can be found in the device BSDL file."
+    RM 136.3.4 puts the length only in the BSDL: 494 for the bundled S32E277
+    file. The default mode proves it on silicon in ONE JTAGLoad run -- shift a
+    32-bit marker behind the expected length and check it re-emerges exactly
+    there (the test-plan section 7.3 design). --measure keeps the raw-shift
+    probe for a chain with no BSDL at all.
     """
-    with open_transport(ctx, tif=Tif.JTAG, connect_dap=False, needs_raw_jtag=True) as (t, _):
-        irlen = _resolve_irlen(t, ctx)
-        if not skip_preamble:
-            pre = bscan_mod.run_preamble(t, irlen)  # type: ignore[arg-type]
-            if not pre.ok:
-                raise click.ClickException("preamble failed; cannot measure the BSR")
-        length = bscan_mod.measure_bsr_length(t, irlen, max_bits=max_bits)  # type: ignore[arg-type]
-        console.print(f"boundary-scan register length: [bold]{length}[/bold] bits")
-        if ctx.json_out:
-            _emit_json(ctx.json_out, {"ir_length": irlen, "bsr_length": length})
+    irlen = ctx.irlen or BSCAN_DEFAULT_IRLEN
+    if measure:
+        expected: int | None = None
+        if bsdl_path:
+            expected = _resolve_bsdl(ctx, bsdl_path, probe=False).boundary_length
+        with open_transport(ctx, tif=Tif.JTAG, connect_dap=False, needs_raw_jtag=True) as (t, _):
+            irlen = _resolve_irlen(t, ctx)
+            if not skip_preamble:
+                pre = bscan_mod.run_preamble(t, irlen)  # type: ignore[arg-type]
+                if not pre.ok:
+                    raise click.ClickException("preamble failed; cannot measure the BSR")
+            length = bscan_mod.measure_bsr_length(t, irlen, max_bits=max_bits)  # type: ignore[arg-type]
+            console.print(f"boundary-scan register length: [bold]{length}[/bold] bits")
+            if expected is not None:
+                mark = "[green]matches the BSDL[/green]" if length == expected else f"[red]BSDL says {expected}[/red]"
+                console.print(mark)
+            if ctx.json_out:
+                _emit_json(ctx.json_out, {
+                    "method": "measure", "ir_length": irlen, "bsr_length": length,
+                    "expected": expected,
+                    "matches": None if expected is None else length == expected,
+                })
+        return
+
+    b = _resolve_bsdl(ctx, bsdl_path, probe=bsdl_path is None)
+    console.print(f"[yellow]![/yellow] {PREAMBLE_CHAIN_WARNING}")
+    ok = bscan_mod.svf_verify_length(
+        irlen,
+        b.boundary_length,
+        bsdl=b,
+        install=discover(ctx.jlink_dir),
+        serial=ctx.serial,
+        log_file=ctx.log,
+        frequency_hz=_bscan_hz(ctx),
+    )
+    if ok:
+        console.print(
+            f"boundary-scan register length: [bold]{b.boundary_length}[/bold] bits "
+            "[green](verified on silicon, one run)[/green]"
+        )
+    else:
+        console.print(
+            f"[red]the register is NOT {b.boundary_length} bits[/red] -- the marker "
+            "did not re-emerge where the BSDL says. Wrong BSDL for this chip, or "
+            "the preamble did not take (power-cycle and retry)."
+        )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            "method": "svf-verify", "ir_length": irlen,
+            "expected": b.boundary_length, "matches": ok, "bsdl": b.path,
+        })
 
 
 @bscan.command("sample")
-@click.option("--bsr-length", type=int, default=None, help="Skip measurement and use this length.")
-@click.option("--skip-preamble", is_flag=True)
-@click.option("--watch", is_flag=True, help="Take a second capture and report which bits changed.")
+@click.option("--bsdl", "bsdl_path", default=None, help="BSDL file for pin names; default: bundled, auto-selected by probed IDCODE.")
+@click.option("--bsr-length", type=int, default=None, help="Raw mode: capture this many bits with no BSDL mapping at all.")
+@click.option("--reverse-cells", is_flag=True, help="Decode with reversed cell orientation (bench escape hatch; see test-plan).")
+@click.option("--pins", "pins_glob", default=None, help="Only tabulate pins matching this glob, e.g. 'CAN_*'. JSON keeps every row.")
+@click.option("--watch", is_flag=True, help="Take a second capture and report which pins changed.")
 @click.pass_obj
-def bscan_sample(ctx: Ctx, bsr_length: int | None, skip_preamble: bool, watch: bool) -> None:
+def bscan_sample(
+    ctx: Ctx,
+    bsdl_path: str | None,
+    bsr_length: int | None,
+    reverse_cells: bool,
+    pins_glob: str | None,
+    watch: bool,
+) -> None:
     """Capture pin states with SAMPLE/PRELOAD. Non-invasive.
 
-    Runs through SVF/JTAGLoad, which is the route proven on hardware. It costs
-    one JTAGLoad invocation per byte, because JTAGLoad stops at the first TDO
-    mismatch and that mismatch report is the only way it reveals received data.
+    Runs through SVF/JTAGLoad, the route proven on hardware: one JTAGLoad
+    invocation per byte, because JTAGLoad stops at the first TDO mismatch and
+    that mismatch report is the only way it reveals received data. With the
+    BSDL (bundled, auto-selected) the capture decodes to named pin states;
+    --bsr-length N keeps the old raw mode instead. In --watch mode the second
+    capture first tries a single-run whole-register compare against the
+    first, so "nothing changed" costs one run, not sixty-two.
     """
     irlen = ctx.irlen or BSCAN_DEFAULT_IRLEN
+    if bsr_length is not None and bsdl_path is not None:
+        raise click.ClickException("--bsr-length is raw mode; it cannot be combined with --bsdl")
+
+    b = None if bsr_length is not None else _resolve_bsdl(ctx, bsdl_path, probe=bsdl_path is None)
+    length = bsr_length if b is None else b.boundary_length
+
     console.print(f"[yellow]![/yellow] {PREAMBLE_CHAIN_WARNING}")
-    if bsr_length is None:
-        raise click.ClickException(
-            "--bsr-length is required for now: measuring it needs a TDO-reporting raw "
-            "shift, which no backend provides here. RM 136.3.4 puts the length only in "
-            f"the BSDL file. Start with a guess ({BSCAN_PROBE_BITS}) and widen it."
-        )
     install = discover(ctx.jlink_dir)
 
-    def capture(label: str):
+    def capture(label: str, previous=None):
         seen = 0
 
         def on_byte(i: int, total: int, _v: int) -> None:
@@ -6553,22 +6717,47 @@ def bscan_sample(ctx: Ctx, bsr_length: int | None, skip_preamble: bool, watch: b
                 console.print(f"[dim]{label}: {seen}/{total} bytes[/dim]", end="\r")
 
         r = bscan_mod.svf_sample(
-            irlen, bsr_length, install=install, serial=ctx.serial,
-            log_file=ctx.log, frequency_hz=ctx.speed_khz * 1000, on_byte=on_byte,
+            irlen, length, install=install, serial=ctx.serial,
+            log_file=ctx.log, frequency_hz=_bscan_hz(ctx), on_byte=on_byte,
+            bsdl=b, reverse_cells=reverse_cells, previous=previous,
         )
         console.print(" " * 40, end="\r")
+        if previous is not None and seen == 0:
+            console.print(f"[dim]{label}: unchanged, verified in one run[/dim]")
         return r
 
     first = capture("capture 1")
     console.print(f"captured {first.bsr_length} bits: {first.as_dict()['raw_hex']}")
+    if first.pins is not None:
+        rows = first.pins
+        if pins_glob:
+            import fnmatch
+
+            rows = [r for r in rows if fnmatch.fnmatch(r["name"].upper(), pins_glob.upper())]
+        emit.print_bscan_sample(rows, console)
+        blocked = sum(1 for r in first.pins if r["sample_input_blocked"])
+        if blocked:
+            console.print(
+                f"[dim]{blocked} DDR pins cannot SAMPLE their inputs in mission "
+                "mode (BSDL DESIGN_WARNING); their levels show the output latch.[/dim]"
+            )
 
     payload: dict[str, object] = {"ir_length": irlen, "first": first.as_dict()}
+    if b is not None:
+        payload["bsdl"] = b.path
+        payload["reverse_cells"] = reverse_cells
     if watch:
         click.pause("change an input pin on the board, then press any key...")
-        second = capture("capture 2")
+        second = capture("capture 2", previous=first)
         changed = first.diff(second)
         console.print(f"second capture: {second.as_dict()['raw_hex']}")
-        if changed:
+        if changed and b is not None:
+            named = first.diff_named(second, b)
+            console.print(f"[green]{len(changed)} cell(s) changed:[/green]")
+            for row in named:
+                console.print(f"  {row['name']:<40} {row['from']} -> {row['to']}")
+            payload["changed_named"] = named
+        elif changed:
             console.print(f"[green]{len(changed)} bit(s) changed:[/green] {changed}")
         else:
             console.print(
@@ -6577,9 +6766,174 @@ def bscan_sample(ctx: Ctx, bsr_length: int | None, skip_preamble: bool, watch: b
             )
         payload["second"] = second.as_dict()
         payload["changed_bits"] = changed
-    console.print(f"[dim]{first.as_dict()['note']}[/dim]")
+    if first.pins is None:
+        console.print(f"[dim]{first.as_dict()['note']}[/dim]")
     if ctx.json_out:
         _emit_json(ctx.json_out, payload)
+
+
+@bscan.command("pins")
+@click.option("--bsdl", "bsdl_path", default=None, help="BSDL file; default: the bundled one.")
+@click.pass_obj
+def bscan_pins(ctx: Ctx, bsdl_path: str | None) -> None:
+    """List every pin the boundary register can see. Parse-only, no probe.
+
+    The inventory out of the BSDL: pin name, BGA ball, direction, data and
+    control cell numbers, safe value, and the caveats (DDR pins that cannot
+    SAMPLE inputs in mission mode; always-driven pins with no Z state).
+    """
+    b = _resolve_bsdl(ctx, bsdl_path, probe=False)
+    pins = [p.as_dict() for p in bsdl_lib.pin_rows(b)]
+    emit.print_bscan_pins(b.entity, pins, console)
+    console.print(
+        f"{len(pins)} pins across {b.boundary_length} cells, IDCODE "
+        f"0x{b.idcode:08X}, IR {b.instruction_length} bits -- {b.path}"
+    )
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {
+            **b.as_dict(),
+            "opcode_disagreements": bsdl_lib.opcode_disagreements(b),
+            "pins": pins,
+        })
+
+
+def _parse_drive_args(pairs: tuple[str, ...]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for p in pairs:
+        name, sep, value = p.partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not name or not value:
+            raise click.ClickException(f"{p!r}: expected PIN=0, PIN=1 or PIN=Z")
+        if name.upper() in (k.upper() for k in out):
+            raise click.ClickException(f"{name}: given twice")
+        out[name] = value
+    return out
+
+
+def _run_drive(ctx: Ctx, name: str, bsdl_path: str | None, opt_in: bool, runner) -> None:
+    """Shared consent gate + warning + execution for EXTEST/HIGHZ/CLAMP."""
+    if not opt_in:
+        # UnsafeOperation, not ClickException: safety-policy exit code 3, the
+        # same bucket as the SWD one-way-door guard.
+        bscan_mod.reject_drive_instruction(name)
+    b = _resolve_bsdl(ctx, bsdl_path, probe=bsdl_path is None)
+    console.print(f"[yellow]![/yellow] {PREAMBLE_CHAIN_WARNING}")
+    console.print(f"[yellow]![/yellow] {DRIVE_WARNING}")
+    console.print(f"[red]![/red] {EXTEST_UNCONFIRMED_WARNING}")
+    try:
+        result = runner(b)
+    except BsdlError as exc:
+        raise click.ClickException(str(exc)) from None
+    for row in result.get("pins", []):
+        level = "Z" if not row["driving"] else str(row["level"])
+        console.print(
+            f"  {row['name']:<24} {row['ball']:<5} cell {row['cell']:>3} -> {level}"
+        )
+    if result.get("ok"):
+        console.print(f"[green]{name} latched[/green] -- pins are under boundary-scan control now.")
+        console.print(
+            "[dim]release with `bscan release`, then power-cycle before further "
+            "boundary scan (the BSDL requires a functional POR).[/dim]"
+        )
+    else:
+        console.print(f"[red]{name} SVF failed[/red]")
+        for line in result.get("failures", []):
+            console.print(f"  [red]{line}[/red]")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, {"bsdl": b.path, **result})
+
+
+@bscan.command("drive")
+@click.argument("drives", nargs=-1, required=True, metavar="PIN=VAL...")
+@click.option(DRIVE_OPT_IN, "opt_in", is_flag=True, help="Required. Acknowledges the MCU reset and that the drive persists until `bscan release` or power-cycle.")
+@click.option("--bsdl", "bsdl_path", default=None, help="BSDL file; default: bundled, auto-selected by probed IDCODE.")
+@click.pass_obj
+def bscan_drive(ctx: Ctx, drives: tuple[str, ...], opt_in: bool, bsdl_path: str | None) -> None:
+    """EXTEST: drive the named pins (VAL is 0, 1 or Z); all others stay safe.
+
+    Every undriven cell holds its BSDL safe value with its output driver
+    disabled, so exactly the pins named here drive. Guarded: EXTEST asserts
+    the internal MCU system reset (RM 136.4.4.3) and the latched drive
+    outlives this command.
+    """
+    parsed = _parse_drive_args(drives)
+    _run_drive(
+        ctx, "EXTEST", bsdl_path, opt_in,
+        lambda b: bscan_mod.drive_pins(
+            b, parsed, ir_length=ctx.irlen or BSCAN_DEFAULT_IRLEN,
+            install=discover(ctx.jlink_dir), serial=ctx.serial,
+            log_file=ctx.log, frequency_hz=_bscan_hz(ctx),
+        ),
+    )
+
+
+@bscan.command("highz")
+@click.option(DRIVE_OPT_IN, "opt_in", is_flag=True, help="Required. Acknowledges the MCU reset and that the float persists until `bscan release` or power-cycle.")
+@click.option("--bsdl", "bsdl_path", default=None, help="BSDL file; default: bundled, auto-selected by probed IDCODE.")
+@click.pass_obj
+def bscan_highz(ctx: Ctx, opt_in: bool, bsdl_path: str | None) -> None:
+    """HIGHZ: float every output driver, for board-level isolation testing.
+
+    Guarded: RM 136.4.4.4 -- tri-states every driver AND asserts the internal
+    MCU system reset. The float persists after this command exits.
+    """
+    _run_drive(
+        ctx, "HIGHZ", bsdl_path, opt_in,
+        lambda b: bscan_mod.highz(
+            b, ir_length=ctx.irlen or BSCAN_DEFAULT_IRLEN,
+            install=discover(ctx.jlink_dir), serial=ctx.serial,
+            log_file=ctx.log, frequency_hz=_bscan_hz(ctx),
+        ),
+    )
+
+
+@bscan.command("clamp")
+@click.argument("drives", nargs=-1, metavar="[PIN=VAL...]")
+@click.option(DRIVE_OPT_IN, "opt_in", is_flag=True, help="Required. Acknowledges the MCU reset and that the clamp persists until `bscan release` or power-cycle.")
+@click.option("--bsdl", "bsdl_path", default=None, help="BSDL file; default: bundled, auto-selected by probed IDCODE.")
+@click.pass_obj
+def bscan_clamp(ctx: Ctx, drives: tuple[str, ...], opt_in: bool, bsdl_path: str | None) -> None:
+    """CLAMP: freeze pins at the preloaded pattern (named PIN=VALs over safe
+    values), with the 1-bit bypass register selected.
+
+    With no PIN=VALs every driver is simply off. Guarded: RM 136.4.4.5 --
+    asserts the internal MCU system reset; persists after this command.
+    """
+    parsed = _parse_drive_args(drives) if drives else {}
+    _run_drive(
+        ctx, "CLAMP", bsdl_path, opt_in,
+        lambda b: bscan_mod.clamp(
+            b, parsed, ir_length=ctx.irlen or BSCAN_DEFAULT_IRLEN,
+            install=discover(ctx.jlink_dir), serial=ctx.serial,
+            log_file=ctx.log, frequency_hz=_bscan_hz(ctx),
+        ),
+    )
+
+
+@bscan.command("release")
+@click.pass_obj
+def bscan_release(ctx: Ctx) -> None:
+    """Undo a latched drive: TAP reset, pins back to the system, MCU boots.
+
+    Ungated -- it only ever makes the board safer. The BSDL DESIGN_WARNING
+    requires a functional POR before further BSR work, so power-cycle before
+    the next boundary-scan command.
+    """
+    result = bscan_mod.release(
+        install=discover(ctx.jlink_dir), serial=ctx.serial,
+        log_file=ctx.log, frequency_hz=_bscan_hz(ctx),
+    )
+    if result.get("ok"):
+        console.print(
+            "[green]released[/green] -- pins returned to the system; the MCU is "
+            "booting. Power-cycle before further boundary scan."
+        )
+    else:
+        console.print("[red]release SVF failed[/red]")
+        for line in result.get("failures", []):
+            console.print(f"  [red]{line}[/red]")
+    if ctx.json_out:
+        _emit_json(ctx.json_out, result)
 
 
 # ---------------------------------------------------------------------------

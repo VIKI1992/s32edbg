@@ -129,7 +129,8 @@ def jtagc_ir(opcode8: int, irlen: int) -> int:
 #: Instructions that assert the internal MCU system reset or float outputs.
 #: RM 136.4.4.3/.4/.5: EXTEST, HIGHZ and CLAMP each "assert the internal system
 #: reset for the MCU"; HIGHZ additionally places "all output drivers ... in an
-#: inactive drive state". Not implemented by this tool, by design.
+#: inactive drive state". Gated behind an explicit opt-in flag; without it the
+#: refusal carries the reason recorded here.
 DRIVE_PIN_INSTRUCTIONS: dict[str, tuple[int, str]] = {
     "EXTEST": (JTAGC_IR_EXTEST, "asserts internal MCU system reset (RM 136.4.4.3)"),
     "HIGHZ": (JTAGC_IR_HIZ, "tri-states every output driver and asserts internal reset (RM 136.4.4.4)"),
@@ -201,9 +202,38 @@ def preamble_steps(irlen: int) -> list[tuple[str, int, int, int, int]]:
     ]
 
 
-#: RM Table 984 names these files but does not say where to obtain them. Recorded
-#: for the operator's benefit; the tool does not require a BSDL.
+#: RM Table 984 names these files but does not say where to obtain them. The
+#: names here are the RM's, kept as the citation record; matching an actual
+#: file is done by the IDCODE parsed from its contents (``bsdl.load_bundled``),
+#: never by filename -- NXP ships the 831F01D file under the longer name
+#: ``SIP_S32S277n8n9_S32E277n8n9_BGA27_831F01D.bsdl``, which is what
+#: ``s32edbg/data/`` bundles verbatim.
 BSDL_FILES: dict[int, str] = {
     0x0831_B01D: "SIP_S32E270_BGA27_831B01D.bsdl",
     0x0831_F01D: "SIP_S32E277n8n9_BGA27_831F01D.bsdl",
+}
+
+#: Measured deviations between the bundled BSDL and this silicon's chain,
+#: applied by ``bsdl.load_bundled``: idcode -> (first cell dropped, count, why).
+#:
+#: 2026-08-19 bench (S32E277, IDCODE 0x0831F01D, marker-delay verify + byte
+#: probing): with the RM Table 984 preamble the SAMPLE/PRELOAD register is
+#: **464 bits, not the BSDL's 494**. BYPASS measured exactly 1 and IDCODE
+#: exactly 32 with the same oracle, so the method is sound. Locating the 30
+#: missing bits against physical invariants (RESET_B=1; with the R52s off,
+#: output-enable cells overwhelmingly read "driver off") converged on a
+#: single cut at cell 262 -- exactly the BSDL's one and only run of 30
+#: consecutive `internal` BC_2 cells (262..291, between the DDR0_CA block
+#: and LIN_6_TX). No pins are lost; cells above shift down by 30, confirmed
+#: by pins above the cut decoding coherently (GTM_033/LFAST_0_EXT_REF/
+#: ETH_1_MII_TXER driver-on states). The bundled file's own DESIGN_WARNING
+#: says it targets the S32S277/8/9 SIP; the S32E die evidently omits that
+#: internal segment from the chain.
+BSDL_CELL_QUIRKS: dict[int, tuple[int, int, str]] = {
+    0x0831_F01D: (
+        262,
+        30,
+        "S32E277 silicon chains 464 of the BSDL's 494 cells; the 30-cell "
+        "internal segment at 262..291 is absent (bench 2026-08-19)",
+    ),
 }

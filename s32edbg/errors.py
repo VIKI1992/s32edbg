@@ -38,7 +38,8 @@ class UnsafeOperation(S32EError):
     AXI-AP traffic while functional reset is asserted (RM Table 957 note --
     recovery needs a destructive reset), any SDA-AP write (the HSE
     challenge/response is one-shot), and the drive-pin boundary-scan
-    instructions EXTEST/HIGHZ/CLAMP.
+    instructions EXTEST/HIGHZ/CLAMP without their explicit opt-in (each
+    asserts the internal MCU system reset, RM 136.4.4).
     """
 
 
@@ -55,6 +56,19 @@ class ElfError(S32EError):
     travels the standard route (message + exit 2 one-shot, printed error inside
     a session); the CLI downgrades argument-quality cases (missing file, not an
     ELF) to a usage error.
+    """
+
+
+class BsdlError(S32EError):
+    """The file is not a BSDL this tool can parse.
+
+    Raised by ``bsdl.parse_bsdl`` for anything outside the supported shape:
+    not a BSDL at all, a boundary-register list with gaps or the wrong count,
+    an IDCODE without the IEEE-mandated LSB of 1, or opcodes whose width
+    disagrees with INSTRUCTION_LENGTH. The parser targets the NXP BSDL_GEN
+    dialect the bundled file uses, not general VHDL; a foreign but valid BSDL
+    failing here is a parser limitation worth reporting, and the error says
+    which construct broke.
     """
 
 

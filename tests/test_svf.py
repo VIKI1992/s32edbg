@@ -139,6 +139,90 @@ def test_a_byte_that_really_is_zero_reports_no_mismatch_and_reads_back_as_zero()
     assert svf.parse_found_byte("Download successful.\n") is None
 
 
+def test_idcode_read_has_no_preamble_and_no_sir() -> None:
+    """TLR loads IDCODE by itself (RM 136.3.1), valid at either chain width --
+    an SIR would need to know the IR length, which is the very thing an
+    un-probed chain cannot tell us."""
+    text = svf.emit_idcode_read(0)
+    statements = [l for l in text.splitlines() if l and not l.startswith("!")]
+    assert not any(l.startswith("SIR") for l in statements)
+    assert "SDR 32 TDI (00000000) TDO (00000000) MASK (000000FF);" in statements
+    assert "STATE RESET;" in statements
+    # exactly one scan
+    assert sum(l.startswith("SDR ") for l in statements) == 1
+
+
+def test_idcode_read_masks_the_requested_byte() -> None:
+    assert "MASK (FF000000);" in svf.emit_idcode_read(3)
+    with pytest.raises(ValueError, match="outside"):
+        svf.emit_idcode_read(4)
+
+
+def test_marker_verify_places_the_marker_after_the_expected_length() -> None:
+    """The §7.3 marker-delay design: the marker goes in TDI's low 32 bits
+    (shifted first) and must re-emerge exactly expected_len clocks later."""
+    marker = 0x6699_A55A
+    text = svf.emit_marker_verify(16, 0x0202, 494, marker)
+    # The preamble contributes its own SDRs; the verify scan is the last one.
+    scan = [l for l in text.splitlines() if l.startswith("SDR ")][-1]
+    assert scan.startswith("SDR 526 ")  # 494 + 32
+    nib = (526 + 3) // 4
+    assert f"TDI ({marker:0{nib}X})" in scan
+    assert f"TDO ({marker << 494:0{nib}X})" in scan
+    assert f"MASK ({0xFFFF_FFFF << 494:0{nib}X})" in scan
+    # and the instruction that selects the boundary register
+    assert "SIR 16 TDI (0202);" in text
+
+
+def test_marker_verify_includes_the_preamble() -> None:
+    text = svf.emit_marker_verify(16, 0x0202, 494, 0x6699_A55A)
+    assert "SIR 16 TDI (0A00);" in text  # EXT_TEST_CTRL
+
+
+def test_dr_verify_compares_only_the_masked_cells() -> None:
+    """496 shifted bits, 494 real cells: the two pad bits are unpredictable
+    and must not fail the compare."""
+    text = svf.emit_dr_verify(16, 0x0202, 496, expect=0x5, mask_bits=494)
+    scan = next(l for l in text.splitlines() if l.startswith("SDR 496 "))
+    nib = (496 + 3) // 4
+    assert f"MASK ({(1 << 494) - 1:0{nib}X})" in scan
+    assert f"TDO ({0x5:0{nib}X})" in scan
+
+
+def test_dr_verify_rejects_mask_wider_than_scan() -> None:
+    with pytest.raises(ValueError, match="outside"):
+        svf.emit_dr_verify(16, 0x0202, 32, expect=0, mask_bits=33)
+
+
+def test_drive_orders_preload_vector_then_final_instruction() -> None:
+    """RM 136.4.4: fill the update latches under SAMPLE/PRELOAD (system
+    unaffected), then one Update-IR of EXTEST flips the pins. The other order
+    would drive stale latch contents."""
+    text = svf.emit_drive(16, 0x0202, vector=0x3, nbits=494, final_ir=0x0404, final_name="EXTEST")
+    lines = [l for l in text.splitlines() if not l.startswith("!")]
+    preload_i = lines.index("SIR 16 TDI (0202);")
+    vector_i = next(i for i, l in enumerate(lines) if l.startswith("SDR 494 "))
+    final_i = lines.index("SIR 16 TDI (0404);")
+    assert preload_i < vector_i < final_i
+    assert final_i == len(lines) - 1  # nothing after: the drive stays latched
+    # write-only: no compares anywhere
+    assert "TDO" not in text
+    assert "MASK" not in text
+
+
+def test_drive_includes_the_preamble_and_ends_clean() -> None:
+    text = svf.emit_drive(16, 0x0202, vector=0, nbits=494, final_ir=0x0509, final_name="HIGHZ")
+    assert "SIR 16 TDI (0A00);" in text
+    statements = [l for l in text.splitlines() if l and not l.startswith("!")]
+    assert all(l.endswith(";") for l in statements)
+
+
+def test_release_is_a_bare_tap_reset() -> None:
+    text = svf.emit_release()
+    assert "STATE RESET;" in text
+    assert "SIR" not in text and "SDR" not in text
+
+
 def test_svf_result_ok_requires_success_marker() -> None:
     good = svf.SvfResult(0, "Executing file [x.svf]...\nDownload successful.\n", [])
     assert good.ok

@@ -172,14 +172,67 @@ def test_an_unknown_ap_name_is_rejected_and_names_the_valid_ones(run) -> None:
     assert "ahb-smu" in out
 
 
-def test_sampling_without_a_bsr_length_explains_why_it_cannot_be_measured(run) -> None:
-    """RM 136.3.4 puts the BSR length only in the BSDL file, and measuring it
-    needs a TDO-reporting raw shift that no backend here provides. The refusal
-    has to say so, or it reads as a missing argument the operator forgot."""
-    code, out = run("bscan", "sample")
+def test_sample_raw_mode_and_bsdl_are_mutually_exclusive(run) -> None:
+    """--bsr-length is the no-BSDL escape hatch; combining it with --bsdl is a
+    contradiction that must be caught before anything touches the probe."""
+    code, out = run("bscan", "sample", "--bsr-length", "64", "--bsdl", "x.bsdl")
     assert code == EXIT_USAGE
-    assert "--bsr-length" in out
-    assert "BSDL" in out
+    assert "raw mode" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bscan", "drive", "BOOTMOD_0=1"],
+        ["bscan", "highz"],
+        ["bscan", "clamp"],
+    ],
+    ids=lambda a: a[1],
+)
+def test_drive_instructions_without_the_opt_in_are_refused(run, argv) -> None:
+    """RM 136.4.4: EXTEST/HIGHZ/CLAMP assert the internal MCU system reset.
+    Exit 3 -- the safety-policy code the SWD guard uses -- and the refusal
+    names the flag, before any transport or JTAGLoad run."""
+    code, out = run(*argv)
+    assert code == EXIT_REFUSED
+    assert "RM 136.4.4" in out
+    assert cli.DRIVE_OPT_IN in out
+
+
+def test_a_malformed_drive_argument_is_a_usage_error(run) -> None:
+    code, out = run("bscan", "drive", "BOOTMOD_0", cli.DRIVE_OPT_IN)
+    assert code == EXIT_USAGE
+    assert "PIN=0" in out
+
+
+def test_a_duplicate_drive_pin_is_a_usage_error(run) -> None:
+    code, out = run("bscan", "drive", "BOOTMOD_0=1", "bootmod_0=0", cli.DRIVE_OPT_IN)
+    assert code == EXIT_USAGE
+    assert "twice" in out
+
+
+def test_bscan_pins_needs_no_probe_and_emits_the_pin_contract(run, tmp_path) -> None:
+    """Parse-only: the bundled BSDL alone answers, with no SEGGER install and
+    no probe. The JSON is the contract the IDE view consumes."""
+    out_path = tmp_path / "pins.json"
+    code, _out = run("--json", str(out_path), "bscan", "pins")
+    assert code == EXIT_OK
+    payload = read_json(out_path)
+    assert payload["entity"] == "SIP_S32S277n8n9_S32E277n8n9_BGA27"
+    assert payload["idcode"] == "0x0831F01D"
+    # The silicon-quirked model: the file says 494, this part chains 464.
+    assert payload["boundary_length"] == 464
+    assert payload["opcode_disagreements"] == [
+        "ENABLE_CENSOR_CTRL: BSDL 0x0100 vs RM Table 959 0x0107"
+    ]
+    rows = {p["name"]: p for p in payload["pins"]}
+    assert len(rows) == 228
+    assert rows["RESET_B"]["cell"] == 167 and rows["RESET_B"]["ball"] == "AC29"
+    assert rows["DDR0_DQ0"]["sample_input_blocked"] is True
+    # The SIUL2 pad identity rides every row (None for dedicated pins).
+    assert rows["DSPI_2_SCK"]["pad"] == "PAD_086"
+    assert rows["PBB_07"]["pad"].startswith("AE MSCR ")
+    assert rows["RESET_B"]["pad"] is None
 
 
 def test_declining_the_write_confirmation_aborts_before_touching_the_target(run) -> None:

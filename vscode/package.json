@@ -1,8 +1,8 @@
 {
   "name": "s32e-debug",
   "displayName": "S32E Debug",
-  "description": "Debug NXP S32E27x boards over J-Link using the s32edbg backend: run control, RAM load, breakpoints, disassembly for 4x Cortex-R52 + 3x Cortex-M33.",
-  "version": "0.1.0",
+  "description": "Debug NXP S32E27x boards over J-Link using the s32edbg backend: run control, RAM load, breakpoints, disassembly for 4x Cortex-R52 + 3x Cortex-M33, plus BSDL-named boundary scan.",
+  "version": "0.3.2",
   "publisher": "s32e-tools",
   "private": true,
   "license": "UNLICENSED",
@@ -87,6 +87,12 @@
           "id": "s32e.stacks",
           "name": "Stacks",
           "icon": "media/icon.svg"
+        },
+        {
+          "id": "s32e.bscan",
+          "name": "Boundary Scan",
+          "icon": "media/icon.svg",
+          "visibility": "collapsed"
         }
       ]
     },
@@ -100,6 +106,11 @@
         "view": "s32e.cores",
         "contents": "Connect to discover cores.",
         "when": "!s32e.connected"
+      },
+      {
+        "view": "s32e.bscan",
+        "contents": "Boundary scan runs without a debug session: its preamble changes the JTAG chain and takes the DAP away until the board is power-cycled, so it goes last.\nDisconnect, then press ⟳ to sample every pin.",
+        "when": "s32e.connected"
       }
     ],
     "commands": [
@@ -375,6 +386,44 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "s32e.bscan.selectBsdl",
+        "title": "Select BSDL File...",
+        "category": "S32E",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "s32e.refreshBscan",
+        "title": "Sample Boundary-Scan Pins",
+        "category": "S32E",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "s32e.bscan.driveHigh",
+        "title": "Drive Pin High (EXTEST)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.bscan.driveLow",
+        "title": "Drive Pin Low (EXTEST)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.bscan.driveZ",
+        "title": "Float Pin / Drive Z (EXTEST)",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.bscan.stopDriving",
+        "title": "Stop Driving Pin",
+        "category": "S32E"
+      },
+      {
+        "command": "s32e.bscan.release",
+        "title": "Release Boundary-Scan Drive (TAP Reset)",
+        "category": "S32E",
+        "icon": "$(debug-disconnect)"
+      },
+      {
         "command": "s32e.addWatch",
         "title": "Add Watch...",
         "category": "S32E",
@@ -456,6 +505,22 @@
     ],
     "menus": {
       "commandPalette": [
+        {
+          "command": "s32e.bscan.driveHigh",
+          "when": "false"
+        },
+        {
+          "command": "s32e.bscan.driveLow",
+          "when": "false"
+        },
+        {
+          "command": "s32e.bscan.driveZ",
+          "when": "false"
+        },
+        {
+          "command": "s32e.bscan.stopDriving",
+          "when": "false"
+        },
         {
           "command": "s32e.focusCore",
           "when": "false"
@@ -654,9 +719,44 @@
           "command": "s32e.refreshStacks",
           "when": "view == s32e.stacks && s32e.connected",
           "group": "navigation@2"
+        },
+        {
+          "command": "s32e.bscan.selectBsdl",
+          "when": "view == s32e.bscan && !s32e.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "s32e.refreshBscan",
+          "when": "view == s32e.bscan && !s32e.connected",
+          "group": "navigation@2"
+        },
+        {
+          "command": "s32e.bscan.release",
+          "when": "view == s32e.bscan && !s32e.connected",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
+        {
+          "command": "s32e.bscan.driveHigh",
+          "when": "view == s32e.bscan && !s32e.connected && viewItem =~ /bscanPin/",
+          "group": "drive@1"
+        },
+        {
+          "command": "s32e.bscan.driveLow",
+          "when": "view == s32e.bscan && !s32e.connected && viewItem =~ /bscanPin/",
+          "group": "drive@2"
+        },
+        {
+          "command": "s32e.bscan.driveZ",
+          "when": "view == s32e.bscan && !s32e.connected && viewItem =~ /bscanPin/",
+          "group": "drive@3"
+        },
+        {
+          "command": "s32e.bscan.stopDriving",
+          "when": "view == s32e.bscan && !s32e.connected && viewItem == bscanPinDriven",
+          "group": "drive@4"
+        },
         {
           "command": "s32e.focusCore",
           "when": "view == s32e.cores && viewItem =~ /core/",
@@ -909,6 +1009,16 @@
           "type": "string",
           "default": "0xAAAAAAAA",
           "description": "The 32-bit word the OS paints unused stack with (MICROSAR OS_HAL_STACK_FILL_PATTERN). The Stacks view's utilization scan looks for where this pattern ends."
+        },
+        "s32e.bscan.bsdlPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a .bsdl file for boundary-scan pin names. Empty uses the BSDL bundled with the backend (SIP_S32E277 27x27, auto-selected by the probed JTAG IDCODE)."
+        },
+        "s32e.bscan.reverseCells": {
+          "type": "boolean",
+          "default": false,
+          "description": "Decode boundary-scan captures with reversed cell orientation. Bench escape hatch: leave off unless sampled pins land on obviously wrong names (see the test plan's boundary-scan section)."
         },
         "s32e.variables.liveRefreshMs": {
           "type": "number",

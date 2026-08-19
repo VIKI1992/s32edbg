@@ -13,8 +13,8 @@ It does six things:
 5. **Debug the cores.** Halt, resume, single-step, step over a call, read and write registers, and
    manage hardware breakpoints and watchpoints — on the Cortex-R52 cores (`core`, `bp`, `wp`) and
    on the Cortex-M33 subsystems (`m33`), which use a completely different debug model.
-6. **Run a boundary scan** — SAMPLE/PRELOAD only, including the mandatory RM Table 984 preamble —
-   `bscan`.
+6. **Run a boundary scan** — named pin states via the bundled BSDL (494 cells, 228 pins), the
+   mandatory RM Table 984 preamble, and a consent-gated EXTEST/HIGHZ/CLAMP drive set — `bscan`.
 
 Plus interface selection (`iface`), raw TAP access (`tap`), and a one-shot artifact collector
 (`report`).
@@ -185,8 +185,8 @@ s32edbg m33 list
 s32edbg attach                     :: stops the application
 s32edbg release                    :: restarts it
 s32edbg report --json out.json
-s32edbg bscan preamble --run-svf   :: from here on the DAP is gone until power-cycle
-s32edbg bscan sample --bsr-length 64
+s32edbg bscan length               :: from here on the DAP is gone until power-cycle
+s32edbg bscan sample               :: named pins from the bundled BSDL
 ```
 
 `tools\bench-acceptance.ps1` runs exactly this, in order, keeping per-step JSON and wire-level logs.
@@ -239,8 +239,9 @@ appear in the binary with full C prototypes and look ideal — they are **not ex
 to the `.JLinkScript` API. `JLINK_JTAG_StoreRaw`/`StoreGetRaw` *are* exported but carry no prototype
 anywhere. That leaves Commander's `WJTAGRaw <NumBits> <TMS> <TDI>`, which drives the pins but does
 **not** report TDO reliably on this probe — so `calibrate_tdo_order()` refuses, and `tap ir`,
-`tap dr` and `bscan length` are unavailable. Boundary scan runs through SVF/JTAGLoad instead, which
-works.
+`tap dr` and `bscan length --measure` are unavailable. Boundary scan runs through SVF/JTAGLoad
+instead, which works — including the default `bscan length` verify, which needs no TDO reporting
+at all (a compare inside the SVF is the answer).
 
 ### Exit codes
 
@@ -1410,13 +1411,48 @@ s32edbg[-]> quit
 
 ## `bscan` — boundary scan
 
-**SAMPLE/PRELOAD only.** RM §136.4.4.2 on PRELOAD: *"System operation is not affected."* By contrast
-EXTEST, HIGHZ and CLAMP each *"assert the internal system reset for the MCU"*, and HIGHZ additionally
-puts *"all output drivers … in an inactive drive state"*. On a live ECU that is a reset and a bus
-float, so they are not implemented — asking for one gives a refusal with the citation.
+**Named pins via the bundled BSDL; sampling is free, driving is gated.** The tool ships NXP's
+`SIP_S32S277n8n9_S32E277n8n9_BGA27_831F01D.bsdl` (the file RM Table 984 names for IDCODE
+`0x0831F01D`) as package data and auto-selects it by the probed IDCODE, so a capture decodes to
+**228 named pins** — pin name, BGA ball, level, and whether the SoC's own output driver was on.
+The file declares 494 cells; **this silicon chains 464** (measured 2026-08-19: the file's one
+30-cell internal segment is absent — no pins lost), and the tool applies that recorded quirk
+automatically. `--bsdl <file>` overrides the bundled copy, verbatim.
+
+Sampling (SAMPLE/PRELOAD) is non-invasive — RM §136.4.4.2: *"System operation is not affected."*
+By contrast EXTEST, HIGHZ and CLAMP each *"assert the internal system reset for the MCU"* (RM
+§136.4.4.3/.4/.5), and a latched drive **persists after the command exits** — pins stay driven and
+the MCU stays in reset until `bscan release` or a power-cycle. So the drive commands demand
+`--i-understand-boundary-scan-drives-pins`; without it they refuse with the citation (exit 3).
 
 > **Run boundary scan last.** The preamble links `JTAGC_AE` into the scan chain and takes DAP access
 > away until you power-cycle. The commands warn about this themselves.
+
+### `bscan pins` — the BSDL inventory (no probe needed)
+
+```bat
+s32edbg bscan pins
+s32edbg --json pins.json bscan pins
+```
+
+Parse-only: every observable pin with its ball, direction, data/control cell numbers, safe value
+and caveats. Two worth knowing: the DDR data pins (`DDR0_DQ*`, `DDR0_DMI*`, `DDR0_DQS*`) **cannot
+SAMPLE their inputs in mission mode** (BSDL DESIGN_WARNING — their sampled level shows the output
+latch), and `DDR0_RESET_N` is the one always-driven pin (an `output2` cell with no control cell, so
+no Z state). `AUR_*`, `JCOMP`, `POR_B` and all power/linkage pins have no boundary cells at all.
+
+The command also cross-checks the BSDL's opcode table against the RM Table 959 constants and prints
+any divergence loudly (today exactly one, `ENABLE_CENSOR_CTRL` — an instruction boundary scan never
+issues; where they disagree, **the BSDL wins at shift time**).
+
+**Every row also carries the SIUL2 pad identity** — the `Pad` column (and `pad`/`pad_detail` in
+JSON): `PAD_086` for main-die pins, `AE MSCR 15` for the AE-die `PB*` pins (there the pin name IS
+the pad name, so the column shows the MSCR index instead), `-` for truly dedicated pins (RESET_B,
+POR_B, JCOMP, EXTAL — note the JTAG pins are *not* dedicated: TCK is `PAD_173`). That is the link
+from a boundary-scan row to the `SIUL2_x` MSCR register you would configure. The mapping is joined
+by BGA ball from NXP's `S32E2_IOMUX.xlsx` — which ships **embedded as a file attachment inside the
+RM PDF** — into the committed table `s32edbg/data/pads_bga27.py`; regenerate with
+`python tools/gen_pads.py --from <IOMUX xlsx or RM pdf>`.
 
 ### `bscan preamble` — the mandatory RM Table 984 sequence
 
@@ -1446,32 +1482,45 @@ SVF ok
   Run boundary scan last.
 ```
 
-### `bscan sample` — capture pin states
+### `bscan sample` — capture named pin states
 
 ```bat
-s32edbg bscan sample --bsr-length 64
-s32edbg bscan sample --bsr-length 64 --watch      :: pause, you change something, capture again
-s32edbg --json bscan.json bscan sample --bsr-length 512
+s32edbg bscan sample                              :: probe IDCODE, pick BSDL, sample all 464 cells
+s32edbg bscan sample --pins "CAN_*"               :: full capture, table filtered to CAN pins
+s32edbg bscan sample --watch                      :: pause, you change something, capture again
+s32edbg bscan sample --bsr-length 64              :: raw mode: no BSDL, indexed bits only
+s32edbg --json bscan.json bscan sample
 ```
 
 ```
+probed IDCODE 0x0831F01D
 ! the preamble links JTAGC_AE into the scan chain ... Run boundary scan last.
-capture 1: 8/8 bytes
-captured 64 bits: 0x0035025555A02006
-Bit indices are shift positions, not pin names. RM 136.3.4 puts the BSR length
-and bit ordering in the BSDL file, which is not available.
+capture 1: 58/58 bytes
+captured 464 bits: 0x...
+                Boundary-scan sample
+┌───────────┬──────┬───────┬───────┬────────┬───────┐
+│ Pin       │ Ball │ Dir   │ Level │ Driver │ Notes │
+│ RESET_B   │ AC29 │ inout │   1   │  off   │       │
+│ BOOTMOD_0 │ AJ1  │ inout │   0   │  off   │       │
+│ ...       │      │       │       │        │       │
 ```
 
-Progress is reported per byte, since a wide scan takes a while. A shorter scan returns the low bits
-of a longer one — `--bsr-length 16` on the same board gives `0x2006`, which is the tail of the 64-bit
-capture above. That is a cheap way to sanity-check the byte indexing.
+The BSDL is picked by reading the IDCODE first (four cheap JTAGLoad runs, no instruction shift —
+Test-Logic-Reset loads IDCODE by itself, so the read works at either chain width). A probed ID that
+matches no bundled file is an error, never a silent guess. `--bsr-length N` is the raw escape hatch
+when no BSDL applies; it cannot be combined with `--bsdl`.
 
-**`--bsr-length` is required.** RM §136.3.4 puts the length only in the BSDL file, and measuring it
-needs a TDO-reporting raw shift no backend here provides. Start at 64 and widen.
+**Cost: one `JTAGLoad.exe` invocation per byte** — 464 cells is 58 runs, measured at ~5 s total on
+this bench (~80 ms per run; the 4-run IDCODE probe adds under a second). JTAGLoad
+has no "print TDO" command; its only read channel is the mismatch report, so a read is a
+deliberately-failing compare that reveals one byte at a time. **`--watch` is much cheaper on the
+second capture**: it first plays a single whole-register compare against capture 1, so "nothing
+changed" verifies in one run; only an actual change pays the full per-byte read again. Changes are
+reported by name (`RESET_B 1 -> 0`, or `cell 166 (control for RESET_B)` for a control cell).
 
-**Cost: one `JTAGLoad.exe` invocation per byte.** JTAGLoad has no "print TDO" command — its only
-read channel is the mismatch report, so a read is a deliberately-failing compare that reveals one
-byte at a time. 64 bits is 8 runs; 512 bits is 64 runs and takes minutes.
+`--reverse-cells` decodes with the opposite cell orientation. IEEE 1149.1 puts cell 0 nearest TDO
+and that is the default; the flag exists so the bench can falsify it once against the schematic
+(BOOTMOD straps, RESET_B=1) — see the test plan.
 
 **How to tell a real capture from a stuck one.** Equality between captures proves nothing — a stuck
 path is perfectly repeatable. Three outcomes:
@@ -1484,16 +1533,60 @@ path is perfectly repeatable. Three outcomes:
 
 Measured on a board running an application: `0x0035025555A02006` then `0x0015025555A02006` — one bit
 of 64 moved, 63 held. A quiescent board gave `0x0000000000000006`. That is what "the boundary scan
-works" looks like.
+works" looks like — now with the moving bit named.
 
-### `bscan length` — currently unavailable
+### `bscan length` — verify 464 in one run
 
 ```bat
-s32edbg bscan length
+s32edbg bscan length              :: marker verify against the (quirked) BSDL, one JTAGLoad run
+s32edbg bscan length --measure    :: the old raw-shift measurement (needs TDO-reporting backend)
 ```
 
-Needs a TDO-reporting raw shift. It fails with an explanation of which capability is missing rather
-than a traceback.
+RM §136.3.4 puts the length only in the BSDL, which says 494 — **and silicon says 464** (verified
+2026-08-19, `bench-runs/20260819-bscan-bsdl/`): the file's single 30-cell internal segment
+(cells 262..291) is not in this part's chain. The recorded quirk makes 464 the expected value. The
+verify is the test-plan §7.3 marker-delay design collapsed to O(1): shift a 32-bit marker in
+behind the register and expect it exactly 464 clocks later, MASK covering only that window.
+`Download successful.` *is* the proof; any other length breaks the compare (the marker is
+asymmetric, so a shifted copy of itself cannot alias) — the same oracle read BYPASS as exactly 1
+bit and IDCODE as exactly 32, which is how the 494→464 discrepancy was caught and pinned in the
+first place.
+
+### `bscan drive` / `highz` / `clamp` / `release` — the gated drive set
+
+> ⚠️ **Known limitation — EXTEST drive is unconfirmed on S32E silicon.** On an S32E277 (bench
+> 2026-08-19, `bench-runs/20260819-bscan-bsdl/EXTEST-not-driving.md`) EXTEST correctly selects the
+> 464-bit register and asserts the internal MCU reset, but the **preloaded output data does not
+> reach the pads** — read-back under EXTEST is identical whether the vector is all-1 or all-0. The
+> shift path is verified correct (SAMPLE reads pins perfectly); the cause is NXP-held (the
+> `EXT_TEST_CTRL` payload likely selects the segments for observe only, and/or the private
+> `JTAGC_EXTEST_PULSE`/`TRAIN` step is required to apply the drive — an NXP ticket is open). These
+> commands stay available so the fix can be tried once known; **verify any drive with a scope.**
+
+```bat
+s32edbg bscan drive CAN_0_TX=0 --i-understand-boundary-scan-drives-pins
+s32edbg bscan drive LIN_0_TX=1 GTM_018=Z --i-understand-boundary-scan-drives-pins
+s32edbg bscan highz --i-understand-boundary-scan-drives-pins
+s32edbg bscan clamp PBB_00=1 --i-understand-boundary-scan-drives-pins
+s32edbg bscan release
+```
+
+One write-only SVF run each: preamble, PRELOAD the vector under SAMPLE/PRELOAD (system still
+unaffected, RM §136.4.4.2), then latch the drive instruction — at that Update-IR the pins flip to
+boundary-scan control **and the MCU enters internal system reset**. Every cell not named on the
+command line holds its BSDL safe value with its driver disabled, so exactly the pins you list
+drive. Refused with the reason: unknown pins, `in`/`linkage` ports, pins with no cell (`AUR_*`),
+and `Z` on the always-driven `DDR0_RESET_N`.
+
+The latched state **outlives the command** — that is the point (probe the board while it holds) and
+the danger (the MCU is off, the pins are yours). `bscan release` is the ungated undo: a TAP reset
+reloads IDCODE, the pins return to the system and the MCU boots. The BSDL requires a functional POR
+before further BSR work, so power-cycle before the next boundary-scan command.
+
+The same drives are available from the IDE (extension ≥ 0.3.0): right-click a pin in the Boundary
+Scan view → *Drive Pin High/Low* / *Float Pin* / *Stop Driving*, with a Release button in the view
+title. The consent modal there stands in for the flag; every action re-sends the whole drive set
+(EXTEST semantics), and sampling auto re-applies an active drive after the read.
 
 ---
 
@@ -1527,7 +1620,9 @@ note: IDCODE taken from J-Link's own chain scan at connect rather than a raw
 shift, so it does not depend on the backend reporting TDO.
 note: IR length 8 selects the 8-bit Table 958 opcode set.
 ! BYPASS DR length not measured: expected 2 WJTAGRaw TDO capture(s) but parsed 1
-RM Table 984 names SIP_S32E277n8n9_BGA27_831F01D.bsdl for IDCODE 0x0831F01D.
+RM Table 984 names SIP_S32E277n8n9_BGA27_831F01D.bsdl for IDCODE 0x0831F01D; the
+tool bundles a matching BSDL (entity SIP_S32S277n8n9_S32E277n8n9_BGA27, 494
+cells) and uses it automatically -- see `bscan pins`.
 ```
 
 The BYPASS warning is the raw-TDO limitation showing through: the IDCODE and IR length come from the
@@ -1824,9 +1919,11 @@ All five passed, plus the M33:
 | step, step-over, cross-trigger | PC advances by exactly one instruction |
 | M33 (`smu`) | halt, registers, step, BPU breakpoint hit at the target address |
 
-Still unproven: `tap ir`/`tap dr` and `bscan length` (blocked on raw-TDO capability), `iface swd`
-(deliberately unrun — it costs a power cycle), `attach` on genuinely blank flash, DWT watchpoints on
-an M33, and run-control on the two CE cores, which are not executing at all.
+Still unproven: `tap ir`/`tap dr` and `bscan length --measure` (blocked on raw-TDO capability),
+the gated boundary-scan drive set (EXTEST/HIGHZ/CLAMP — **found not to reach the pads on S32E277**,
+bench 2026-08-19, NXP ticket open; sampling and the length verify passed on silicon, test-plan §7.3),
+`iface swd` (deliberately unrun — it costs a power cycle), `attach` on genuinely blank flash, DWT
+watchpoints on an M33, and run-control on the two CE cores, which are not executing at all.
 
 ---
 
@@ -1893,8 +1990,21 @@ debugger-domain policy in the post-reset default state. It is reported as access
 transport failure.
 
 **BSDL.** RM Table 984 names `SIP_S32E277n8n9_BGA27_831F01D.bsdl` but does not say where to get it,
-and RM §136.3.4 puts the BSR length and bit ordering only in that file. So `bscan sample` emits an
-indexed raw bit vector with no pin names. Supply the BSDL and pin mapping becomes possible.
+and RM §136.3.4 puts the BSR length and bit ordering only in that file. The file NXP actually ships
+(`SIP_S32S277n8n9_S32E277n8n9_BGA27_831F01D.bsdl` — the S32S/S32E combined SIP file) is now bundled
+as package data: it mapped the register to 228 pins, confirmed every RM Table 959 opcode the tool
+shifts (including the non-duplicated `HIGHZ 0x0509`) with one benign divergence
+(`ENABLE_CENSOR_CTRL` 0x0100 vs 0x0107), and carries the whole Table 984 preamble verbatim in its
+DESIGN_WARNING — two independent sources agreeing on the trickiest sequence in the tool.
+
+**And then silicon disagreed with the BSDL too — by exactly one segment.** The file declares
+BOUNDARY_LENGTH 494; the marker-delay oracle (validated by reading BYPASS as exactly 1 bit and
+IDCODE as exactly 32) measured **464** on the S32E277, and locating the missing 30 bits against
+physical invariants landed on the file's single run of 30 consecutive `internal` cells (262..291,
+between the DDR block and LIN_6). No pins are lost; the tool records this as a per-IDCODE cell
+quirk and applies it automatically (`bench-runs/20260819-bscan-bsdl/`). Two smaller width
+discrepancies stay recorded but unacted-on: EXT_TEST_CTRL's DR is 215 bits per REGISTER_ACCESS,
+205 per the warning text, and 208 as proven on silicon; the shipped 208-bit payload stays.
 
 ---
 

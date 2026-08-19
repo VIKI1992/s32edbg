@@ -14,6 +14,7 @@ import { PlotPanels } from "./plot/plotPanel";
 import { Poller } from "./poll/poller";
 import { ComparatorAdoption } from "./state/adoption";
 import { BreakpointStore } from "./state/breakpoints";
+import { BscanState } from "./state/bscan";
 import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
 import { DebugState } from "./state/session";
@@ -28,6 +29,7 @@ import { WatchpointStore } from "./state/watchpoints";
 import { Output } from "./ui/output";
 import { StatusBar } from "./ui/statusBar";
 import { BreakpointsView } from "./views/breakpointsView";
+import { BscanView } from "./views/bscanView";
 import { CoresView } from "./views/coresView";
 import { MemoryView } from "./views/memoryView";
 import { RegistersView } from "./views/registersView";
@@ -94,6 +96,30 @@ export function activate(context: vscode.ExtensionContext): void {
   const stacksTree = vscode.window.createTreeView("s32e.stacks", {
     treeDataProvider: new StacksView(state, stacks),
   });
+  // Boundary Scan: refresh-button-only AND disconnect-only -- the bscan
+  // preamble takes the DAP away until power-cycle, so its buttons hide while
+  // connected and a sample runs one-shot invocations with no session.
+  const bscan = new BscanState();
+  const bscanTree = vscode.window.createTreeView("s32e.bscan", {
+    treeDataProvider: new BscanView(state, bscan),
+  });
+  // A successful connect proves the chain is cold again (post-preamble it
+  // cannot connect, and a latched EXTEST drive cannot have survived the
+  // power-cycle that made connecting possible) -- so the per-board-session
+  // modal warnings re-arm and any believed drive state is stale.
+  let bscanWasConnected = false;
+  context.subscriptions.push(
+    state.onDidChange(() => {
+      if (state.connected !== bscanWasConnected) {
+        bscanWasConnected = state.connected;
+        if (bscanWasConnected) {
+          bscan.confirmed = false;
+          bscan.driveConfirmed = false;
+          bscan.clearDrives();
+        }
+      }
+    }),
+  );
   const bpTree = vscode.window.createTreeView("s32e.breakpoints", {
     treeDataProvider: new BreakpointsView(bpStore, viewPolling, comparators),
   });
@@ -148,8 +174,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output, state, elf, bpStore, wpStore, disasm, mem, pcDecor, poller,
     comparators, plots, statusBar, stackTree, regsTree, varsTree, coresTree,
-    memTree, bpTree, wpTree, stacks, stacksTree, variables, varLive,
-    viewPolling, adoption,
+    memTree, bpTree, wpTree, stacks, stacksTree, bscan, bscanTree, variables,
+    varLive, viewPolling, adoption,
     vscode.window.registerTreeDataProvider("s32e.session", new SessionView(state, elf)),
     vscode.workspace.registerTextDocumentContentProvider(DISASM_SCHEME, disasm),
     vscode.workspace.registerTextDocumentContentProvider(MEM_SCHEME, mem),
@@ -158,7 +184,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const deps: Deps = {
     state, elf, output, poller, bpStore, wpStore, disasm, mem, pcDecor,
     statusBar, stackView, variables, varLive, viewPolling, comparators,
-    plots, stacks,
+    plots, stacks, bscan,
     variablesTreeVisible: () => varsTree.visible,
     refreshTitles,
   };

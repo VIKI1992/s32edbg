@@ -4,6 +4,8 @@ import * as vscode from "vscode";
 import { SessionClient } from "./backend/client";
 import { oneshot } from "./backend/oneshot";
 import {
+  BscanDriveResult,
+  BscanSampleResult,
   hexToInt,
   PollResult,
   StackFrame,
@@ -20,6 +22,7 @@ import { PcDecorations } from "./editor/sourceDecorations";
 import { PlotPanels } from "./plot/plotPanel";
 import { Poller } from "./poll/poller";
 import { BreakpointStore, S32Breakpoint } from "./state/breakpoints";
+import { BscanState } from "./state/bscan";
 import { ComparatorReconciler } from "./state/comparators";
 import { ElfState } from "./state/elf";
 import { CoreInfo, DebugState, familyOf, M33_NAMES } from "./state/session";
@@ -55,6 +58,7 @@ export interface Deps {
   comparators: ComparatorReconciler;
   plots: PlotPanels;
   stacks: StacksState;
+  bscan: BscanState;
   variablesTreeVisible: () => boolean;
   refreshTitles: () => void;
 }
@@ -265,6 +269,179 @@ async function refreshStacks(deps: Deps): Promise<void> {
     stacks.scanning = false;
     stacks.fire();
   }
+}
+
+// ---------------------------------------------------------------------------
+// boundary scan
+// ---------------------------------------------------------------------------
+
+/** One button press = one `bscan sample` one-shot (~62 JTAGLoad runs).
+ *
+ * Inverted from every other refresh: it REFUSES while connected. JTAGLoad
+ * needs the probe to itself (`bscan` is SESSION_BLOCKED in the backend for
+ * the same reason), and the RM Table 984 preamble the sample plays takes the
+ * DAP away until the board is power-cycled -- so one modal confirm per board
+ * session before the first run. */
+async function refreshBscan(deps: Deps): Promise<void> {
+  const { state, bscan, output } = deps;
+  if (state.connected) {
+    throw new Error(
+      "boundary scan changes the JTAG chain and takes the DAP away until " +
+        "power-cycle — disconnect the session first (run it last)",
+    );
+  }
+  if (!bscan.confirmed) {
+    const go = await confirmDestructive(
+      "Run boundary scan? The preamble changes the JTAG chain.",
+      "The RM Table 984 preamble links JTAGC_AE into the scan chain (IR 8 → 16) " +
+        "and the change persists. DP/AP access — connect, memory, run control — " +
+        "will stop working until the board is power-cycled. Sampling itself is " +
+        "non-invasive (SAMPLE/PRELOAD; the application keeps running). Run " +
+        "boundary scan last.",
+      "Run boundary scan",
+    );
+    if (!go) {
+      return;
+    }
+    bscan.confirmed = true;
+  }
+  const args = ["bscan", "sample"];
+  const bsdlPath = bscan.bsdlPath;
+  if (bsdlPath) {
+    args.push("--bsdl", bsdlPath);
+  }
+  if (setting<boolean>("bscan.reverseCells", false)) {
+    args.push("--reverse-cells");
+  }
+  // The sample SVF ends with SAMPLE/PRELOAD latched, so an active EXTEST
+  // drive is released during the read; re-latch it right after (user chose
+  // auto re-apply -- the glitch is stated in the drive consent modal).
+  const relatch = bscan.driveLatched && bscan.driveSet.size > 0;
+  bscan.sampling = true;
+  bscan.fire();
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "S32E: boundary-scan sample (one JTAGLoad run per byte, ~10 s)...",
+      },
+      async () => {
+        const r = await oneshot(backendConfig(), output, args, {
+          timeoutMs: 600000,
+        });
+        const json = r.json as BscanSampleResult | null;
+        if (!json?.first?.pins) {
+          throw new Error(
+            `bscan sample failed (exit ${r.code}) — see the S32E log`,
+          );
+        }
+        bscan.noteSample(json.bsdl ?? null, json.first.pins, json.first.raw_hex);
+      },
+    );
+  } finally {
+    bscan.sampling = false;
+    bscan.fire();
+  }
+  if (relatch) {
+    await applyDrives(deps);
+  }
+}
+
+/** Mirror of the backend's `jtag/bscan.py:DRIVE_OPT_IN`. The modal below is
+ * the human consent this flag attests to; passing it without the modal is
+ * exactly what the flag exists to prevent, so keep them together. */
+const BSCAN_DRIVE_OPT_IN = "--i-understand-boundary-scan-drives-pins";
+
+/** Send the WHOLE drive set as one EXTEST latch (empty set = release).
+ *
+ * Whole-set is not a convenience: a `bscan drive` run rebuilds the full
+ * boundary vector from safe values, so omitting a previously-driven pin
+ * silently releases it. The view's per-pin actions all funnel through here.
+ */
+async function applyDrives(deps: Deps): Promise<void> {
+  const { state, bscan, output } = deps;
+  if (state.connected) {
+    throw new Error(
+      "boundary scan changes the JTAG chain and takes the DAP away until " +
+        "power-cycle — disconnect the session first (run it last)",
+    );
+  }
+  if (bscan.driveSet.size === 0) {
+    await releaseDrives(deps);
+    return;
+  }
+  if (!bscan.driveConfirmed) {
+    const go = await confirmDestructive(
+      "Drive pins via EXTEST? This stops the MCU.",
+      "KNOWN LIMITATION: EXTEST drive is UNCONFIRMED on S32E silicon — on an " +
+        "S32E277 the pads did not follow the preloaded data (bench 2026-08-19, " +
+        "pending NXP). Verify with a scope; do not rely on it. SAMPLE/read works.\n\n" +
+        "EXTEST asserts the internal MCU system reset (RM 136.4.4.3): the " +
+        "application stops and the listed pins are driven by boundary scan. " +
+        "The drive PERSISTS after each command until Release or a " +
+        "power-cycle. Every change re-sends the whole drive set, and " +
+        "sampling (⟳) briefly returns the pins to the (booting) system " +
+        "before the drive is automatically re-applied.",
+      "Drive pins",
+    );
+    if (!go) {
+      return;
+    }
+    bscan.driveConfirmed = true;
+  }
+  const args = ["bscan", "drive"];
+  for (const [pin, value] of bscan.driveSet) {
+    args.push(`${pin}=${value}`);
+  }
+  args.push(BSCAN_DRIVE_OPT_IN);
+  const bsdlPath = bscan.bsdlPath;
+  if (bsdlPath) {
+    args.push("--bsdl", bsdlPath);
+  }
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `S32E: EXTEST drive (${bscan.driveSet.size} pin(s))...`,
+    },
+    async () => {
+      const r = await oneshot(backendConfig(), output, args, {
+        timeoutMs: 120000,
+      });
+      const json = r.json as BscanDriveResult | null;
+      if (!json?.ok) {
+        // Latch state is unknown after a failed run; assume released and say
+        // how to be sure.
+        bscan.driveLatched = false;
+        bscan.fire();
+        const detail = json?.failures?.[0] ?? `exit ${r.code}`;
+        throw new Error(
+          `EXTEST drive failed (${detail}) — see the S32E log; press Release ` +
+            "or power-cycle if unsure of the pin state",
+        );
+      }
+      bscan.driveLatched = true;
+      bscan.fire();
+    },
+  );
+}
+
+async function releaseDrives(deps: Deps): Promise<void> {
+  const { state, bscan, output } = deps;
+  if (state.connected) {
+    throw new Error("disconnect first — boundary scan runs without a session");
+  }
+  const r = await oneshot(backendConfig(), output, ["bscan", "release"], {
+    timeoutMs: 120000,
+  });
+  const json = r.json as BscanDriveResult | null;
+  if (json && !json.ok) {
+    throw new Error("release SVF failed — see the S32E log; power-cycle to be sure");
+  }
+  bscan.clearDrives();
+  void vscode.window.showInformationMessage(
+    "S32E: boundary-scan drive released — pins returned to the system, the " +
+      "MCU is booting. Power-cycle before further boundary scan or debugging.",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,6 +1465,51 @@ export function registerCommands(
   diag("doctor", ["doctor"]);
   diag("probe", ["probe"]);
   diag("report", ["report"]);
+
+  // -- boundary scan (disconnect-only, like the diagnostics) --
+  reg("s32e.refreshBscan", () => refreshBscan(deps));
+  // Context-menu drive actions: the clicked tree node arrives as the first
+  // command argument (the row element itself). Immediate model: every click
+  // updates the set and re-latches the whole set at once.
+  const drivePin = (value: "0" | "1" | "Z") => async (node: unknown) => {
+    const row = node as { name?: string } | undefined;
+    if (!row?.name) {
+      throw new Error("right-click a pin row in the Boundary Scan view");
+    }
+    deps.bscan.setDrive(row.name, value);
+    await applyDrives(deps);
+  };
+  reg("s32e.bscan.driveHigh", drivePin("1"));
+  reg("s32e.bscan.driveLow", drivePin("0"));
+  reg("s32e.bscan.driveZ", drivePin("Z"));
+  reg("s32e.bscan.stopDriving", async (node: unknown) => {
+    const row = node as { name?: string } | undefined;
+    if (!row?.name) {
+      throw new Error("right-click a driven pin row in the Boundary Scan view");
+    }
+    deps.bscan.clearDrive(row.name);
+    await applyDrives(deps); // empty set falls through to release
+  });
+  reg("s32e.bscan.release", () => releaseDrives(deps));
+  reg("s32e.bscan.selectBsdl", async () => {
+    const uris = await vscode.window.showOpenDialog({
+      title: "BSDL file (cancel keeps the current choice)",
+      filters: { BSDL: ["bsdl"] },
+      canSelectMany: false,
+      defaultUri: deps.bscan.bsdlPath
+        ? vscode.Uri.file(path.dirname(deps.bscan.bsdlPath))
+        : undefined,
+    });
+    const p = uris?.[0]?.fsPath;
+    if (!p) {
+      return;
+    }
+    await vscode.workspace
+      .getConfiguration("s32e")
+      .update("bscan.bsdlPath", p, vscode.ConfigurationTarget.Workspace);
+    deps.bscan.reset();
+    await refreshBscan(deps);
+  });
 }
 
 // ---------------------------------------------------------------------------

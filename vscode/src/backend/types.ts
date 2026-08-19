@@ -248,6 +248,58 @@ export interface StacksScanResult {
   rows: StackScanRow[];
 }
 
+/** One named boundary-scan pin, as `bscan sample`/`bscan pins` emit it. */
+export interface BscanPinRow {
+  name: string;
+  ball: string;
+  cell: number;
+  direction: string;
+  function?: string;
+  /** Sampled level; absent in `bscan pins` inventory rows. */
+  level?: number;
+  /** null: the pin has no control cell (always driven, e.g. DDR0_RESET_N). */
+  driver_enabled?: boolean | null;
+  /** BSDL DESIGN_WARNING: DDR0_D* cannot SAMPLE inputs in mission mode. */
+  sample_input_blocked: boolean;
+  control_cell?: number | null;
+  safe?: string;
+  /** SIUL2 pad label from the IOMUX join: "PAD_086" (main die) or
+   * "AE MSCR 36" (AE die); null for dedicated pins (RESET_B, JTAG...). */
+  pad?: string | null;
+  /** Register-level identity, e.g. "SIUL2_1 MSCR 86". */
+  pad_detail?: string | null;
+}
+
+/** The `--json` payload of `bscan drive` / `bscan release` (oneshot). */
+export interface BscanDriveResult {
+  ok: boolean;
+  failures?: string[];
+  instruction: string;
+  cells?: number;
+  bsdl?: string;
+  pins?: {
+    name: string;
+    ball: string;
+    cell: number;
+    control_cell: number | null;
+    level: number | null;
+    driving: boolean;
+  }[];
+}
+
+/** The `--json` payload of one `bscan sample` run (oneshot, no session). */
+export interface BscanSampleResult {
+  ir_length: number;
+  bsdl?: string;
+  reverse_cells?: boolean;
+  first: {
+    bsr_length: number;
+    raw_hex: string;
+    cells?: number;
+    pins?: BscanPinRow[];
+  };
+}
+
 export function hexToInt(text: string | null | undefined): number | null {
   if (!text) {
     return null;

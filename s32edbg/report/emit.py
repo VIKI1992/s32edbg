@@ -392,6 +392,70 @@ def print_tap(info: TapInfo, console: Console | None = None) -> None:
         console.print(f"[yellow]![/yellow] {warning}")
 
 
+def print_bscan_pins(
+    entity: str, pins: list[dict], console: Console | None = None
+) -> None:
+    """The BSDL's pin inventory: what boundary scan can see and touch."""
+    console = console or Console()
+    table = Table(title=f"Boundary-scan pins -- {entity}")
+    table.add_column("Pin", style="bold")
+    table.add_column("Ball")
+    table.add_column("Pad")
+    table.add_column("Dir")
+    table.add_column("Cell", justify="right")
+    table.add_column("Ctl", justify="right")
+    table.add_column("Safe")
+    table.add_column("Notes")
+    for p in pins:
+        notes = []
+        if p.get("sample_input_blocked"):
+            notes.append("[yellow]SAMPLE-input-blocked[/yellow]")
+        if p.get("control_cell") is None:
+            notes.append("[dim]always driven[/dim]")
+        table.add_row(
+            p["name"],
+            p["ball"],
+            p.get("pad") or "-",
+            p["direction"],
+            str(p["cell"]),
+            "-" if p.get("control_cell") is None else str(p["control_cell"]),
+            p.get("safe", "?"),
+            " ".join(notes),
+        )
+    console.print(table)
+
+
+def print_bscan_sample(
+    pins: list[dict], console: Console | None = None, *, title: str = "Boundary-scan sample"
+) -> None:
+    """Named pin states from one SAMPLE capture."""
+    console = console or Console()
+    table = Table(title=title)
+    table.add_column("Pin", style="bold")
+    table.add_column("Ball")
+    table.add_column("Pad")
+    table.add_column("Dir")
+    table.add_column("Level", justify="center")
+    table.add_column("Driver", justify="center")
+    table.add_column("Notes")
+    for p in pins:
+        driver = "-"
+        if p.get("driver_enabled") is True:
+            driver = "[green]on[/green]"
+        elif p.get("driver_enabled") is False:
+            driver = "off"
+        notes = (
+            "[yellow]SAMPLE-input-blocked[/yellow]"
+            if p.get("sample_input_blocked")
+            else ""
+        )
+        table.add_row(
+            p["name"], p["ball"], p.get("pad") or "-", p["direction"],
+            str(p["level"]), driver, notes,
+        )
+    console.print(table)
+
+
 def print_m33_cores(cores: list, console: Console | None = None) -> None:
     """One row per Cortex-M33 subsystem."""
     console = console or Console()
