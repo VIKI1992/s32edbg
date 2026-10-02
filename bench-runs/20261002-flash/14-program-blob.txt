@@ -1,0 +1,78 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: smu halted
+flash: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce0 halted
+flash: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce1 halted
+flash: --reset none: attaching to the SoC as-is. If firmware owns the QSPI 
+controller this flow may misprogram or hang (u-f9). No reset also means no SMU 
+bring-up -- recovering a wiped board needs --reset pin (default) or sda.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: SMU EDBGREQ latch cleared (multitool-exact: CONTROL &= ~0x10000100; CE 
+latches left as the reference leaves them); the SMU stays pinned by DHCSR
+flash: registered the AHB-AP at 0x01C80000 with the DLL for WriteMem
+flash: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+flash: flash preflight ok on AP 0x01C80000: MCR reads 0x010F00CC, applet RAM 
+holds data
+flash: SPI JEDEC probe read 0xC23989C2
+flash: QSPI controller already alive (BootROM left it configured: JEDEC 
+0xC23989C2 answered in SPI) -- skipping the PLL/pad/controller init tables
+flash: LUT slot 1 armed with the SPI READ sequence (AHB window live)
+flash: mode spi, JEDEC 0xC23989C2
+flash: JEDEC 0xC23989C2 (spi) matches the expected MX25UW25A45G
+flash: erase plan: 3 span(s), 2×64K + 1×4K units
+flash: WriteMem fast path proven by full read-back of the first block (518 
+words)
+flash: applet staged at 0x25000000 (2072 bytes, SHA-pinned)
+flash: erased 0x00000000..0x00100000 (unit 0x10000) in 6.48s
+flash: erased 0x00100000..0x001D0000 (unit 0x10000) in 4.02s
+flash: erased 0x001D0000..0x001D2000 (unit 0x1000) in 0.65s
+flash: blank-page skip: 3374 of 7450 pages are 0xFF and stay unprogrammed (10 
+run(s))
+flash: programmed 0x00000000        256 bytes    0.62s       0.4 KB/s
+flash: programmed 0x00001F00    135,680 bytes    2.22s      59.6 KB/s
+flash: programmed 0x00082000    103,680 bytes    1.88s      53.9 KB/s
+flash: programmed 0x000C2000      4,096 bytes    0.66s       6.0 KB/s
+flash: programmed 0x00103000    196,608 bytes    2.94s      65.3 KB/s
+flash: programmed 0x00133000    196,608 bytes    2.94s      65.2 KB/s
+flash: programmed 0x00163000      6,656 bytes    0.69s       9.4 KB/s
+flash: programmed 0x00170000    196,608 bytes    2.93s      65.5 KB/s
+flash: programmed 0x001A0000    196,608 bytes    2.94s      65.2 KB/s
+flash: programmed 0x001D0000      6,656 bytes    0.70s       9.3 KB/s
+flash: ReadMem fast path proven against a full independent ADIv6 read of the 
+first block (1024 words)
+flash: fast read path demoted at 0x00191000 (FlashError: ReadMem sampled 
+cross-check disagreed with ADIv6 at 0x00191000: DLL 0x00000000, ADIv6 
+0x53C00F2C) -- staying on ADIv6 reads
+flash: full verify passed: 0x1D1A00 bytes byte-exact
+programmed 1,907,168 bytes from s32e2xx_bootloader_M33_v3.1.0_BLOB 1.bin at 
+0x00000000  (byte 0 reads 0xD1 -- boot IVT in place)
+power-cycle the board to boot the flashed image -- the reference project 
+documents that a debug reset is not equivalent to the cold boot the BootROM 
+needs.
+                                 flash program                                 
++-----------------------------------------------------------------------------+
+| Field        | Value                                                        |
+|--------------+--------------------------------------------------------------|
+| offset       | 0x00000000                                                   |
+| length       | 1,907,168 bytes                                              |
+| mode / JEDEC | spi  0xC23989C2                                              |
+| erased       | 1,908,736 bytes in 11.80s (2×64K + 1×4K spans)               |
+| programmed   | 1,043,456 bytes in 18.76s (10 run(s), 3374 blank pages       |
+|              | skipped)                                                     |
+| verify       | full in 213.26s                                              |
+| paths        | WriteMem used, ReadMem demoted, 13 applet call(s)            |
+| via          | AP 0x01C80000, AHB window base 0x00000000                    |
+| total        | 244.78s                                                      |
++-----------------------------------------------------------------------------+
+wrote bench-runs/20261002-flash/14-program-blob.json

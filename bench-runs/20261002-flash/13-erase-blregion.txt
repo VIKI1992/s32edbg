@@ -1,0 +1,56 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: smu halted
+flash: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce0 halted
+flash: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce1 halted
+flash: --reset none: attaching to the SoC as-is. If firmware owns the QSPI 
+controller this flow may misprogram or hang (u-f9). No reset also means no SMU 
+bring-up -- recovering a wiped board needs --reset pin (default) or sda.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: SMU EDBGREQ latch cleared (multitool-exact: CONTROL &= ~0x10000100; CE 
+latches left as the reference leaves them); the SMU stays pinned by DHCSR
+flash: registered the AHB-AP at 0x01C80000 with the DLL for WriteMem
+flash: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+flash: flash preflight ok on AP 0x01C80000: MCR reads 0x010F00CC, applet RAM 
+holds data
+flash: SPI JEDEC probe read 0xC23989C2
+flash: QSPI controller already alive (BootROM left it configured: JEDEC 
+0xC23989C2 answered in SPI) -- skipping the PLL/pad/controller init tables
+flash: LUT slot 1 armed with the SPI READ sequence (AHB window live)
+flash: mode spi, JEDEC 0xC23989C2
+flash: JEDEC 0xC23989C2 (spi) matches the expected MX25UW25A45G
+flash: erase plan: 2 span(s), 2×64K + 0×4K units
+flash: WriteMem fast path proven by full read-back of the first block (518 
+words)
+flash: applet staged at 0x25000000 (2072 bytes, SHA-pinned)
+flash: erased 0x00000000..0x00100000 (unit 0x10000) in 6.44s
+flash: erased 0x00100000..0x00200000 (unit 0x10000) in 4.71s
+flash: ReadMem fast path proven against a full independent ADIv6 read of the 
+first block (1 words)
+flash: sampled blank check passed (513 words)
+erased 2,097,152 bytes at 0x00000000
+                           flash erase                           
++---------------------------------------------------------------+
+| Field        | Value                                          |
+|--------------+------------------------------------------------|
+| offset       | 0x00000000                                     |
+| length       | 2,097,152 bytes                                |
+| mode / JEDEC | spi  0xC23989C2                                |
+| erased       | 2,097,152 bytes in 11.58s (2×64K + 0×4K spans) |
+| verify       | blank-sampled in 13.07s                        |
+| paths        | WriteMem used, ReadMem used, 2 applet call(s)  |
+| via          | AP 0x01C80000, AHB window base 0x00000000      |
+| total        | 25.61s                                         |
++---------------------------------------------------------------+
+wrote bench-runs/20261002-flash/13-erase-blregion.json

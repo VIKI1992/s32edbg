@@ -1,0 +1,48 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: smu: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+flash: smu halted
+flash: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce0: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+flash: ce0 halted
+flash: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce1: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+flash: ce1 halted
+flash: --reset none: attaching to the SoC as-is. If firmware owns the QSPI 
+controller this flow may misprogram or hang (u-f9). No reset also means no SMU 
+bring-up -- recovering a wiped board needs --reset pin (default) or sda.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: SMU EDBGREQ latch cleared (multitool-exact: CONTROL &= ~0x10000100; CE 
+latches left as the reference leaves them); the SMU stays pinned by DHCSR
+flash: registered the AHB-AP at 0x01C80000 with the DLL for WriteMem
+flash: synced the DLL's target model (arming the fast path): DLL Halt issued, 
+IsHalted=1
+flash: flash preflight ok on AP 0x01C80000: MCR reads 0x010F00CC, applet RAM 
+holds data
+flash: SPI JEDEC probe read 0xC23989C2
+flash: QSPI controller already alive (BootROM left it configured: JEDEC 
+0xC23989C2 answered in SPI) -- skipping the PLL/pad/controller init tables
+flash: LUT slot 1 armed with the SPI READ sequence (AHB window live)
+flash: mode spi, JEDEC 0xC23989C2
+JEDEC 0xC23989C2 (spi) -- matches the expected MX25UW25A45G
+                            flash jedec                             
++------------------------------------------------------------------+
+| Field        | Value                                             |
+|--------------+---------------------------------------------------|
+| offset       | 0x00000000                                        |
+| length       | 0 bytes                                           |
+| mode / JEDEC | spi  0xC23989C2                                   |
+| verify       | none                                              |
+| paths        | WriteMem unused, ReadMem unused, 0 applet call(s) |
+| via          | AP 0x01C80000, AHB window base 0x00000000         |
+| total        | 4.56s                                             |
++------------------------------------------------------------------+
+wrote bench-runs/20261002-flash/12-jedec-none-confirm.json

@@ -1,0 +1,28 @@
+{
+  "op": "jedec",
+  "offset": "0x00000000",
+  "length": 0,
+  "mode": "spi",
+  "jedec": "0xC23989C2",
+  "ap_mem": "0x01C80000",
+  "ahb_base": "0x00000000",
+  "erase": {
+    "spans_4k": 0,
+    "spans_64k": 0,
+    "bytes": 0,
+    "seconds": 0.0
+  },
+  "program": {
+    "runs": 0,
+    "skipped_pages": 0,
+    "bytes": 0,
+    "seconds": 0.0
+  },
+  "verify": "none",
+  "verify_seconds": 0.0,
+  "fast_write": "unused",
+  "fast_read": "unused",
+  "applet_calls": 0,
+  "seconds": 4.562,
+  "notes": []
+}

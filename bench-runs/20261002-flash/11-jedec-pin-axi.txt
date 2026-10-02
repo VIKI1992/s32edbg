@@ -1,0 +1,29 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+flash: smu: could not quiesce before the reset (smu: every identity register 
+read as zero. That is a poisoned debug port or an AP that answers with nothing,
+not a processor.) -- expected on a blank-flash board sitting in the BootROM 
+fail cascade (docs/virgin-board.md); proceeding, the reset with EDBGREQ latched
+catches it out of reset
+flash: ce0: could not halt (ce0: every identity register read as zero. That is 
+a poisoned debug port or an AP that answers with nothing, not a processor.) -- 
+continuing; the EDBGREQ latched over the reset will hold it anyway
+flash: ce1: could not halt (ce1: every identity register read as zero. That is 
+a poisoned debug port or an AP that answers with nothing, not a processor.) -- 
+continuing; the EDBGREQ latched over the reset will hold it anyway
+flash: reset-quiesce: asserting pin functional reset with every debug request 
+latched
+flash: functional reset released; both reset flags read clear
+flash: SMU AHB-AP still dead 10.04s after the reset release
+flash: SMU bring-up (s32multitool, Finding 15): partitions + SRAM scrubs + 
+MC_ME PRTN0 core-0 release
+flash: the debug-enable gate is closed (MDM-AP DBGENCNTRL1-3 read zero). RM 
+135.11: "Trying to access debug components while the clocks are not enabled 
+might hang the debug APBIC bus." Run `s32edbg gates apply` first if this hangs.
+flash: SDA-AP reports application debug disabled, so this part may be in a 
+secured lifecycle state and some APs will read as zero.
+error: bring-up poll timed out: PRTN1_STAT.PCS set -- wanted (value & 
+0x00000001) == 0x00000001, last read 0x00000000 at 0x41900308

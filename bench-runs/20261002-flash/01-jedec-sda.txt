@@ -1,0 +1,21 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+flash: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: smu: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+flash: smu halted
+flash: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce0: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+flash: ce0 halted
+flash: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and
+the secure alias of the debug block stay invisible.
+flash: ce1: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+flash: ce1 halted
+flash: reset-quiesce: asserting sda functional reset with every debug request 
+latched
+flash: functional reset released; both reset flags read clear
+error: CORESIGHT_ReadAPDPReg(DP,1) failed with -1

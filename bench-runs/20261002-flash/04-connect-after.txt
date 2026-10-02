@@ -1,0 +1,10 @@
+! DPIDR unavailable. DP address 0x0 cannot be read over JTAG: ADIv6 Figure A1-2
+makes JTAG-DP DPACC address 0b00 Reserved. That covers DPIDR, DPIDR1 and 
+BASEPTR0/1, which all live there and are selected by DPBANKSEL. Reading it 
+anyway returns a plausible-looking value that is not the register asked for -- 
+on this target 0x4BA07477 rather than 0x4C013477. Over JTAG, take DPIDR from 
+J-Link's connect banner instead.
+  CTRL/STAT: 0xF0000000
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+wrote bench-runs/20261002-flash/04-connect-after.json

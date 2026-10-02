@@ -1363,6 +1363,23 @@ when failing), so the whole recovery rides pure ADIv6 at ~1.3 KB/s — ~37 minut
 list (root-cause WriteMem, auto-failover to the AXI-AP, fast-read-only verify) live under
 test-plan **Finding 16**.
 
+**Flashing a board that is already running its application needs `--reset none` (Finding 18).**
+Do *not* use a reset-quiescing flash op on a board booting a normal application. `--reset pin`
+and `--reset sda` both reboot the SoC, and if the application arms the MC_RGM functional-reset
+entry timeout at a zero value — the NXP RTD `Mcu_Init` does exactly this, `FRENTC =
+FRET_EN(1) | FRET_TIMEOUT(0)` — the debugger's functional reset escalates to a *destructive*
+reset that drops the JTAG-DP about 200 ms into the reboot (`CORESIGHT_ReadAPDPReg(DP,1) = -1`,
+`sda` and `pin` failing identically because it is on-chip escalation, not the SBC path). Use
+**`--reset none`**: it attaches to the running SoC without resetting, so the timeout never
+fires, and the normal boot has already brought up the clocks, the QSPI controller and the SMU.
+On this path **both fast paths work** (WriteMem ~56 KB/s, ReadMem proven) — the Finding-16
+WriteMem failure is specific to the pin-reset wiped-board flow — so a full erase + program +
+verify of the 1.9 MiB BLOB runs in ~4 minutes. The one cost is that the R52 application keeps
+running during the op, which is safe only while it never touches the external QSPI at runtime.
+Serial boot (`BOOTMOD_0=1, BOOTMOD_1=0`) survives the reset but is *not* a flash mode: with no
+application running the BootROM never runs the IVT self-test DCD that sets up the clock tree, so
+the SMU bring-up stalls on the partition-clock poll. Full account: test-plan **Finding 18**.
+
 **Programming for normal boot needs more than the image.** The M33 bootloader starts the app
 only when the app-valid flag `0x55AA55AA` sits at flash `0x100000`, the app is laid out
 flash-`0x300000`-equals-RAM-`0x32100000`, and the BLOB is at 0 — the whole contract, the
@@ -1387,7 +1404,9 @@ the reference profile carries both); `--no-fast` disables the WriteMem/ReadMem f
 ADIv6, ~4 KB/s — the fast paths carry the same first-block-proof + sampled-cross-check + demote
 discipline as `load`); `--reset pin|sda|none` picks the reset (default `pin`, the
 reference's RESET_B toggle — Finding 15; `sda` is the chip-internal fallback; `none` attaches
-as-is — cannot recover a wiped board, and unproven while firmware may own the controller).
+as-is — cannot recover a wiped board, but it is the *required* mode to flash a board running an
+application that arms the reset-entry timeout, where `pin`/`sda` would escalate to a destructive
+reset and drop the debug port — Finding 18).
 `program`: `--verify full|sampled|none` (default full), `--no-skip-blank`. `erase`: `--length`,
 `--all`, `--no-verify` (skip the blank check). Destructive ops prompt unless `--yes`.
 

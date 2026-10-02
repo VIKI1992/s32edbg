@@ -2071,6 +2071,92 @@ speed: roughly **10–26× slower**. Two measured causes:
 - [ ] Re-measure s32multitool's wall clock for the same v3.1.0 BLOB on this
   bench as the concrete target number.
 
+### Finding 18 — flashing a board that is already running its application: the app arms the functional-reset entry timeout, so a debugger reset escalates to destructive and drops the JTAG-DP; `--reset none` is the route in
+
+Measured 2026-10-02 (V13 J-Link, V9.62 DLL, `--speed 16000`, S32E277 SOM)
+while flashing the v3.1.0 bootloader onto a board carrying the v3.3.0
+bootloader + the `br1_rear` application (built 2026-08-14), app running.
+Artifacts: `bench-runs/20261002-flash/`.
+
+**Symptom.** `flash jedec --reset sda` and `--reset pin` both die identically
+at the first DP read after the reset release:
+
+```
+flash: reset-quiesce: asserting <sda|pin> functional reset with every debug request latched
+flash: functional reset released; both reset flags read clear
+error: CORESIGHT_ReadAPDPReg(DP,1) failed with -1
+```
+
+i.e. the whole JTAG-DP disappears ~200-300 ms into the reboot. `--reset none`
+is unaffected and completes normally. The failures are self-recovering: the
+board reboots and comes back running the app, so a later `connect` reads
+`CTRL/STAT 0xF0000000` again.
+
+**Root cause (confirmed on silicon).** The running application's NXP RTD
+`Mcu_Init` arms the MC_RGM functional-reset *entry* timeout at a zero
+timeout — `Power_Ip_PBcfg.c`: `FRENTC = MC_RGM_FRENTC_FRET_EN(1) |
+MC_RGM_FRENTC_FRET_TIMEOUT(0)`, `FRET = 15`. Read live over the AXI-AP
+(MC_RGM base `0x41850000`):
+
+| register | address | value |
+|---|---|---|
+| DES | `0x41850000` | `0x00000001` (last destructive event = POR) |
+| FRET | `0x41850018` | `0x0000000F` |
+| FRENTC | `0x41850028` | `0x00000001` (FRET_EN=1, timeout=0) |
+
+When the debugger asserts a functional reset while holding debug requests
+latched in the MDM-AP, the reset entry does not complete immediately, the
+zero timeout fires, and MC_RGM escalates the functional reset to a
+**destructive** reset — which drops the debug port. That is why `sda` and
+`pin` fail identically (on-chip escalation, not the SBC/R439 path) and `none`
+(no functional reset) does not. The application does **not** remux the JTAG
+pads: source review confirmed SIUL2_0 MSCR 170-173 are left in JTAG function
+(pin remux ruled out).
+
+**Serial boot confirms the cause but is not a flash mode.** The board's
+straps read from BOOT_GPR_BMR2 (`0x42280004` = `0x01000010`: FUSE_SEL=1 bit4,
+BOOTMOD_0=0 bit25, BOOTMOD_1=1 bit24) = boot-from-fuses. Setting serial boot
+(RM Table 309, FUSE_SEL=1 row → BOOTMOD_0=1, BOOTMOD_1=0) made the
+application not run, and the reset-quiesced flow **survived the reset**
+(reached the SMU bring-up with no `-1`) — proving the FRENTC escalation is the
+whole cause. But the bring-up then stalled: `error: bring-up poll timed out:
+PRTN1_STAT.PCS set ... last read 0x00000000 at 0x41900308`. In serial boot the
+BootROM never reads the IVT, so it never runs the v3.3.0 self-test DCD that
+configures the 900 MHz clock tree and pre-enables the partitions, and the
+tool's MC_ME partition release cannot complete without clocks. Finding 15's
+SMU bring-up implicitly depends on a normal boot having configured the clocks
+first.
+
+**Resolution — `--reset none` on a normally-booted board.** It attaches to
+the running SoC without a functional reset (FRENTC never triggers), and the
+normal boot has already brought up the clocks, the QSPI controller (BootROM
+leaves it configured) and the SMU. The flow halts the SMU by DHCSR and runs
+the applet. Crucially, on this path **both fast paths work** — the Finding-16
+`JLINK_WriteMem` rc `-1` is specific to the pin-reset wiped-board flow, not
+this one (partial answer to Finding 16's first TODO: the pin-reset is
+implicated). Measured, end to end:
+
+| phase | measured |
+|---|---|
+| erase `0x0..0x200000` (BL region) + blank check | 11.6 s + 13.1 s |
+| program v3.1.0 BLOB at 0: erase span | 11.8 s |
+| program 1,043,456 non-blank bytes (13 applet calls, 3,374 blank pages skipped) | 18.8 s ≈ 56 KB/s |
+| full byte-exact verify of 1,907,168 bytes (ReadMem demoted to ADIv6 at 0x191000) | 213 s |
+| program total | 244.8 s |
+
+byte 0 reads `0xD1` (IVT in place), verify byte-exact. ~4 minutes vs Finding
+16's ~37 on the wiped board.
+
+**Caveats.** (1) `--reset none` leaves the R52 application running during the
+op — safe here because the app has no external-QSPI driver linked (it runs
+from RAM), but a board whose app writes the QSPI NOR at runtime would
+contend. (2) Erasing `0x0..0x200000` clears the app-valid flag at `0x100000`,
+so the bootloader will not start the app until `AA 55 AA 55` is rewritten
+there (`docs/app-boot-contract.md` §4). (3) The v3.3.0 bootloader had written
+a self-test DCD pointer into the IVT at offset 0 that persists across a
+reflash; the v3.1.0 BLOB carries that pointer blank, so programming it at
+offset 0 clears the behaviour.
+
 ---
 
 ## 11. IDE integration — machine mode, symbols layer, VS Code extension — implemented 2026-08-06, offline-proven, bench pending
@@ -2387,4 +2473,4 @@ both block the extension's connect/first-stop flow. Remedy when it hurts
 enough: persist the parsed index to disk keyed on the ELF's identity
 (size+mtime+build-id) and load it back in milliseconds.
 
-The next finding number is **18**.
+The next finding number is **19**.
