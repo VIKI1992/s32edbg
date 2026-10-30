@@ -44,6 +44,16 @@ from ..errors import DapError, TransportError, UnsupportedOperation
 from .base import ProbeInfo, Tif, Transport
 from .install import JLinkInstall, discover
 
+#: ``void (*pfOut)(const char* sMsg)`` -- the signature of the callbacks
+#: JLINK_SetErrorOutHandler / JLINK_SetWarnOutHandler take. x64 Windows has a
+#: single calling convention, so CFUNCTYPE is the right factory.
+_MSG_HANDLER = ctypes.CFUNCTYPE(None, c_char_p)
+#: Every handler ever installed, kept for the life of the process. The DLL
+#: stores the raw thunk pointer and ctypes never unloads a CDLL, so a handler
+#: freed with its transport would leave the DLL a dangling callback; two small
+#: objects per open() is the cheaper of the two.
+_LIVE_MESSAGE_HANDLERS: list[object] = []
+
 #: APnDP argument of CORESIGHT_ReadAPDPReg / WriteAPDPReg.
 AP_NOT_DP_DP = 0
 AP_NOT_DP_AP = 1
@@ -76,6 +86,10 @@ class DllTransport(Transport):
         self._lib: ctypes.CDLL | None = None
         self._opened = False
         self.capability_warnings: list[str] = []
+        #: What the DLL wanted to say in a message box: "error: ..." and
+        #: "warning: ..." lines, oldest first, across every call of this
+        #: transport (see _install_message_handlers).
+        self.dll_messages: list[str] = []
 
     # ---------------------------------------------------------- lifecycle --
 
@@ -120,6 +134,7 @@ class DllTransport(Transport):
             raise TransportError(f"could not load {dll_path}: {exc}") from exc
 
         self._bind()
+        self._install_message_handlers()
 
         if self.log_file:
             # SetLogFile is the whole logging story here. JLINK_EnableLog and
@@ -138,6 +153,48 @@ class DllTransport(Transport):
         if err:
             raise TransportError(f"JLINK_Open failed: {err.decode('utf-8', 'replace')}")
         self._opened = True
+
+    def _install_message_handlers(self) -> None:
+        """Route the DLL's errors and warnings into `dll_messages`, not a dialog.
+
+        With no handler installed the DLL shows every ``***** Error:`` and
+        ``***** Warning:`` it logs as a modal Qt message box (through
+        JLinkGUIServer.exe) and blocks the calling thread until someone clicks
+        it. Measured 2026-10-30: a scripted `debug` session sat behind
+        "J-Link V9.62 Error" / "J-Link V9.62 Warning" with nothing on stdout,
+        raised by the DLL's own connect finding no R52 debug frames behind the
+        still-closed gate -- the normal state before `gates apply`, and a
+        failure this tool already treats as benign (`_bring_up_link`). The
+        text still reaches the --log file either way; a handler only changes
+        who has to click. Best-effort: a DLL without the exports keeps its
+        dialogs and says so in `capability_warnings`.
+        """
+        try:
+            setters = (
+                (self._fn("JLINK_SetErrorOutHandler", "JLINKARM_SetErrorOutHandler"), "error"),
+                (self._fn("JLINK_SetWarnOutHandler", "JLINKARM_SetWarnOutHandler"), "warning"),
+            )
+        except TransportError as exc:
+            self.capability_warnings.append(
+                f"DLL message handlers not installed ({exc}); the DLL will show its "
+                "errors and warnings as modal dialogs"
+            )
+            return
+        for setter, kind in setters:
+            setter.restype = None
+            setter.argtypes = [_MSG_HANDLER]
+            handler = _MSG_HANDLER(lambda msg, _kind=kind: self._on_dll_message(_kind, msg))
+            _LIVE_MESSAGE_HANDLERS.append(handler)
+            setter(handler)
+
+    def _on_dll_message(self, kind: str, msg: bytes | None) -> None:
+        # Called from inside the DLL: must never raise.
+        try:
+            text = (msg or b"").decode("utf-8", "replace").strip()
+        except Exception:  # pragma: no cover - defensive, see above
+            text = repr(msg)
+        if text:
+            self.dll_messages.append(f"{kind}: {text}")
 
     def close(self) -> None:
         if self._opened and self._lib is not None:

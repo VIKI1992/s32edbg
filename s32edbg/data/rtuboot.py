@@ -68,6 +68,17 @@ MC_ME_PRTN1_CORE1_ADDR = 0x4190_036C
 RGM_PRST0_1 = 0x4185_0048
 RGM_PSTAT0_1 = 0x4185_0148
 
+#: MC_RGM FRENTC -- functional-reset entry timeout control (MC_RGM base
+#: 0x41850000). The NXP RTD ``Mcu_Init`` of a running application arms it with
+#: FRET_EN=1, FRET_TIMEOUT=0 (``Power_Ip_PBcfg.c``; read live as 0x00000001 on
+#: both the br1_rear and br1_cabin boards -- test-plan Finding 18). A debugger
+#: functional reset taken with debug requests latched then fails to complete
+#: inside the zero timeout, MC_RGM escalates it to a destructive reset, and
+#: the JTAG-DP disappears ~200 ms into the reboot. `load` clears it before its
+#: own reset (loader P0b, Finding 19); writing 0 is the bench-proven value.
+RGM_FRENTC = 0x4185_0028
+RGM_FRENTC_FRET_EN = 0x1
+
 
 @dataclass(frozen=True)
 class InitAction:
@@ -273,6 +284,16 @@ ACTIONS_RTU0_CORE0: tuple[InitAction, ...] = (
     _poll(0x4190_0348, 0x1, 0x1, 40, "CORE0_STAT.CCS set"),
     _poll(RGM_PSTAT0_1, 0x2, 0x0, 40, "core0 reset lifted (PSTAT)"),
     _sleep(10),
+)
+
+#: Finding 19 retry: put core 0 back into reset so a re-armed EDBGREQ latch
+#: catches it on the way out again, exactly as the first pass did. PRST_0[1]
+#: bit 1 is core 0 -- the same per-core reset the application's own
+#: BrsHwEarlyInitPowerOn asserts on core 1 through bit 2 -- and PSTAT mirrors
+#: it. Run only when the park table above failed under a vanished debug hold.
+ACTIONS_RTU0_CORE0_RESET: tuple[InitAction, ...] = (
+    _rmw(RGM_PRST0_1, 0x2, 0x2, "RGM: put core0 back into reset"),
+    _poll(RGM_PSTAT0_1, 0x2, 0x2, 40, "core0 in reset (PSTAT)"),
 )
 
 #: Only the continuation for core 1 -- the plugin's `"0" in core_nr` early

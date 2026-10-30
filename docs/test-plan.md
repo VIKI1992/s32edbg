@@ -48,7 +48,7 @@ proves the model was right. Neither substitutes for the other.
 | `core reg pc` / `dspsr` (write) | `test_doc_alignment.py` | round-tripped on a halted rtu0.1 | proven |
 | `m33 wp` | `test_doc_alignment.py` | programs and read-back verifies (RO ID masked); never seen to *fire* — SMU makes no stores near SP | partial |
 | `m33 reset-halt` | `test_doc_alignment.py` | **SYSRESETREQ takes no effect on this silicon** — no reset, core keeps running, command fails cleanly | **blocked** |
-| `load` | `test_loader.py`, `test_session.py`, `test_elf.py` | 3.6 MiB in 33.6 s at 16 MHz, fast path proven, app boots — see "The `load` flow" | proven (2026-08-04) |
+| `load` | `test_loader.py`, `test_session.py`, `test_elf.py` | 3.6 MiB in 33.6 s at 16 MHz, fast path proven, app boots — see "The `load` flow". On a board that boots its own application, RAM load over a functional reset is blocked by the HSE (Finding 19): P0b/FRENTC confirmed on silicon, the reset stays functional, but the MDM-AP then goes dark and cannot be re-gated | proven on a blank-flash board (2026-08-04); app-running board bench-measured 2026-10-30 — not achievable, use `flash --reset none` |
 | `flash` (all subcommands) | `test_flash.py`, `test_cli.py`, `test_session.py` | never run on silicon — see "The `flash` flow" for the u-f1..u-f9 uncertainties and the bench procedure | **offline only** |
 
 **Three facts settled on silicon**, recorded here because they will otherwise be
@@ -1330,9 +1330,13 @@ way core1 comes up with no debugger involvement.
 
 ### Phase order (the load-bearing constraints)
 
+P0b disarm `MC_RGM.FRENTC` if the running application armed it (AXI
+traffic, so only while the system runs; Finding 18 / Finding 19) →
 P1 assert reset + latch MDM EDBGREQ (MDM-only traffic — the AXI-AP is
 forbidden during functional reset, guide §9 #3, and `gates.assert_axi_safe`
-enforces it) → P2 release + poll both reset views clear + ONE AXI preflight →
+enforces it) → P2 release + poll both reset views clear → P2b if the reset
+wiped the MDM-AP, re-apply LADDER-1, re-latch, pin the M33s by DHCSR
+(Finding 19; checked again before P5 and before P7) → ONE AXI preflight →
 P3 MC_ME/RGM partitions + NXP generic SRAM scrubs (verbatim, including their
 local 0x0-0xFFFF ranges) → P4 SRAMC D0/D1/D2 v2 ladder → P5 park rtu0.0 →
 P6 write LMAs → P7 verify → P8 PC/DSPSR.T → P9 core1 (optional).
@@ -2156,6 +2160,159 @@ there (`docs/app-boot-contract.md` §4). (3) The v3.3.0 bootloader had written
 a self-test DCD pointer into the IVT at offset 0 that persists across a
 reflash; the v3.1.0 BLOB carries that pointer blank, so programming it at
 offset 0 clears the behaviour.
+
+### Finding 19 — `load` on a board that boots its own application: P0b (disarm FRENTC) is confirmed on silicon and keeps the reset functional, but the HSE then re-secures debug and the whole MDM-AP goes dark, so RAM `load` over a functional reset is not achievable on this board — bench-measured 2026-10-30
+
+Measured 2026-10-29 on the br1_cabin C-sample board (S32E278; M33 bootloader
++ cabin application in QSPI, HSE provisioned; V13 probe, V9.62 DLL,
+`--speed 16000`). The full bench account, with the measured register values,
+is `docs/handover-cabin-ram-load.md`; the board that proved `load` in August
+had a blank flash (`docs/app-boot-contract.md` §7), so nothing below had ever
+been exercised.
+
+**Symptoms, in the order they were hit.**
+
+1. Fresh power cycle: `no Cortex-R52 debug frames answered` — the gate is
+   closed. Expected; `gates apply` must be the session's first command.
+2. Gate open: the load's SDA functional reset escalated to destructive —
+   Finding 18 applied to `load`. The application's `Mcu_Init` had armed
+   `MC_RGM.FRENTC` (`0x41850028` read `0x00000001`); the loader got as far as
+   P5 and lost the port; a following `gates status` read the whole MDM-AP as
+   zero and the board had rebooted from flash.
+3. FRENTC disarmed by hand (`mem write 0x41850028 0x0 --ap axi --yes`
+   before `load`): the reset stayed functional, but P5 failed with
+   `rtu0.0 did not halt within 2.0s (EDSCR 0x00000000, EDPRSR 0x00000000)` —
+   the R52 debug frames answered nothing at all. `gates status` afterwards:
+   `CONTROL 0x00000000`, `DBGENCNTRL 0x00000000`, gate "gated",
+   `APPDBGEN yes`, and the ECU was running its flashed application again.
+
+So on this board **the SDA functional reset of P1/P2 clears the MDM-AP
+enables and latches** (`CONTROL`, `CONTROL2/3`, `DBGENCNTRL*`), which guide
+§3.6 and RM 135.11 document as surviving a functional reset — and which the
+rear-ECU bench has confirmed for two months. Inside `load_image()` that
+takes away, at once: the LADDER-1 gate (the APBIC2 frames go dead), the R52
+EDBGREQ latches (the park cannot catch core0), and the M33 holds (the SMU
+wakes into the BootROM and the bootloader, which copies the *flashed*
+application into `0x32100000..` and starts rtu0.0 itself — a race against
+P5-P8).
+
+**Still open:** whether the reset itself or the HSE/bootloader boot that
+follows it does the clearing. The bench log has the frames dying *after* the
+park had already caught core0 once, so the wipe lands late. The
+discriminator is `attach --hold` → `release` → `gates status`: a gate that
+survives a plain release puts the clearing in the boot that follows.
+
+**Fix (`s32edbg/dap/loader.py`, built against both timings in the fake).**
+P0b is the part that works on silicon; P2b is correct in design but the
+br1_cabin board does not permit the re-gate (the Bench section below has the
+measurement) — it degrades to a fast, accurate failure, which is the right
+behaviour when the hold is gone for good.
+
+- **P0b `disarm_frentc`** — read `MC_RGM.FRENTC` over the AXI-AP while the
+  system is still running; `FRET_EN` set → write 0, read back, note it.
+  Under a held reset the AXI-AP is off limits and nothing is running to have
+  armed it, so the step says so and skips. A write that does not take
+  refuses to reset: the alternative is Finding 18's dead port.
+- **P2b `regate_if_cleared` + `repin_m33s_after_reset`** — right after
+  `wait_reset_deasserted`, ~15 AP reads compare the MDM-AP with what P1
+  wrote. If anything is gone: `apply_ladder1` + `arm_edbgreq` while RGM
+  still holds every R52 in reset, then every answering M33 is pinned by its
+  own `DHCSR` (`m33.ensure_halted`: one `C_DEBUGEN|C_HALT` write, a no-op
+  on a core the latch already caught — a hold in the core's own debug
+  logic, independent of whatever the MDM-AP does next). Finding 10's dead
+  SMU-AP window after a release is polled through (1.5 s cap).
+- **The guard runs again** before P5 (the first step since P2b that needs
+  the frames) and before P7 (M33 half only — re-arming the R52 latches
+  after P5 would recreate the Finding 7 trap for rtu0.1). P5 itself retries
+  once: a park that fails under a vanished hold is repaired, core0 is put
+  back into reset (`ACTIONS_RTU0_CORE0_RESET`, PRST_0[1] bit 1) and parked
+  again — the bench saw the hold vanish exactly there.
+- **A healthy board sees nothing**: no note, one LADDER-1 write in the whole
+  flow, no FRENTC traffic (asserted by test).
+
+**Tests** (`tests/test_loader.py`, 12 new): `SyntheticTarget.mdm_clearing =
+"release"` and `"boot"` (two wipe timings), a LADDER-1 that will not re-apply
+with the AP still identifying (enables-rejected branch), **the bench shape —
+`mdm_goes_dark`, where the AP's own IDR reads 0 and `load` fails to the flash
+route** (`test_the_cabin_board_shape_...`), the DHCSR re-pin on every board,
+the dead SMU-AP window, and the Finding 18 model — a reset taken with `FRENTC`
+armed kills the fake's DP (`dp_dead`), and `load` must never take one. The
+dark-AP model and its test were added 2026-10-30 from the bench trace.
+
+**Bench 2026-10-30 — the result, and why the re-gate cannot win.**
+`gates apply` → baseline AXI reads → `load br1_cabin.elf` → `resume` →
+`core list`, V13 probe at `--speed 16000`.
+Artifacts: `bench-runs/20261030-load-cabin/` (`01-session.txt` is the
+transcript, `01-session.jlink.log` the wire trace). Two things were proven,
+one of them the opposite of what the fix assumed.
+
+*P0b works.* `load` read `MC_RGM.FRENTC = 0x00000001`, disarmed it, and the
+SDA functional reset then **stayed functional** — the JTAG-DP survived, the
+flow reached P5. Under Finding 18 the same reset escalated to destructive and
+dropped the port ~200 ms in. This is the confirmed, retained win: the FRENTC
+disarm is what makes a functional reset survivable on a running-app board at
+all.
+
+*But the MDM-AP does not come back.* P2b right after the reset release found
+the hold intact (the SMU AHB-AP came back at 0.42 s, Finding 10, and was
+re-pinned). The wipe landed later, during the P3/P4 bring-up: the pre-P5
+guard found `DBGENCNTRL/CONTROL/CONTROL2` all zero and re-applied LADDER-1 —
+and the re-apply **did not take**. The wire log is unambiguous: the re-gate
+writes (`DBGENCNTRL = 0x3CF3CF00`, etc.) were acknowledged by the DLL, and
+every readback — *including the MDM-AP IDR, which read `0x001DE040` at `gates
+apply` minutes earlier* — came back `0x00000000`. The whole access port had
+gone dark, not merely its enables. That is the HSE re-securing debug during
+the secure boot the functional reset re-triggered; no register write from the
+debugger brings a powered-down AP back. `load` stopped with the dark-AP
+`LoadError` (it distinguishes IDR-reads-zero from enables-rejected) and named
+the route that works. The board self-recovered to its flashed application.
+
+**So, for this board:** RAM `load` over a functional reset is **not
+achievable** — any functional reset re-triggers the HSE boot that takes debug
+down, and that is below the debugger. The loader now does everything it can
+(P0b keeps the reset functional; P2b detects the wipe and fails fast with an
+accurate diagnostic instead of a 2 s timeout). The working route is unchanged:
+`flash program <elf> --area app --reset none --yes` then a power cycle
+(Finding 18). The open question the handover posed — reset edge vs. the boot
+after it — is now answered: the boot. P2b saw the hold survive the release and
+die only once the bring-up (and the HSE with it) had run.
+
+**Not yet tried, the one lead left for RAM load:** a route that never issues a
+functional reset — halt the running cores by DHCSR/EDBGREQ in place, stop the
+bring-up the application already did, and write the image without a reset.
+That is a different flow from the plugin's reset-first one and was not built;
+it is the only avenue that sidesteps the HSE re-lock.
+
+### D-4 — the DLL's errors and warnings are modal dialogs: a scripted connect blocks until someone clicks — **FIXED (offline), bench pending**
+
+**Found by:** the Finding 19 verification run, 2026-10-30, launched unattended.
+
+`debug -c "gates apply" -c "load …"` printed nothing for an hour. The wire
+log ends with the DLL's own connect failing twice (`Debug registers of core
+not found. Debugging not possible` → `Connect failed. Resetting via Reset
+pin and trying again` → the same error), then `Forking J-Link GUI Server`,
+and two visible Qt windows owned by `JLinkGUIServer.exe` titled
+`J-Link V9.62 Warning` and `J-Link V9.62 Error`. The calling thread sits in
+`JLINK_Connect()` until they are clicked. That connect failure is the normal
+state before `gates apply` (README § `doctor`, "Chain scanned but connect
+failed is normal") and `_bring_up_link` already treats it as benign — but the
+DLL's documented fallback for an error with no handler installed is a
+message box, and the transport installed none. The 2026-10-07 bench log
+(`bench-runs/20261007-attach/01-connect.jlink.log`) shows the same fork
+followed by a 2.6 s gap before the next call: the operator clicked, every
+time, and nobody noticed because someone was always there.
+
+**Fix:** `DllTransport._install_message_handlers()` — `JLINK_SetErrorOutHandler`
+and `JLINK_SetWarnOutHandler` (both exported by V9.62) get a ctypes callback
+right after the exports are bound and before anything that can make the DLL
+speak (`SetLogFile`, the serial select, `Open`). The text lands in
+`transport.dll_messages` as `error: …` / `warning: …`; the `--log` file is
+unchanged. The callbacks are kept alive for the life of the process (the DLL
+stores the raw pointer and ctypes never unloads a CDLL). A DLL without the
+exports keeps its dialogs and says so in `capability_warnings`. Tests:
+`tests/test_transport_dll.py` (4). **Not covered:** dialogs that go through
+other hooks — the firmware-update prompt and device selection — have not
+been seen on this bench and are not handled.
 
 ---
 

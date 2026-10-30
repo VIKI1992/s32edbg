@@ -316,6 +316,20 @@ def arm_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
     dap.ap_write(ap_base, MDM_CONTROL3, MDM_CONTROL3_EDBGREQ_RTU1_ALL)
 
 
+def arm_m33_edbgreq(dap: Dap, ap_base: int = AP_MDM) -> None:
+    """Latch the three M33 debug requests alone: CONTROL = MDM_CONTROL_LOAD_ASSERT,
+    CONTROL2/3 untouched.
+
+    The Finding 19 repair for the moment P5 has already dropped the R52
+    latches on purpose: a wiped MDM-AP gets its enables back from
+    `apply_ladder1` (whose CONTROL write carries MSK_DBG_FAULT only), and this
+    restores the M33 half of what `arm_edbgreq` wrote -- the plugin-faithful
+    end state of a load, M33s EDBGREQ-held -- without re-arming the R52
+    nibbles, which would recreate the Finding 7 trap for rtu0.1.
+    """
+    dap.ap_write(ap_base, MDM_CONTROL, MDM_CONTROL_LOAD_ASSERT)
+
+
 def clear_core_edbgreq(dap: Dap, core: int = 0, ap_base: int = AP_MDM) -> None:
     """De-assert one RTU0 core's external debug request (read-modify-write).
 

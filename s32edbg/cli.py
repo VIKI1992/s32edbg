@@ -5538,6 +5538,11 @@ def load_cmd(
     stops. Run it inside a `debug` session -- a one-shot invocation works, but
     the next connect pulses reset into the SBC/PMIC (defect D-2) and undoes
     the load.
+
+    On a board that boots its own application, `gates apply` first. The flow
+    then disarms MC_RGM.FRENTC (the application arms it; Finding 18) before
+    its reset and re-opens the gate, re-latches and re-pins the M33s if the
+    reset wipes the MDM-AP (Finding 19).
     """
     # Parse and sanity-check before the probe opens: a bad path or a
     # flash-linked image must cost nothing.

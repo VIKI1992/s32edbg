@@ -9,11 +9,25 @@ instead of running to a startup catch.
 
 Phase order, and why it is load-bearing:
 
+P0b disarm MC_RGM.FRENTC if the running application armed it (Finding 18:
+    the NXP RTD Mcu_Init arms the functional-reset entry timeout at zero, and
+    a debugger reset taken with debug requests latched then escalates to a
+    destructive one that drops the JTAG-DP). AXI-AP traffic, so it runs here
+    while the system is still running, never during the reset.
 P1  assert reset; latch MDM EDBGREQ for every R52 (MDM survives functional
     reset -- guide §3.6 -- so the requests are pending when cores wake).
     MDM-AP traffic only: the AXI-AP is forbidden during reset (guide §9#3),
     and `memaccess.preflight` enforces exactly that.
 P2  release reset; wait for both reset flags to clear; ONE AXI preflight.
+P2b Finding 19 guard. On the br1_cabin board the MDM-AP did NOT survive the
+    reset: every enable and latch read zero, the APBIC2 frames went dead and
+    the parked core was lost (docs/handover-cabin-ram-load.md). If what P1
+    wrote is gone, re-apply LADDER-1 and re-latch while RGM still holds the
+    R52s; then re-pin every answering M33 by its own DHCSR, so a bootloader
+    on the SMU cannot copy the flashed image over the load. The guard runs
+    again before P5 and before P7, and a park that fails under a vanished
+    hold is repaired and retried once -- on that board the hold vanished
+    late, during P5.
 P3  MC_ME/RGM partition bring-up + NXP generic SRAM scrubs (verbatim).
 P4  SRAMC v2 D-bank ladder -- MUST run after P3 (whose scrub leaves the
     edge-triggered RAMCR.INIT set at the wrong range) and MUST see its
@@ -43,11 +57,17 @@ from .. import elf
 from ..data import r52debug as r52
 from ..data import rtuboot
 from ..data.expected_apmap import AP_AXI
+from ..data.ladder1 import (
+    MDM_CONTROL2_EDBGREQ_RTU0_ALL,
+    MDM_CONTROL3_EDBGREQ_RTU1_ALL,
+    MDM_CONTROL_M33_EDBGREQ_MASK,
+)
 from ..errors import (
     DapError,
     LoadError,
     S32EError,
     TransportError,
+    UnsafeOperation,
     UnsupportedOperation,
 )
 from . import gates, memaccess, runcontrol
@@ -66,6 +86,12 @@ WRITE_SLICE_WORDS = 16 * 1024 // 4
 #: gives the window time to pass.
 FAST_ATTEMPTS = 3
 FAST_RETRY_PAUSE_S = 0.025
+#: P2b: how long to wait for the SMU AHB-AP to answer after the reset release
+#: before giving up on its DHCSR re-pin. Finding 10: it reads all-zeros for
+#: ~0.5 s after a release on the rear board. A wiped (DEST0) board's stays
+#: dead until a flash bring-up that `load` never runs, so there this is the
+#: whole cost of the guard.
+POST_RESET_SMU_SETTLE_TIMEOUT_S = 1.5
 
 
 class ResetDriver(Protocol):
@@ -649,6 +675,253 @@ def halt_m33s(dap: Dap, note: Callable[[str], None], *, smu_fatal: bool = True) 
 
 
 # ---------------------------------------------------------------------------
+# Finding 19 -- boards that boot their own application
+# (br1_cabin C sample, 2026-10-29; docs/handover-cabin-ram-load.md)
+# ---------------------------------------------------------------------------
+
+
+def disarm_frentc(dap: Dap, note: Callable[[str], None]) -> bool:
+    """P0b: clear MC_RGM.FRENTC if a running application armed it. True if written.
+
+    Finding 18: the NXP RTD ``Mcu_Init`` arms the functional-reset *entry*
+    timeout at zero (``FRENTC = FRET_EN(1) | FRET_TIMEOUT(0)``). A debugger
+    functional reset taken with debug requests latched then does not complete
+    inside the timeout, MC_RGM escalates it to a destructive reset, and the
+    JTAG-DP disappears ~200 ms into the reboot -- the load dies in P3-P5 with
+    "no Cortex-R52 debug frames answered" and the board reboots from flash.
+    Measured on the br1_cabin board 2026-10-29: with FRENTC written to 0
+    first, the very same reset stays functional. This is AXI-AP traffic, so
+    it can only run while the system is out of reset; under a held reset
+    nothing is running to have armed it, and the register may not be touched
+    anyway (RM Table 957: no AXI during reset).
+    """
+    try:
+        memaccess.preflight(dap, AP_AXI, write=True)
+    except UnsafeOperation:
+        note(
+            "MC_RGM.FRENTC not checked: the system is held in functional reset, so "
+            "the AXI-AP is off limits -- and nothing is running to have armed it"
+        )
+        return False
+    try:
+        value = memaccess.read_words(dap, AP_AXI, rtuboot.RGM_FRENTC, 1)[0]
+    except DapError as exc:
+        note(
+            f"MC_RGM.FRENTC unreadable ({exc}) -- if the running application armed "
+            "the functional-reset entry timeout, the reset below escalates to a "
+            "destructive one and drops the debug port (test-plan Finding 18)"
+        )
+        return False
+    if not value & rtuboot.RGM_FRENTC_FRET_EN:
+        return False
+    memaccess.write_word(dap, AP_AXI, rtuboot.RGM_FRENTC, 0)
+    back = memaccess.read_words(dap, AP_AXI, rtuboot.RGM_FRENTC, 1)[0]
+    if back & rtuboot.RGM_FRENTC_FRET_EN:
+        raise LoadError(
+            f"MC_RGM.FRENTC reads 0x{back:08X} after writing 0: the functional-reset "
+            "entry timeout stays armed, and the reset this load needs would escalate "
+            "to a destructive reset and drop the JTAG-DP (Finding 18). Refusing to "
+            "reset. Routes in: `flash program --reset none` plus a power cycle, or a "
+            "power cycle followed by `load` before the application runs."
+        )
+    note(
+        f"MC_RGM.FRENTC read 0x{value:08X}: the running application armed the "
+        "functional-reset entry timeout (NXP RTD Mcu_Init, Finding 18) -- disarmed, "
+        "so the reset below stays functional"
+    )
+    return True
+
+
+def _debug_hold_missing(report: gates.GateReport, *, r52_latches: bool) -> list[str]:
+    """What P1 wrote into the MDM-AP that no longer reads back.
+
+    Empty on a board whose MDM-AP survived the functional reset (guide §3.6,
+    the rear-ECU bench). ``r52_latches`` says whether the four-core EDBGREQ
+    nibbles are still expected: before P5 they are, after P5 the flow dropped
+    them on purpose.
+    """
+    regs = report.mdm.registers
+    missing: list[str] = []
+    if not report.mdm.enables_set:
+        missing.append("DBGENCNTRL/2/3")
+    if (regs.get("CONTROL", 0) & MDM_CONTROL_M33_EDBGREQ_MASK) != MDM_CONTROL_M33_EDBGREQ_MASK:
+        missing.append("CONTROL[M33 EDBGREQ]")
+    if r52_latches:
+        if (regs.get("CONTROL2", 0) & MDM_CONTROL2_EDBGREQ_RTU0_ALL) != MDM_CONTROL2_EDBGREQ_RTU0_ALL:
+            missing.append("CONTROL2[RTU0 EDBGREQ]")
+        if (regs.get("CONTROL3", 0) & MDM_CONTROL3_EDBGREQ_RTU1_ALL) != MDM_CONTROL3_EDBGREQ_RTU1_ALL:
+            missing.append("CONTROL3[RTU1 EDBGREQ]")
+    return missing
+
+
+def regate_if_cleared(
+    dap: Dap, hooks: LoadHooks, report: LoadReport, *, when: str, r52_latches: bool
+) -> bool:
+    """Finding 19 guard: restore the MDM-AP debug hold if the reset took it away.
+
+    Guide §3.6 and RM 135.11 have the MDM-AP enables and latches surviving a
+    functional reset, and the rear-ECU bench agrees -- the whole P1 design
+    (latch, then reset) rests on it. The br1_cabin C-sample board does not
+    (2026-10-29, docs/handover-cabin-ram-load.md): after the P1/P2 reset
+    every MDM-AP register read zero, the APBIC2 frames stopped answering and
+    the parked core was lost. Whether the reset itself or the HSE/bootloader
+    boot that follows it does the clearing is still open -- the bench log has
+    the frames dying *after* the park had caught core0, so it is late -- and
+    this check therefore runs at every point the flow is about to depend on
+    the hold. ~15 AP reads; prints nothing when everything P1 wrote is there.
+
+    ``r52_latches``: before P5 the four-core nibbles must be back (the park
+    depends on them); after P5 they were dropped on purpose, and re-arming
+    them would recreate the Finding 7 trap (a stale latch halts rtu0.1 the
+    moment the application releases it), so only the M33 half is restored.
+    """
+    status = gates.status(dap)
+    missing = _debug_hold_missing(status, r52_latches=r52_latches)
+    if not missing:
+        return False
+    regs = status.mdm.registers
+    hooks.note(
+        f"the MDM-AP reads cleared {when} ({', '.join(missing)}: DBGENCNTRL "
+        f"0x{regs.get('DBGENCNTRL', 0):08X}, CONTROL 0x{regs.get('CONTROL', 0):08X}, "
+        f"CONTROL2 0x{regs.get('CONTROL2', 0):08X}) -- re-applying LADDER-1 and "
+        "re-latching the debug requests before anything depends on them (Finding 19)"
+    )
+    after = gates.apply_ladder1(dap)
+    if not after.mdm.enables_set:
+        regs = after.mdm.registers
+        # The br1_cabin bench (2026-10-30) took this branch: the MDM-AP IDR
+        # itself read 0x00000000 here, having read 0x001DE040 at `gates apply`
+        # minutes earlier -- the whole AP went dark, not just its enables. The
+        # LADDER-1 writes are acknowledged on the wire and every readback is
+        # zero. That is the HSE re-securing debug during the secure boot the
+        # functional reset re-triggered (Finding 19); no register write from
+        # here can bring the AP back. Distinguish a dark AP from live-but-
+        # rejected enables so the next reader is not sent hunting the wrong
+        # layer.
+        if after.mdm.idr in (0, None):
+            raise LoadError(
+                f"re-applying LADDER-1 {when} did not take: the MDM-AP reads all "
+                f"zero, IDR included (0x{(after.mdm.idr or 0):08X}; it read "
+                f"0x{gates.MDM_IDR_EXPECTED:08X} at `gates apply`). The whole debug "
+                "access port went dark -- the HSE re-secured debug during the boot "
+                "the functional reset re-triggered, and no register write brings it "
+                "back (test-plan Finding 19). On a board that boots its own "
+                "application, RAM `load` over a functional reset is not achievable; "
+                "use `flash program --reset none` plus a power cycle instead."
+            )
+        raise LoadError(
+            f"re-applying LADDER-1 {when} did not take: DBGENCNTRL/2/3 read "
+            f"0x{regs.get('DBGENCNTRL', 0):08X} / 0x{regs.get('DBGENCNTRL2', 0):08X} / "
+            f"0x{regs.get('DBGENCNTRL3', 0):08X} after the writes, but the MDM-AP IDR "
+            f"still answers (0x{(after.mdm.idr or 0):08X}). The enables are being "
+            "rejected, which points at the HSE gate (`gates status` shows AUTHSTTS), "
+            "not at this sequence."
+        )
+    if r52_latches:
+        gates.arm_edbgreq(dap)
+    else:
+        gates.arm_m33_edbgreq(dap)
+    gates.invalidate_status_cache(dap)
+    report.notes.append(
+        f"MDM-AP found cleared {when}; re-gated and re-latched (Finding 19)"
+    )
+    return True
+
+
+def repin_m33s_after_reset(
+    dap: Dap,
+    note: Callable[[str], None],
+    report: LoadReport,
+    *,
+    settle_timeout_s: float = POST_RESET_SMU_SETTLE_TIMEOUT_S,
+) -> None:
+    """P2b: pin every answering M33 by its own DHCSR once the reset has released.
+
+    P0's halts replicate the plugin's ordering; what carries the M33s across
+    the reset in the plugin's flow is the EDBGREQ latch in MDM CONTROL. On
+    the br1_cabin board that latch did not survive (Finding 19), so the SMU
+    woke into its bootloader, which copies the flashed application over
+    CodeRAM and starts rtu0.0 itself (docs/app-boot-contract.md §3) -- a
+    race the load cannot win from P3 onwards. A DHCSR C_HALT lives in the
+    M33's own debug logic, not in the MDM-AP, so it holds whatever the MDM-AP
+    does next. One write that sets C_DEBUGEN|C_HALT (`ensure_halted`): a
+    no-op on a core the latch already caught, a halt request on one that is
+    running -- never the two-write `halt()`, whose first write would resume
+    an already-halted core for a gap. Finding 10: the SMU AHB-AP answers
+    zeros for ~0.5 s after a release, so its identity is polled first. Quiet
+    on a board where nothing needed doing.
+    """
+    t0 = time.monotonic()
+    while True:
+        ident = m33_mod.identify(dap, m33_mod.M33_APS["smu"])
+        if ident.is_cortex_m33 or time.monotonic() - t0 > settle_timeout_s:
+            break
+        time.sleep(0.02)
+    waited = time.monotonic() - t0
+    if waited > 0.1:
+        note(
+            f"SMU AHB-AP {'came back' if ident.is_cortex_m33 else 'still dead'} "
+            f"{waited:.2f}s after the reset release"
+        )
+    for core in m33_mod.discover(dap):
+        if core.name != "smu" and not core.identity.is_cortex_m33:
+            continue  # an unclocked CE: P0 said so already, nothing to pin
+        try:
+            for n in m33_mod.preflight(core, write=True):
+                note(f"{core.name}: {n}")
+            _dhcsr, was_running = m33_mod.ensure_halted(dap, core)
+        except S32EError as exc:
+            note(
+                f"{core.name}: could not re-pin after the reset ({exc})"
+                + (
+                    " -- if a bootloader runs on it, that bootloader races this "
+                    "load (Finding 19)"
+                    if core.name == "smu"
+                    else ""
+                )
+            )
+            continue
+        if was_running:
+            note(f"{core.name} was running after the reset -- re-pinned by DHCSR (Finding 19)")
+            report.notes.append(
+                f"{core.name} ran after the reset; re-pinned by DHCSR (Finding 19)"
+            )
+
+
+def _park_core0(
+    dap: Dap, hooks: LoadHooks, report: LoadReport, *, timeout_s: float
+) -> runcontrol.Core:
+    """P5: park rtu0.0 on the `b .` loop and convert the EDBGREQ catch into a CTI halt.
+
+    One retry, for Finding 19 boards: if the catch or the pin-down fails and
+    the MDM-AP reads cleared, the gate and the latches are restored, the M33s
+    re-pinned, core0 put back into reset and the park run again -- the bench
+    saw the hold vanish exactly here, after the park had caught core0.
+    """
+    for attempt in (1, 2):
+        try:
+            run_init_actions(dap, rtuboot.ACTIONS_RTU0_CORE0, note=hooks.note)
+            core0 = runcontrol.resolve("rtu0.0", hooks.discover_cores())
+            wait_halted(dap, core0, timeout_s=timeout_s, what="parked core")
+            _pin_down_parked_core(dap, core0, 0, hooks)
+            return core0
+        except (S32EError, ValueError) as exc:
+            # ValueError: resolve() found no rtu0.0 -- the frames stopped
+            # enumerating. Everything else is the catch or the pin-down.
+            if attempt == 2 or not regate_if_cleared(
+                dap, hooks, report, when="while parking rtu0.0", r52_latches=True
+            ):
+                if isinstance(exc, S32EError):
+                    raise
+                raise LoadError(f"rtu0.0 is not among the discovered cores: {exc}") from exc
+            hooks.note(f"the park had failed under the closed gate: {exc}")
+            repin_m33s_after_reset(dap, hooks.note, report)
+            hooks.note("putting rtu0.0 back into reset and parking it again")
+            run_init_actions(dap, rtuboot.ACTIONS_RTU0_CORE0_RESET, note=hooks.note)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
 # The flow
 # ---------------------------------------------------------------------------
 
@@ -665,8 +938,10 @@ def load_image(
     use_fast: bool = True,
     core1: str = "leave",
     settle_timeout_s: float = 2.0,
+    park_timeout_s: float = 2.0,
+    check_frentc: bool = True,
 ) -> LoadReport:
-    """Run P1-P9. Caller has done P0 (power-up, LADDER-1, M33 halts) already."""
+    """Run P0b-P9. Caller has done P0 (power-up, LADDER-1, M33 halts) already."""
     report = LoadReport(
         image=image.name,
         entry=image.entry,
@@ -678,6 +953,16 @@ def load_image(
     check_windows(image)
     plans = plan_segment_words(image, blob)
 
+    # P0b -- Finding 18: a running application's Mcu_Init arms the MC_RGM
+    # functional-reset entry timeout at zero, and the P1 reset -- taken with
+    # debug requests latched -- then escalates to a destructive reset that
+    # drops the JTAG-DP. Disarm it while the AXI-AP is still usable.
+    if check_frentc and disarm_frentc(dap, hooks.note):
+        report.notes.append(
+            "MC_RGM.FRENTC was armed by the running application; disarmed before "
+            "the reset (Finding 18)"
+        )
+
     # P1 -- reset asserted; latch the debug requests. MDM-AP only.
     hooks.note(f"asserting {reset.name} reset and latching EDBGREQ for every R52")
     reset.assert_reset()
@@ -686,6 +971,12 @@ def load_image(
     # P2 -- release, settle, prove the AXI-AP safe exactly once.
     reset.release_reset()
     wait_reset_deasserted(dap, hooks.note, timeout_s=settle_timeout_s)
+    # P2b -- Finding 19: the MDM-AP may not have survived the reset (the
+    # br1_cabin board). Restore the hold while RGM still has every R52 in
+    # reset, then pin the M33s by DHCSR -- a hold in their own debug logic,
+    # whatever the MDM-AP does next.
+    regate_if_cleared(dap, hooks, report, when="after the reset release", r52_latches=True)
+    repin_m33s_after_reset(dap, hooks.note, report)
     hooks.on_system_reset()
     _report, notes = memaccess.preflight(dap, AP_AXI, write=True)
     for n in notes:
@@ -700,13 +991,14 @@ def load_image(
     # P4 -- the ladder that actually initialises DataRAM ECC.
     sramc_init_v2(dap, note=hooks.note)
 
+    # Finding 19 guard, again: the park below is the first step since P2b
+    # that needs the frames and the latches. Silent when nothing moved.
+    if regate_if_cleared(dap, hooks, report, when="before releasing rtu0.0", r52_latches=True):
+        repin_m33s_after_reset(dap, hooks.note, report)
+
     # P5 -- park core0 and catch it with the pending EDBGREQ.
     hooks.note("parking rtu0.0 on a `b .` loop and releasing it into the halt")
-    run_init_actions(dap, rtuboot.ACTIONS_RTU0_CORE0, note=hooks.note)
-    cores = hooks.discover_cores()
-    core0 = runcontrol.resolve("rtu0.0", cores)
-    wait_halted(dap, core0, what="parked core")
-    _pin_down_parked_core(dap, core0, 0, hooks)
+    core0 = _park_core0(dap, hooks, report, timeout_s=park_timeout_s)
     if core1 == "leave":
         # The latches have done their job; a stale one would halt rtu0.1 the
         # moment the application's own bring-up releases it (measured), and
@@ -760,6 +1052,16 @@ def load_image(
     # the load spinning at the DataRAM park, harmlessly, and is re-halted
     # here. Verify runs after the quiesce so its reads describe a stopped
     # machine.
+    #
+    # Finding 19 guard, last time: the re-halt, the verify and the PC write
+    # all need the frames. Nothing to re-latch for the R52s -- core0 is held
+    # by an acknowledged CTI halt and P5 dropped the latches on purpose
+    # (re-arming them would recreate the Finding 7 trap for rtu0.1); only
+    # core1's own latch comes back when a P9 variant still needs it.
+    if regate_if_cleared(
+        dap, hooks, report, when="after the image was written", r52_latches=False
+    ) and core1 != "leave":
+        gates.arm_r52_edbgreq(dap, 0, 1)
     state = runcontrol.read_state(dap, core0.debug_base)
     if state.halted is not True:
         hooks.note(

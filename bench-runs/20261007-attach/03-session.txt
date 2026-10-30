@@ -1,0 +1,71 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+session open -- 4 R52 core(s): rtu0.0 rtu0.1 rtu1.0 rtu1.1; M33: smu ce0 ce1
+rtu0.0: already unlocked
+rtu0.0 EDPRSR 0x00000001
+rtu0.1: cleared the OS lock
+rtu0.1 EDPRSR 0x00000001
+---------------------- rtu0.0  (debug frame 0x00410000) -----------------------
+EDSCR   0x02054002  running (non-debug state)
+        halting_debug_enabled=True sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x00000001  powered_up=True halted=False os_locked=False in_reset=False
+---------------------- rtu0.1  (debug frame 0x00510000) -----------------------
+EDSCR   0x02050002  running (non-debug state)
+        halting_debug_enabled=False sticky_error=False 
+instruction_transfer_empty=False
+EDPRSR  0x00000001  powered_up=True halted=False os_locked=False in_reset=False
+rtu0.0: 300 samples, 0 invalid, 68 distinct addresses
+  0x321DDD08    150   50.0%  #########################
+  0x32402350     31   10.3%  #####
+  0x321DDD06     30   10.0%  #####
+  0x3243B760      9    3.0%  #
+  0x32402170      4    1.3%  
+  0x32402132      4    1.3%  
+  0x3242CDEA      3    1.0%  
+  0x3240FB04      3    1.0%  
+  0x3242CFEA      3    1.0%  
+  0x324031E2      2    0.7%  
+  0x32401786      2    0.7%  
+  0x324021C4      2    0.7%  
+  0x321DC49C      2    0.7%  
+  0x323F7932      1    0.3%  
+  0x32400912      1    0.3%  
+  0x323F830A      1    0.3%  
+EDPCSR is only valid while the core is running; a halted core samples 
+0xFFFFFFFF. These are statistical samples, not a trace.
+rtu0.1: 300 samples, 0 invalid, 71 distinct addresses
+  0x321DDD08    150   50.0%  #########################
+  0x321DDD06     52   17.3%  ########
+  0x3243B760     23    7.7%  ###
+  0x3243B75A      7    2.3%  #
+  0x3243A230      2    0.7%  
+  0x32186C68      1    0.3%  
+  0x32340BC2      1    0.3%  
+  0x3229E7A2      1    0.3%  
+  0x32181914      1    0.3%  
+  0x323476F8      1    0.3%  
+  0x322AE976      1    0.3%  
+  0x322A76DA      1    0.3%  
+  0x3238A696      1    0.3%  
+  0x322F17DE      1    0.3%  
+  0x32319278      1    0.3%  
+  0x32384510      1    0.3%  
+EDPCSR is only valid while the core is running; a halted core samples 
+0xFFFFFFFF. These are statistical samples, not a trace.
+0x41850000  0x00000001
+0x41850004  0x00000000
+0x41850008  0x00000000
+0x4185000C  0x00000000
+0x41850010  0x00000000
+0x41850014  0x00000000
+0x41850018  0x0000000F
+0x4185001C  0x00000000
+0x41850020  0x00000000
+0x41850024  0x00000000
+0x41850028  0x00000001
+! smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and the 
+secure alias of the debug block stay invisible.
+smu: 200 samples, 0 invalid, 1 distinct addresses
+  0x25001F70    200  100.0%  ##################################################
+session closed

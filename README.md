@@ -367,7 +367,10 @@ no blockers, 1 warning(s)
 Two subtleties worth knowing:
 
 - **"Chain scanned but connect failed" is normal** before `gates apply`. J-Link cannot identify a
-  core while the debug clocks are gated, but the DAP works fine.
+  core while the debug clocks are gated, but the DAP works fine. The DLL used to raise that same
+  failure as a modal "J-Link Error" message box as well, which stalled every scripted run until
+  someone clicked it; the dll transport now installs the DLL's error and warning handlers, so the
+  text goes to the `--log` file and the run continues (test-plan D-4).
 - **Current swing is not evidence on its own.** A connect toggles the reset pin, so interleaving
   connects with current samples makes a static board look like it is rebooting. `doctor` tracks
   whether it issued resets during sampling and discounts the reading accordingly. (Measured: flat
@@ -1221,7 +1224,12 @@ register — see `s32edbg/data/rtuboot.py` for every value with its citation):
 1. **P0** — debug power-up, the LADDER-1 debug enables, and halting the three M33s.
 2. **P1/P2** — a system reset (SDA-AP functional reset by default) with **MDM EDBGREQ latched
    for every R52** across it, so each core halts the instant it leaves reset. All AXI-AP
-   traffic waits until both reset flags read clear (guide §9 #3).
+   traffic waits until both reset flags read clear (guide §9 #3). Around it, two steps that
+   only speak up on a board that boots its own application: **P0b** disarms `MC_RGM.FRENTC`
+   if the running application armed it (confirmed on silicon — it keeps the reset functional),
+   and **P2b** tries to re-open the gate and re-pin the M33s if the reset wiped the MDM-AP. On
+   the br1_cabin board the HSE takes the whole access port dark and P2b cannot recover it, so
+   the load fails cleanly there (test-plan Finding 19, and the note above).
 3. **P3** — MC_ME/RGM partition bring-up for RTU0 and RTU1, plus NXP's generic SRAM scrubs.
 4. **P4** — the SRAMC D0/D1/D2 ECC init **with the edge-trigger fix**: `RAMCR.INIT` is
    edge-triggered, so each controller gets `RAMCR=0` first, and three witness words must read
@@ -1275,6 +1283,27 @@ polls dying with every later read displaced, and once as WriteMem wedging on a f
 load's own quiesce then starts from a quiet SoC. Starting within seconds of a power cycle works
 too; starting minutes into the cascade is the failure mode.
 
+**On a board that boots its own application, RAM `load` is blocked by the HSE — use `flash --reset
+none` instead.** Bench-measured on the br1_cabin board 2026-10-30 (test-plan **Finding 19**). The
+running application's `Mcu_Init` arms the functional-reset entry timeout at zero (Finding 18),
+which `load` now detects and disarms (`MC_RGM.FRENTC`) before its reset — and that part works: the
+reset stays functional and the debug port survives, where under Finding 18 it escalated to
+destructive. But the functional reset then re-triggers the HSE secure boot, and that boot
+**re-secures debug and takes the whole MDM-AP dark** — its IDR reads zero where `gates apply` read
+`0x001DE040` moments earlier, and no register write from the debugger brings a powered-down access
+port back. `load` detects this, stops with a clear error, and the board recovers to its flashed
+application. Because any functional reset re-triggers that HSE boot, and the reset is intrinsic to
+the plugin's load flow, RAM load is not achievable on this board; load a new build with
+
+```bat
+s32edbg --speed 16000 flash program C:\br1_cabin_ecu\build\bin\br1_cabin.elf --area app --reset none --yes
+:: then power-cycle the board
+```
+
+(the full running-app reflash recipe is under `flash` below). A board that does **not** boot its
+own application — a blank-flash board, the August bench — takes RAM `load` normally; everything
+above is silent there.
+
 **This resets the whole SoC.** Everything running stops; every core reboots. The image must be
 linked for the RTU0 RAM windows (DataRAM `0x3178_0000`+, extended `0x3180_0000`+, CodeRAM
 `0x3210_0000`+); an ELF whose LMAs fall outside — a flash-linked image — is refused before a
@@ -1297,6 +1326,7 @@ s32edbg flash verify s32e2xx_bootloader_M33_BLOB.bin --offset 0x0
 s32edbg flash read --offset 0x300000 --length 0x10000 --out dump.bin
 s32edbg flash erase --area app --yes
 s32edbg flash erase --all --yes
+:: board already running its application?  add --reset none to EVERY flash op -- recipe below (Finding 18)
 ```
 
 **How it works.** The QuadSPI_0 controller at `0x42320000` is driven by direct register writes
@@ -1379,6 +1409,38 @@ running during the op, which is safe only while it never touches the external QS
 Serial boot (`BOOTMOD_0=1, BOOTMOD_1=0`) survives the reset but is *not* a flash mode: with no
 application running the BootROM never runs the IVT self-test DCD that sets up the clock tree, so
 the SMU bring-up stalls on the partition-clock poll. Full account: test-plan **Finding 18**.
+
+The whole running-app reflash, as bench-proven 2026-10-02 (`bench-runs/20261002-flash/`):
+
+```bat
+:: 0. once per power cycle: open the debug gates first, so the flash op's own probe connect
+::    finds the cores first try and never falls back to the D-2 reset-pin pulse
+s32edbg gates apply
+
+:: 1. identity -- expect 0xC23989C2; proves the attach-as-is path before anything destructive
+s32edbg --speed 16000 flash jedec --reset none
+
+:: 2. erase the bootloader region 0x0..0x200000 (--area blob)  -- ~25 s incl. blank check
+s32edbg --speed 16000 flash erase --area blob --reset none --yes
+
+:: 3. program the BLOB at offset 0 (erase + program + byte-exact verify)  -- ~4 min
+s32edbg --speed 16000 flash program s32e2xx_bootloader_M33_BLOB.bin --offset 0x0 --reset none --yes
+
+:: 4. step 2 wiped the app-valid flag at 0x100000 -- rewrite AA 55 AA 55 or the new bootloader
+::    will sit in its UDS superloop and never start the app (docs/app-boot-contract.md §4)
+powershell -Command "[IO.File]::WriteAllBytes('appflag.bin', [byte[]](0xAA,0x55,0xAA,0x55))"
+s32edbg --speed 16000 flash program appflag.bin --offset 0x100000 --reset none --yes
+
+:: 5. power-cycle -- nothing here resets into the new image
+```
+
+Step 2 is optional (`program` erases its own span first); it is the way to get a clean BL
+region when the new BLOB is smaller than the old one. `erase --all` is not bench-proven with
+`--reset none` (only the 2 MiB range erase and the program are); it also removes the application
+and un-boots the board, so if a later step fails do **not** power-cycle: a blank boot flash puts
+the board on the slow wiped-board route (Finding 16). The application keeps running from RAM for
+the whole sequence and only disappears at the power cycle; use the default AP (`--ap smu`) here --
+that is the routing on which both fast paths were proven.
 
 **Programming for normal boot needs more than the image.** The M33 bootloader starts the app
 only when the app-valid flag `0x55AA55AA` sits at flash `0x100000`, the app is laid out

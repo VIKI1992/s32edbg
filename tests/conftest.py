@@ -30,6 +30,7 @@ from s32edbg.data.expected_apmap import (
     EXPECTED_APS,
 )
 from s32edbg.data.ladder1 import MDM_DEVARCH_EXPECTED, MDM_DEVARCH
+from s32edbg.errors import TransportError
 from s32edbg.transport.base import ProbeInfo, Tif, Transport
 
 
@@ -488,6 +489,38 @@ class SyntheticTarget(MemApFake):
         self.smu_sram_gated = False
         #: Every set_reset_pin() call, in order (True = assert nRESET).
         self.pin_reset_calls: list[bool] = []
+        #: Finding 19 (br1_cabin board, 2026-10-29): the MDM-AP enables and
+        #: EDBGREQ latches did not survive the load's P1/P2 functional reset.
+        #: None = the rear-ECU behaviour (guide §3.6: everything survives).
+        #: "release" = wiped the moment the reset releases. "boot" = wiped
+        #: later by something the reset started -- one-shot, fired at the P5
+        #: core-0 reset lift, which is where the bench saw the frames die.
+        #: While wiped, the APB-AP side (APBIC2 ROM, R52 debug frames, CTIs)
+        #: answers zero and swallows writes, as RM 135.11 describes for gated
+        #: debug clocks, and the SMU's EDBGREQ hold is gone with the latch, so
+        #: it runs.
+        self.mdm_clearing: str | None = None
+        self.mdm_clear_events: list[str] = []
+        self._mdm_clear_armed = False
+        #: Finding 19 bench (br1_cabin, 2026-10-30): on the real board the wipe
+        #: did not merely clear the enables -- the whole MDM-AP went dark, its
+        #: IDR reading 0x00000000 where `gates apply` minutes earlier read
+        #: 0x001DE040, and every LADDER-1 re-write was acknowledged yet read
+        #: back zero. That is the HSE re-securing debug during the boot the
+        #: functional reset re-triggered; no register write brings the AP back.
+        #: Set with mdm_clearing to model it; the plain clear (IDR survives) is
+        #: the softer "enables rejected" case the handover first guessed at.
+        self.mdm_goes_dark = False
+        self._mdm_dark = False
+        #: How many DHCSR control words had been accepted when the last reset
+        #: released -- lets a test tell a post-reset re-pin from P0's halts.
+        self.m33_dhcsr_writes_at_release = 0
+        #: Finding 18 model: a functional reset asserted while MC_RGM.FRENTC
+        #: has FRET_EN set escalates to a destructive reset and the whole
+        #: JTAG-DP disappears -- every later AP access fails the way the DLL
+        #: reports it, `CORESIGHT_ReadAPDPReg(DP,1) failed with -1`.
+        self.frentc_escalations = 0
+        self.dp_dead = False
         # The PLL lock bit the bring-up table polls; everything else the
         # tables poll already reads as its expected value from an empty dict.
         self.mem[0x4022_0004] = 0x4
@@ -697,6 +730,11 @@ class SyntheticTarget(MemApFake):
         if addr == rtuboot.RGM_PRST0_1:
             old = self.mem.get(rtuboot.RGM_PRST0_1, 0)
             self.mem[rtuboot.RGM_PSTAT0_1] = value
+            if self._mdm_clear_armed and old & 0x2 and not value & 0x2:
+                # Finding 19 "boot" model: the first core-0 reset lift after
+                # the reset is where the bench saw the hold vanish.
+                self._mdm_clear_armed = False
+                self._clear_mdm_ap("core0 release")
             control2 = self.ap_space.get(AP_MDM + lad.MDM_CONTROL2, 0)
             for debug_base, bit in ((CORE0_DEBUG, 0x2), (CORE1_DEBUG, 0x4)):
                 if not old & bit and value & bit:
@@ -737,6 +775,8 @@ class SyntheticTarget(MemApFake):
         code under test relies on: channel 0 -> trigger out 0 -> debug request,
         channel 1 -> trigger out 1 -> restart.
         """
+        if self._apb_dead():
+            return True  # Finding 19: the APBIC2 is unclocked, the write is lost
         if self._smu_sram_dead(addr):
             return True  # clock-starved SMU SRAM: the write lands on nothing
         self._loadflow_write(addr, value)
@@ -812,6 +852,8 @@ class SyntheticTarget(MemApFake):
         return None
 
     def on_mem_read(self, addr: int, value: int) -> int:
+        if self._apb_dead():
+            return 0  # Finding 19: nothing behind the APB-AP answers
         # EDPRSR.SDR is clear-on-read (guide §5.5) -- the read that observes
         # the restart consumes the evidence.
         for debug_base in self.core_frames:
@@ -1168,6 +1210,54 @@ class SyntheticTarget(MemApFake):
                 return False  # observable, but stored normally
         return False
 
+    # -- Finding 19: an MDM-AP that does not survive the reset ---------------
+
+    MDM_WIPED_OFFSETS = (
+        lad.MDM_CONTROL,
+        lad.MDM_CONTROL2,
+        lad.MDM_CONTROL3,
+        lad.MDM_DBGENCNTRL,
+        lad.MDM_DBGENCNTRL2,
+        lad.MDM_DBGENCNTRL3,
+    )
+
+    def _clear_mdm_ap(self, event: str) -> None:
+        """Wipe what LADDER-1 and arm_edbgreq wrote.
+
+        With ``mdm_goes_dark`` set this is the br1_cabin bench shape: the whole
+        AP stops answering, IDR and DEVARCH included, and writes no longer
+        stick. Without it, the softer model the handover first guessed at --
+        the enables clear but the AP still identifies.
+        """
+        for off in self.MDM_WIPED_OFFSETS:
+            self.ap_space[AP_MDM + off] = 0
+        if self.mdm_goes_dark:
+            self._mdm_dark = True
+            self.ap_space[AP_MDM + lad.MDM_IDR] = 0
+            self.ap_space[AP_MDM + MDM_DEVARCH] = 0
+        self.mdm_clear_events.append(event)
+        # The SMU's hold was the latch; with it gone the bootloader runs.
+        self.m33["halted"] = False
+
+    def _apb_dead(self) -> bool:
+        """Gate closed on a Finding-19 board: the APB-AP serves nothing."""
+        return (
+            self.mdm_clearing is not None
+            and (self.select & 0xFFFF_F000) == AP_APB
+            and not self.ap_space.get(AP_MDM + lad.MDM_DBGENCNTRL, 0)
+        )
+
+    def _mdm_dead(self) -> bool:
+        """The whole MDM-AP is dark (mdm_goes_dark): every read 0, writes lost."""
+        return self._mdm_dark and (self.select & 0xFFFF_F000) == AP_MDM
+
+    def ap_reg_read(self, index: int) -> int:
+        if self.dp_dead:
+            raise TransportError("CORESIGHT_ReadAPDPReg(DP,1) failed with -1")
+        if self._mdm_dead():
+            return 0
+        return super().ap_reg_read(index)
+
     # -- SDA-AP reset machinery ----------------------------------------------
     #
     # Modelled to the *measured* behaviour, not the guide's §5.10.3 claim: a
@@ -1181,12 +1271,17 @@ class SyntheticTarget(MemApFake):
 
     def ap_reg_write(self, index: int, value: int) -> None:
         addr = self._addr(index)
+        if self.dp_dead:
+            raise TransportError("CORESIGHT_WriteAPDPReg failed with -1")
+        if self._mdm_dead():
+            return  # acknowledged on the wire, lands on nothing (bench 2026-10-30)
         if addr == AP_SDA + lad.SDA_SYSRSTC:
             sysrsts = self.ap_space.get(AP_SDA + lad.SDA_SYSRSTS, 0)
             if value & lad.SDA_SYSRSTC_SYSFUNCREQ:
                 self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
                     sysrsts | lad.SDA_SYSRSTS_SYSTEM_RESET
                 )
+                self._frentc_escalation_check()
             else:
                 self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
                     sysrsts & ~lad.SDA_SYSRSTS_SYSTEM_RESET
@@ -1209,6 +1304,14 @@ class SyntheticTarget(MemApFake):
             # anything): let the armed cross-halt channel do its level work.
             self._propagate_cross_halt()
 
+    def _frentc_escalation_check(self) -> None:
+        """Finding 18: a functional reset entered with FRENTC.FRET_EN set
+        does not complete inside the zero timeout; MC_RGM escalates it to a
+        destructive reset and the debug port is gone."""
+        if self.mem.get(rtuboot.RGM_FRENTC, 0) & rtuboot.RGM_FRENTC_FRET_EN:
+            self.frentc_escalations += 1
+            self.dp_dead = True
+
     def _smu_sram_dead(self, addr: int) -> bool:
         """True while the gated SMU SRAM has no clock source selected."""
         return (
@@ -1221,6 +1324,18 @@ class SyntheticTarget(MemApFake):
         # `smu_unpowered` deliberately survives here: DEST0 ends at the MC_ME
         # PRTN0 release (Finding 15), never at a reset (Finding 14).
         self._m33_dead_reads = self.m33_dead_reads_after_reset  # Finding 10
+        self.m33_dhcsr_writes_at_release = len(self.m33_dhcsr_writes)
+        # Finding 10, as measured: the SMU wakes from the reset into whatever
+        # MDM CONTROL holds -- a latched EDBGREQ catches it halted, nothing
+        # latched and it runs (the bootloader). Same rule as the DEST0 power-up
+        # in _loadflow_write. Evaluated before any Finding 19 wipe below, which
+        # takes the latch -- and the hold -- away again.
+        control = self.ap_space.get(AP_MDM + lad.MDM_CONTROL, 0)
+        self.m33["halted"] = bool(control & lad.MDM_CONTROL_SMU_EDBGREQ)
+        if self.mdm_clearing == "release":
+            self._clear_mdm_ap("reset release")
+        elif self.mdm_clearing == "boot":
+            self._mdm_clear_armed = True
         rstctrl = self.ap_space.get(
             AP_SDA + lad.SDA_RSTCTRL, lad.SDA_RSTCTRL_RESET_VALUE
         )
@@ -1272,6 +1387,7 @@ class SyntheticTarget(MemApFake):
             self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
                 sysrsts | lad.SDA_SYSRSTS_SYSTEM_RESET
             )
+            self._frentc_escalation_check()
         else:
             self.ap_space[AP_SDA + lad.SDA_SYSRSTS] = (
                 sysrsts & ~lad.SDA_SYSRSTS_SYSTEM_RESET

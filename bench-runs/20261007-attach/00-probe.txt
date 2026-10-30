@@ -1,0 +1,11 @@
+            serial: unknown
+  hardware version: V13.00
+          firmware: J-Link V13 compiled Jun 25 2026 10:24:04
+       DLL version: V9.62
+             VTREF: 3309 mV
+              pins: TCK=0 TDI=1 TDO=0 TMS=1 TRES=1 TRST=1
+note: J-Link install: C:\Program Files\SEGGER\JLink_V962 (v9.62)
+note: VTREF and pin states come from JLINK_GetHWStatus, whose struct layout is 
+not documented on this machine; treat them as best-effort and cross-check with 
+the commander transport.
+wrote bench-runs/20261007-attach/00-probe.json

@@ -1,0 +1,32 @@
+Finding 19 / D-4 — key wire-log lines from 01-session.jlink.log (gitignored; full trace kept
+local on the bench machine). V13 probe, V9.62 DLL, --speed 16000, br1_cabin board, 2026-10-30.
+
+The point this proves: the MDM-AP is alive at `gates apply` and DARK after the load's functional
+reset. Same DBGENCNTRL write (0x3CF3CF00), same MDM-AP IDR read (AP reg 0x03 after selecting the
+IDR bank) -- 0x001DE040 at the start, 0x00000000 mid-load. A dead access port, not just cleared
+enables; no register write brings it back (the HSE re-secured debug during the post-reset boot).
+
+--- gates apply, start of session (timestamp 2511:739) -------------------------------------------
+  JLINK_CORESIGHT_WriteAPDPReg(AP reg 0x00, 0x3CF3CF00)     <- DBGENCNTRL (CONTROL banked)
+  JLINK_CORESIGHT_WriteAPDPReg(AP reg 0x02, 0x3CF3CF00)
+  JLINK_CORESIGHT_ReadAPDPReg(AP reg 0x03)
+    Value=0x001DE040                                        <- MDM-AP IDR: the AP answers (RM Table 957)
+  ... STATUS 0xF08001C0, CONTROL 0x00800000 ...             <- gate opens, load proceeds
+
+--- P0b/P1/P2: FRENTC disarmed, functional reset taken and RELEASED, DP survives --------------
+  (transcript) load: MC_RGM.FRENTC read 0x00000001 ... disarmed, so the reset below stays functional
+  (transcript) load: functional reset released; both reset flags read clear
+  (transcript) load: SMU AHB-AP came back 0.42s after the reset release   <- Finding 10 window
+
+--- pre-P5 re-gate attempt, after the P3/P4 bring-up (timestamp 2514:118) ---------------------
+  JLINK_CORESIGHT_WriteAPDPReg(AP reg 0x00, 0x3CF3CF00)     <- same DBGENCNTRL write, acknowledged
+  JLINK_CORESIGHT_WriteAPDPReg(AP reg 0x02, 0x3CF3CF00)
+  JLINK_CORESIGHT_ReadAPDPReg(AP reg 0x03)
+    Value=0x00000000                                        <- MDM-AP IDR now ZERO: the AP went dark
+  (every subsequent MDM read: Value=0x00000000)
+  (transcript) error: re-applying LADDER-1 ... did not take ... the MDM-AP reads all zero, IDR included
+
+--- D-4: the DLL forked its GUI server once for a modal dialog (line 19) ----------------------
+  Forking J-Link GUI Server: C:\Program Files\SEGGER\JLink_V962\JLinkGUIServer.exe
+  (this run used the pre-patch transport; the dialog was dismissed by hand. The handler fix in
+   s32edbg/transport/dll.py routes these to transport.dll_messages -- bench-pending on the real DLL.)

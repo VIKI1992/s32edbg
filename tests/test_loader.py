@@ -18,11 +18,12 @@ from s32edbg import elf
 from s32edbg.dap import loader, memaccess, runcontrol
 from s32edbg.dap.adiv6 import Dap
 from s32edbg.data import ladder1 as lad
+from s32edbg.data import m33debug as m33d
 from s32edbg.data import r52debug as r52
 from s32edbg.data import rtuboot
-from s32edbg.data.expected_apmap import AP_AXI, AP_MDM
+from s32edbg.data.expected_apmap import AP_AXI, AP_MDM, AP_SDA
 from s32edbg.dap import gates
-from s32edbg.errors import LoadError
+from s32edbg.errors import LoadError, TransportError
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +526,203 @@ def test_the_dll_model_is_synced_when_the_fast_path_arms() -> None:
     assert device.halt_syncs >= 1
     assert any("synced the DLL's target model (arming" in n for n in notes)
     assert report.fast_path == "used"
+
+
+# ---------------------------------------------------------------------------
+# Finding 19 -- boards that boot their own application (br1_cabin, 2026-10-29)
+# ---------------------------------------------------------------------------
+
+
+def _mdm_writes(device: SyntheticTarget, offset: int) -> int:
+    return sum(
+        1 for kind, _i, addr in device.log if kind == "ap_write" and addr == AP_MDM + offset
+    )
+
+
+def test_a_board_whose_mdm_ap_survives_the_reset_sees_no_new_notes_or_writes() -> None:
+    """The rear-ECU behaviour (guide §3.6). Every Finding 19 guard must be
+    invisible here: no note, no second LADDER-1, no FRENTC traffic."""
+    _dap, device, report, notes = run_full_load(device := SyntheticTarget())
+    assert not any("MDM-AP reads cleared" in n for n in notes)
+    assert not any("FRENTC" in n for n in notes)
+    assert not any("Finding 19" in n for n in report.notes)
+    assert _mdm_writes(device, lad.MDM_DBGENCNTRL) == 1, "LADDER-1 was re-applied"
+    assert rtuboot.RGM_FRENTC not in device.mem, "FRENTC written on a board that never armed it"
+
+
+def test_the_fake_models_the_cabin_boards_mdm_wipe() -> None:
+    """Prove the double has the measured shape before trusting the fix to it:
+    every enable and latch zero, the AP itself still identifies, and nothing
+    behind the APB-AP answers."""
+    device = SyntheticTarget()
+    device.mdm_clearing = "release"
+    dap = prepared_dap(device)
+    gates.arm_edbgreq(dap)
+    gates.hold_in_functional_reset(dap)
+    gates.release_functional_reset(dap)
+    report = gates.status(dap)
+    assert report.mdm.enables_set is False
+    assert report.mdm.registers["CONTROL2"] == 0
+    assert report.mdm.identity_ok, "IDR must survive -- the AP itself still answers"
+    assert device.mdm_clear_events == ["reset release"]
+    assert runcontrol.discover(dap) == []
+
+
+def test_a_reset_that_wipes_the_mdm_ap_is_repaired_before_the_cores_leave_reset() -> None:
+    """Handover theory A: the reset itself clears the MDM-AP. P2b sees it the
+    moment the release is confirmed, re-gates, re-latches, and the park
+    catches core0 exactly as on a healthy board."""
+    device = SyntheticTarget()
+    device.mdm_clearing = "release"
+    _dap, device, report, notes = run_full_load(device)
+    assert device.mdm_clear_events == ["reset release"]
+    assert any("MDM-AP reads cleared after the reset release" in n for n in notes)
+    assert any("Finding 19" in n for n in report.notes)
+    # The end state is the healthy board's.
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+    assert device.dlr[CORE0_DEBUG] == 0x3210_0020
+    assert device.mem[CORE0_DEBUG + r52.EDPRSR] & r52.EDPRSR_HALTED
+    assert report.pc == 0x3210_0020
+    assert device.ap_space[AP_MDM + lad.MDM_DBGENCNTRL] == lad.LADDER1[1].value
+    assert not device.ap_space[AP_MDM + lad.MDM_CONTROL2] & 0x000F_0000  # dropped in P5, as always
+    assert device.ap_space[AP_MDM + lad.MDM_CONTROL] & lad.MDM_CONTROL_M33_EDBGREQ_MASK
+    # The SMU lost its latch hold with the wipe and was re-pinned by DHCSR.
+    assert device.m33["halted"] is True
+    assert any("smu was running after the reset" in n for n in notes)
+
+
+def test_a_hold_that_vanishes_during_the_park_is_repaired_and_the_park_retried() -> None:
+    """What the bench actually logged (handover §2.3): the park had caught
+    core0, then the frames died -- the wipe landed late. P2b and the pre-P5
+    check see an intact MDM-AP; the park fails under the closed gate; the flow
+    must notice, restore the hold, put core0 back into reset and park again."""
+    device = SyntheticTarget()
+    device.mdm_clearing = "boot"
+    _dap, device, report, notes = run_full_load(device, park_timeout_s=0.05)
+    assert device.mdm_clear_events == ["core0 release"]
+    assert not any("after the reset release" in n for n in notes), "P2b saw a wipe that had not happened yet"
+    assert not any("before releasing rtu0.0" in n for n in notes)
+    assert any("MDM-AP reads cleared while parking rtu0.0" in n for n in notes)
+    assert any("parking it again" in n for n in notes)
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+    assert device.dlr[CORE0_DEBUG] == 0x3210_0020
+    assert device.mem[CORE0_DEBUG + r52.EDPRSR] & r52.EDPRSR_HALTED
+    assert report.pc == 0x3210_0020
+    assert device.m33["halted"] is True
+    assert not device.ap_space[AP_MDM + lad.MDM_CONTROL2] & 0x000F_0000
+
+
+def test_a_wipe_the_repair_cannot_undo_fails_with_the_hse_hint() -> None:
+    """If LADDER-1 does not take on the re-apply, the load must stop with a
+    message that points at the right gate instead of a 2 s timeout."""
+
+    class RejectsLadder(SyntheticTarget):
+        def ap_reg_write(self, index: int, value: int) -> None:
+            addr = self._addr(index)
+            if self.mdm_clear_events and addr == AP_MDM + lad.MDM_DBGENCNTRL:
+                return  # the HSE gate: writes land on nothing after the wipe
+            super().ap_reg_write(index, value)
+
+    device = RejectsLadder()
+    device.mdm_clearing = "release"
+    with pytest.raises(LoadError, match="did not take"):
+        run_full_load(device)
+
+
+def test_the_cabin_board_shape_the_whole_mdm_ap_goes_dark_fails_to_the_flash_route() -> None:
+    """What the br1_cabin bench measured 2026-10-30, end to end. FRENTC was
+    armed, so the reset would escalate (Finding 18) -- P0b disarms it and the
+    reset stays functional, the DP survives. Then the HSE re-secures debug
+    during the boot the reset re-triggered and the whole MDM-AP goes dark: its
+    IDR reads 0 where `gates apply` read 0x001DE040, and every re-gate write is
+    acknowledged yet reads back 0. No register write brings it back, so `load`
+    must stop and name the route that does work (flash + power cycle), not sit
+    on a timeout or claim success."""
+    device = SyntheticTarget()
+    device.mem[rtuboot.RGM_FRENTC] = 0x1  # the running application armed it
+    device.mdm_clearing = "release"
+    device.mdm_goes_dark = True
+    with pytest.raises(LoadError, match="went dark") as exc:
+        run_full_load(device)
+    assert "flash program --reset none" in str(exc.value)
+    assert device.frentc_escalations == 0, "P0b did not keep the reset functional"
+    assert device.mem[rtuboot.RGM_FRENTC] == 0, "FRENTC was not disarmed"
+
+
+def test_the_m33s_are_repinned_by_dhcsr_after_every_reset() -> None:
+    """Quietly on a healthy board -- the latch already holds them and the single
+    C_DEBUGEN|C_HALT write is a no-op -- but always: the M33 hold must not
+    depend on the MDM-AP surviving."""
+    _dap, device, _report, notes = run_full_load(device := SyntheticTarget())
+    after = device.m33_dhcsr_writes[device.m33_dhcsr_writes_at_release :]
+    assert after, "no DHCSR write after the reset release"
+    assert all(w & m33d.DHCSR_C_HALT for w in after), "a C_HALT-less write resumes a halted core"
+    assert not any("was running after the reset" in n for n in notes)
+
+
+def test_a_dead_smu_ap_after_the_reset_is_waited_out_then_pinned() -> None:
+    """Finding 10's dead window: identity reads zero for a moment after the
+    release. The re-pin polls through it instead of giving up."""
+    device = SyntheticTarget()
+    device.m33_dead_reads_after_reset = 12
+    _dap, device, _report, notes = run_full_load(device)
+    assert device.m33["halted"] is True
+    assert not any("could not re-pin" in n for n in notes)
+
+
+def test_an_armed_frentc_is_disarmed_before_the_reset() -> None:
+    """Finding 18 on the load flow: the running application's Mcu_Init armed
+    the functional-reset entry timeout at zero; a reset taken like that
+    escalates and the port is gone. FRENTC must read 0 before SYSFUNCREQ."""
+    device = SyntheticTarget()
+    device.mem[rtuboot.RGM_FRENTC] = 0x1  # FRET_EN=1, FRET_TIMEOUT=0: Power_Ip_PBcfg.c
+    _dap, device, report, notes = run_full_load(device)
+    assert device.frentc_escalations == 0, "the reset was taken with FRENTC still armed"
+    assert device.mem[rtuboot.RGM_FRENTC] == 0
+    assert any("FRENTC read 0x00000001" in n for n in notes)
+    assert any("FRENTC" in n for n in report.notes)
+    assert device.mem[0x3210_0020] == 0xEA00_0021
+
+
+def test_the_fake_escalates_a_reset_taken_with_frentc_armed() -> None:
+    """The model has teeth: without the disarm the port is lost, as measured."""
+    device = SyntheticTarget()
+    device.mem[rtuboot.RGM_FRENTC] = 0x1
+    with pytest.raises(TransportError, match="-1"):
+        run_full_load(device, check_frentc=False)
+    assert device.frentc_escalations == 1
+
+
+def test_frentc_is_left_alone_under_a_held_reset() -> None:
+    """`attach --hold` then `load`: the AXI-AP is off limits in reset, nothing
+    is running to have armed FRENTC, and the flow says so and carries on."""
+    device = SyntheticTarget()
+    dap = prepared_dap(device)
+    gates.hold_in_functional_reset(dap)
+    gates.invalidate_status_cache(dap)  # what the CLI's attach path does
+    hooks, notes = make_hooks(dap)
+    image, blob = make_image([(0x3210_0020, b"\x21\x00\x00\xea")])
+    report = loader.load_image(
+        dap, device, image, blob, hooks, reset=loader.SdaReset(dap), settle_timeout_s=0.5
+    )
+    assert any("FRENTC not checked" in n for n in notes)
+    assert report.pc == 0x3210_0020
+
+
+def test_a_frentc_that_will_not_disarm_refuses_to_reset() -> None:
+    """If the write does not take, resetting would kill the port: stop before P1."""
+
+    class StickyFrentc(SyntheticTarget):
+        def on_mem_write(self, addr: int, value: int) -> bool | None:
+            if addr == rtuboot.RGM_FRENTC:
+                return True  # write-protected: swallowed, reads back armed
+            return super().on_mem_write(addr, value)
+
+    device = StickyFrentc()
+    device.mem[rtuboot.RGM_FRENTC] = 0x1
+    with pytest.raises(LoadError, match="stays armed"):
+        run_full_load(device)
+    assert device.frentc_escalations == 0
+    assert not any(
+        kind == "ap_write" and addr == AP_SDA + lad.SDA_SYSRSTC for kind, _i, addr in device.log
+    ), "SYSFUNCREQ was written after the refusal"

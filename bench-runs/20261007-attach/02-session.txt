@@ -1,0 +1,116 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! no Cortex-R52 debug frames answered. The debug clocks are off by default (RM 
+135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+session open with no cores discovered yet -- run `gates apply`, then `core 
+list`.
+  MDM-AP (APB debug-enable  
+           gate)            
++--------------------------+
+| Register    | Value      |
+|-------------+------------|
+| IDR         | 0x001DE040 |
+| STATUS      | 0xF08001C0 |
+| CONTROL     | 0x00000000 |
+| STATUS2     | 0x00F000C0 |
+| CONTROL2    | 0x00000000 |
+| CONTROL3    | 0x00000000 |
+| DBGENCNTRL  | 0x00000000 |
+| DBGENCNTRL2 | 0x00000000 |
+| DBGENCNTRL3 | 0x00000000 |
++--------------------------+
+STATUS: system_reset=no, cdbgpwrupreq=yes, csyspwrupreq=yes, 
+aux_tap_trst_released=yes
+Debug-enable gate: gated
+       SDA-AP (HSE security gate, read-only)       
++-------------------------------------------------+
+| Field                      | Value              |
+|----------------------------+--------------------|
+| IDR                        | 0x001DE001         |
+| AUTHSTTS                   | 0x40000005         |
+| APPDBGEN                   | yes                |
+| CHALRDY                    | yes                |
+| SDASYSRSTS                 | 0x00000000         |
+| functional_reset_asserted  | no                 |
+| destructive_reset_asserted | no                 |
+| SDARSTCTRL                 | 0xF0F30000         |
+| UID                        | 0x090A300B5563B9BC |
++-------------------------------------------------+
+! MDM-AP DBGENCNTRL/2/3 read zero, so the debug clocks are still gated. The APB
+ROM will not enumerate and RM 135.11 warns that touching debug components now 
+'might hang the debug APBIC bus'. Run `gates apply` first.
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+  MDM-AP (APB debug-enable  
+           gate)            
++--------------------------+
+| Register    | Value      |
+|-------------+------------|
+| IDR         | 0x001DE040 |
+| STATUS      | 0xF08001C0 |
+| CONTROL     | 0x00800000 |
+| STATUS2     | 0x00F000C0 |
+| CONTROL2    | 0x00000000 |
+| CONTROL3    | 0x00000000 |
+| DBGENCNTRL  | 0x3CF3CF00 |
+| DBGENCNTRL2 | 0x3CF3CF00 |
+| DBGENCNTRL3 | 0xFFF03CF0 |
++--------------------------+
+STATUS: system_reset=no, cdbgpwrupreq=yes, csyspwrupreq=yes, 
+aux_tap_trst_released=yes
+Debug-enable gate: open
+       SDA-AP (HSE security gate, read-only)       
++-------------------------------------------------+
+| Field                      | Value              |
+|----------------------------+--------------------|
+| IDR                        | 0x001DE001         |
+| AUTHSTTS                   | 0x40000005         |
+| APPDBGEN                   | yes                |
+| CHALRDY                    | yes                |
+| SDASYSRSTS                 | 0x00000000         |
+| functional_reset_asserted  | no                 |
+| destructive_reset_asserted | no                 |
+| SDARSTCTRL                 | 0xF0F30000         |
+| UID                        | 0x090A300B5563B9BC |
++-------------------------------------------------+
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+debug-enable gate is open (sticky until power loss)
+                               Cortex-R52 cores                                
++-----------------------------------------------------------------------------+
+|   |        | Debug   |        |         |        |       |         |        |
+| # | Name   | frame   | CTI    | Part    | Ident… | BP/WP | Invasi… | State  |
+|---+--------+---------+--------+---------+--------+-------+---------+--------|
+| 0 | rtu0.0 | 0x0041… | 0x004… | Cortex… | ok     | 8/8   | granted | locked |
+| 1 | rtu0.1 | 0x0051… | 0x005… | Cortex… | ok     | 8/8   | granted | locked |
+| 2 | rtu1.0 | 0x00C1… | 0x00C… | Cortex… | ok     | 8/8   | granted | locked |
+| 3 | rtu1.1 | 0x00D1… | 0x00D… | Cortex… | ok     | 8/8   | granted | locked |
++-----------------------------------------------------------------------------+
+rtu0.0: core-domain debug registers unreadable -- the OS lock is set (clear 
+OSLAR to release it)
+rtu0.1: core-domain debug registers unreadable -- the OS lock is set (clear 
+OSLAR to release it)
+rtu1.0: core-domain debug registers unreadable -- the core is held in reset 
+(never released)
+rtu1.1: core-domain debug registers unreadable -- the core is held in reset 
+(never released)
+                   Cortex-M33 subsystems                    
++----------------------------------------------------------+
+| Name | AP         | Part       | BP/WP | Debug | State   |
+|------+------------+------------+-------+-------+---------|
+| smu  | 0x01C80000 | Cortex-M33 | 8/4   | off   | running |
+| ce0  | 0x01C90000 | Cortex-M33 | 8/4   | off   | running |
+| ce1  | 0x01C92000 | Cortex-M33 | 8/4   | off   | running |
++----------------------------------------------------------+
+rtu0.0: 200 samples, 200 invalid, 0 distinct addresses
+! every sample was invalid, so no PC was captured: the OS lock is set (clear 
+OSLAR to release it).
+---------------------- rtu0.0  (debug frame 0x00410000) -----------------------
+EDPRSR  0x000002A1  powered_up=True halted=False os_locked=True in_reset=False
+---------------------- rtu0.1  (debug frame 0x00510000) -----------------------
+EDPRSR  0x000002A1  powered_up=True halted=False os_locked=True in_reset=False
+session closed

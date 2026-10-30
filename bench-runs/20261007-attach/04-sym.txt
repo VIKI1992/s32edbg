@@ -1,0 +1,22 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+session open -- 4 R52 core(s): rtu0.0 rtu0.1 rtu1.0 rtu1.1; M33: smu ce0 ce1
+symbols: 12018 function(s), 668240 line row(s), CFI debug_frame (11969 FDEs), 
+entry 0x32100020
+0x321DDD08  Os_Task_Os_IdleTask  
+C:\br1_rear_ecu\Sip\Components\Os\Implementation\Os_Hal_Core.h:409
+0x321DDD06  Os_Task_Os_IdleTask  
+C:\br1_rear_ecu\Sip\Components\Os\Implementation\Os_Hal_Core.h:409
+0x32402350  Adc_Sar_Ip_GetConvResult  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:3372
+0x3243B760  memcpy  
+\opt\bamboo\agent-home\xml-data\build-dir\DBT-GAB-EV7\opt\nxp-gcc\Earmv7nGCC\sr
+c_newlib\newlib\libc\string\memcpy.c:61
+0x32402170  Adc_Sar_Ip_GetStatusFlags  
+C:\br1_rear_ecu\Sip\ThirdParty\Mcal_S32SZExx\Supply\SW32ZE_RTD_R21-11_2.0.0_HF0
+1\eclipse\plugins\Adc_TS_T31D53M20I0R0\src\Adc_Sar_Ip.c:824
+0x41850000  0x00000001
+0x41850004  0x00000000
+0x41850008  0x00000000
+session closed

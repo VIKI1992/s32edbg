@@ -1,0 +1,135 @@
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! no Cortex-R52 debug frames answered. The debug clocks are off by default (RM 
+135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+session open with no cores discovered yet -- run `gates apply`, then `core 
+list`.
+  MDM-AP (APB debug-enable  
+           gate)            
++--------------------------+
+| Register    | Value      |
+|-------------+------------|
+| IDR         | 0x001DE040 |
+| STATUS      | 0xF08001C0 |
+| CONTROL     | 0x00800000 |
+| STATUS2     | 0x00F000C0 |
+| CONTROL2    | 0x00000000 |
+| CONTROL3    | 0x00000000 |
+| DBGENCNTRL  | 0x3CF3CF00 |
+| DBGENCNTRL2 | 0x3CF3CF00 |
+| DBGENCNTRL3 | 0xFFF03CF0 |
++--------------------------+
+STATUS: system_reset=no, cdbgpwrupreq=yes, csyspwrupreq=yes, 
+aux_tap_trst_released=yes
+Debug-enable gate: open
+       SDA-AP (HSE security gate, read-only)       
++-------------------------------------------------+
+| Field                      | Value              |
+|----------------------------+--------------------|
+| IDR                        | 0x001DE001         |
+| AUTHSTTS                   | 0x40000005         |
+| APPDBGEN                   | yes                |
+| CHALRDY                    | yes                |
+| SDASYSRSTS                 | 0x00000000         |
+| functional_reset_asserted  | no                 |
+| destructive_reset_asserted | no                 |
+| SDARSTCTRL                 | 0xF0F30000         |
+| UID                        | 0x090A300B5563B9BC |
++-------------------------------------------------+
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+debug-enable gate is open (sticky until power loss)
+0x32150000  0xBD08F89C
+0x32150004  0xF0EAB508
+0x32150008  0x2001F886
+0x3215000C  0xFBF6F0DE
+0x32150010  0x53A0F244
+0x32150014  0x1378F2C3
+0x32150018  0xF8832201
+0x3215001C  0xF0EA2103
+0x32300000  0x127AF2C3
+0x32300004  0xF8822101
+0x32300008  0x2103139C
+0x3230000C  0x139BF882
+0x32300010  0xF8A22100
+0x32300014  0xF8821356
+0x32300018  0x2D04140E
+0x3230001C  0x8130F000
+! `load` resets the whole SoC: every core reboots. Image: br1_cabin.elf, 
+3,236,917 bytes in 13 segments, entry 0x32100020 (Thumb)
+load: fresh probe connection for this load (Finding 9: the DLL's WriteMem 
+wedges after ~4 MB per connection)
+note: AP reads are direct on this transport (determined by reading a known IDR 
+both ways).
+! SDA-AP AUTHSTTS[CHALRDY] is set: the HSE is offering a debug-authentication 
+challenge. This tool never answers it -- the RM states only one attempt is ever
+accepted.
+load: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: smu: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+load: smu halted
+load: ce0: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce0: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+load: ce0 halted
+load: ce1: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: ce1: halting debug was disabled; enabling it (DHCSR.C_DEBUGEN).
+load: ce1 halted
+load: MC_RGM.FRENTC read 0x00000001: the running application armed the 
+functional-reset entry timeout (NXP RTD Mcu_Init, Finding 18) -- disarmed, so 
+the reset below stays functional
+load: asserting sda reset and latching EDBGREQ for every R52
+load: functional reset released; both reset flags read clear
+load: SMU AHB-AP came back 0.42s after the reset release
+load: smu: secure debug is not enabled (DHCSR.S_SDE clear), so secure code and 
+the secure alias of the debug block stay invisible.
+load: MC_ME/RGM partition bring-up (RTU0, RTU1) + NXP generic SRAM scrubs
+load: SRAMC D0/D1/D2 ECC init verified (witness words read 0)
+load: the MDM-AP reads cleared before releasing rtu0.0 (DBGENCNTRL/2/3, 
+CONTROL[M33 EDBGREQ], CONTROL2[RTU0 EDBGREQ], CONTROL3[RTU1 EDBGREQ]: 
+DBGENCNTRL 0x00000000, CONTROL 0x00000000, CONTROL2 0x00000000) -- re-applying 
+LADDER-1 and re-latching the debug requests before anything depends on them 
+(Finding 19)
+error: re-applying LADDER-1 before releasing rtu0.0 did not take: 
+DBGENCNTRL/2/3 read 0x00000000 / 0x00000000 / 0x00000000 after the writes. The 
+MDM-AP is rejecting writes, which points at the HSE gate (`gates status` shows 
+AUTHSTTS), not at this sequence.
+error: no Cortex-R52 debug frames answered. The debug clocks are off by default
+(RM 135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+error: no Cortex-R52 debug frames answered. The debug clocks are off by default
+(RM 135.11) -- run `s32edbg gates apply` first. If the gate is already open, 
+`s32edbg romdump --source apb` will show whether the APBIC2 tree enumerates at 
+all.
+! the debug-enable gate is closed (MDM-AP DBGENCNTRL1-3 read zero). RM 135.11: 
+"Trying to access debug components while the clocks are not enabled might hang 
+the debug APBIC bus." Run `s32edbg gates apply` first if this hangs.
+! SDA-AP reports application debug disabled, so this part may be in a secured 
+lifecycle state and some APs will read as zero.
+0x32150000  0x00000000
+0x32150004  0x00000000
+0x32150008  0x00000000
+0x3215000C  0x00000000
+0x32150010  0x00000000
+0x32150014  0x00000000
+0x32150018  0x00000000
+0x3215001C  0x00000000
+! the debug-enable gate is closed (MDM-AP DBGENCNTRL1-3 read zero). RM 135.11: 
+"Trying to access debug components while the clocks are not enabled might hang 
+the debug APBIC bus." Run `s32edbg gates apply` first if this hangs.
+! SDA-AP reports application debug disabled, so this part may be in a secured 
+lifecycle state and some APs will read as zero.
+0x32300000  0x00000000
+0x32300004  0x00000000
+0x32300008  0x00000000
+0x3230000C  0x00000000
+0x32300010  0x00000000
+0x32300014  0x00000000
+0x32300018  0x00000000
+0x3230001C  0x00000000
+session closed
